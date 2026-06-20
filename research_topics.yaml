@@ -1,0 +1,33 @@
+topics:
+  - name: "RNA Docking Into Picornaviridae Capsid Proteins"
+
+    virus_family: "Picornaviridae"
+    virus_name: ""
+    virus_genus: ""
+
+    description: >
+      Design and optimise RNA sequence motifs from Picornaviridae-like RNA
+      virus contexts that fold into stable secondary structures and form
+      physically plausible 3D conformations capable of binding viral capsid
+      or coat-protein RNA-binding pockets. Evaluate candidates using
+      Picornaviridae-focused conservation analysis, RNA folding, molecular
+      dynamics, and docking into experimentally validated or inferred viral
+      RNA-interacting protein targets.
+
+    seed_questions:
+      - >
+        Which Picornaviridae-associated RNA stem-loop sequence motifs can
+        achieve an optimal balance between evolutionary conservation,
+        structural stability, and favourable docking interactions with viral
+        capsid or coat-protein RNA-binding sites?
+
+      - >
+        How can conserved RNA motif patterns across Picornaviridae genomes
+        be leveraged to design structurally stable RNA elements that
+        consistently exhibit strong and reproducible binding to viral
+        RNA-interacting capsid or coat-protein domains?
+
+      - >
+        What sequence and structural features enable Picornaviridae-like RNA
+        stem-loop motifs to maintain low-energy conformations while achieving
+        efficient and specific docking into viral protein RNA-binding pockets?

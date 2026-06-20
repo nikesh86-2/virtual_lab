@@ -1,0 +1,162 @@
+name: biophysics-research-agent
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - bioconda
+
+channel_priority: flexible
+
+dependencies:
+  # -------------------------------------------------------------------
+  # Core Python
+  # -------------------------------------------------------------------
+  - python=3.11
+  - pip
+  - setuptools
+  - wheel
+
+  # -------------------------------------------------------------------
+  # CUDA / PyTorch stack
+  # -------------------------------------------------------------------
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - torchaudio=2.5.1
+  - pytorch-cuda=12.4
+
+  # FAISS GPU
+  - faiss-gpu
+
+  # -------------------------------------------------------------------
+  # Scientific Python
+  # -------------------------------------------------------------------
+  - numpy=1.26
+  - scipy
+  - pandas
+  - matplotlib-base
+  - scikit-learn
+  - biopython
+  - networkx
+  - pyyaml
+  - requests
+  - beautifulsoup4
+  - tqdm
+  - joblib
+  - plotly
+  - reportlab
+  - python-dotenv
+
+  # -------------------------------------------------------------------
+  # RNA / bioinformatics tools
+  # -------------------------------------------------------------------
+  - viennarna
+  - sfold
+  - mafft
+  - samtools
+  - minimap2
+  - htslib
+
+  # -------------------------------------------------------------------
+  # Chemistry / docking support
+  # -------------------------------------------------------------------
+  - openbabel
+  - vina
+  - pymoo
+
+  # -------------------------------------------------------------------
+  # Image/library stack for non-PyMOL uses
+  # Do NOT force jpeg=8 here.
+  # -------------------------------------------------------------------
+  - pillow>=10
+  - libjpeg-turbo
+  - libpng
+  - freetype
+
+  # -------------------------------------------------------------------
+  # Build/runtime libraries often needed by native packages
+  # -------------------------------------------------------------------
+  - cmake
+  - make
+  - gcc_linux-64
+  - gxx_linux-64
+  - gfortran_linux-64
+  - curl
+  - openssl
+
+  # -------------------------------------------------------------------
+  # Pip-only / fast-moving AI stack
+  # -------------------------------------------------------------------
+  - pip:
+      # LLM / LangGraph
+      - openai
+      - langchain-core
+      - langchain-openai
+      - langchain-community
+      - langchain-text-splitters
+      - langgraph
+      - langgraph-checkpoint
+      - langgraph-prebuilt
+      - langgraph-sdk
+      - langsmith
+
+      # vLLM stack
+      - vllm==0.7.2
+      - transformers==4.48.3
+      - tokenizers
+      - accelerate
+      - sentence-transformers
+      - sentencepiece
+      - safetensors
+      - xformers==0.0.28.post3
+      - datasets
+      - ray
+      - huggingface-hub
+      - hf-xet
+
+      # API/server stack
+      - fastapi
+      - uvicorn
+      - httpx
+      - pydantic
+      - pydantic-settings
+      - pydantic-extra-types
+      - python-multipart
+
+      # Optimisation / utilities
+      - autograd
+      - alive-progress
+      - progressbar2
+      - rich
+      - typer
+      - tenacity
+      - simplejson
+      - orjson
+      - zstandard
+      - diskcache
+
+      # RNA / modelling utilities
+      - rna-tools
+
+      # Misc used by vLLM ecosystem
+      - gguf
+      - lm-format-enforcer
+      - outlines==0.1.11
+      - outlines-core
+      - compressed-tensors
+      - mistral-common
+      - tiktoken
+      - einops
+      - msgpack
+      - msgspec
+      - pyzmq
+      - prometheus-client
+      - prometheus-fastapi-instrumentator
+      - opentelemetry-api
+      - opentelemetry-sdk
+      - opentelemetry-exporter-prometheus
+      - opentelemetry-semantic-conventions
+      - opentelemetry-proto
+
+      # Keep headless OpenCV if any image processing utility expects it
+      - opencv-python-headless

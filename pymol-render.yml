@@ -1,0 +1,15 @@
+
+name: pymol-render
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pymol-open-source
+  - pillow
+  - libjpeg-turbo
+  - libpng
+  - freetype
+  - pmw
+  - pip

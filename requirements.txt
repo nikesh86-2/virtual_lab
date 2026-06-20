@@ -1,0 +1,13 @@
+# Requirements for retrieval index and LoRA prototyping
+# NOTE: install a PyTorch wheel suitable for your platform before installing the rest.
+# CPU example:
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+sentence-transformers>=2.2.2
+faiss-cpu>=1.7.2
+numpy>=1.24
+transformers>=4.30.0
+datasets>=2.12.0
+accelerate>=0.20.3
+peft>=0.6.0
+tqdm>=4.65.0

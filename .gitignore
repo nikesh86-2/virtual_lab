@@ -1,0 +1,73 @@
+# Caches and heavy artifacts
+cache/
+complex_cache
+data/
+experiments/
+HDOCKlite_v1.1/
+logs/
+output_data/
+output/
+postrun_training_data/
+training_data/
+hf_cache/
+model_cache/
+pdb_cache/
+local_faiss_index/
+__pycache__/
+tmp/
+conda_pkgs/
+$HF_HOME/
+cache/
+triton_cache/
+torchinductor_cache/
+pycache/
+scratch/
+
+# Logs and results
+logs/
+*.log
+*.sc
+*.json
+lab_results_*.json
+lab_checkpoint.json
+ROSETTA_CRASH.log
+
+# Simulation outputs
+*.pdb
+*.ent
+*.trafl
+*.ss_detected
+*.bonds
+*.ps
+rna.ps
+test.seq*
+
+# Scratch and environment
+scratch/
+.env
+
+# Training data
+training_data/*.jsonl
+
+# Other directories
+hbv_phylogeny/
+rna_cache/
+
+# Docking and simulation outputs
+HDOCKlite-v1.1/
+Hdock.out
+SimRNA_bin
+docking_summary_*.csv
+docking_summary_*.md
+*.md
+*.csv
+*.json
+summary_*.md
+output_data/
+debug_hdock/
+hdock_work/
+rna_hdock_cache/
+docking_snapshots/
+debug_rna_prep/
+*.pdbqt
+*.pdb

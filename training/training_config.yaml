@@ -1,0 +1,16 @@
+model_name: Qwen/Qwen2.5-7B-Instruct
+
+output_dir: training/output_model
+
+training:
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-5
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+
+max_length: 2048
