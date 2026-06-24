@@ -25,10 +25,6 @@ from VLAB2.orchestration.utils.interface_contacts import (
 
 from VLAB2.orchestration.utils.checkpointing import save_checkpoint
 
-from VLAB2.orchestration.utils.docking_visuals import (
-    render_docking_snapshots_for_results,
-)
-
 from VLAB2.orchestration.utils.docking_utils import (
     export_docking_outputs,
     parse_pdb_candidates,
