@@ -1,8 +1,7 @@
 """
 failure_memory.py
 
-Persistent memory for recurring failure modes, target outcomes, and partial
-successes across Virtual Lab iterations and runs.
+Persistent memory for recurring failure modes and partial successes.
 
 Tracks:
 - sequence failures
@@ -12,20 +11,12 @@ Tracks:
 - interface failures
 - target failures with reasons
 - partial-success targets/sequences
-- successful targets
-- successful pose/interface features
 
 Used by:
 - Skeptic Agent
 - PI Agent
 - Protein Agent target selection
 - postrun training data builder
-
-Design goals:
-- Backward compatible with older FailureMemory callers.
-- Never break the lab if the memory file is missing/corrupt.
-- Distinguish hard target failures from soft/partial target failures.
-- Preserve partial successes so future runs can exploit promising targets.
 """
 
 from __future__ import annotations
@@ -37,10 +28,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
-# ---------------------------------------------------------------------------
-# Basic helpers
-# ---------------------------------------------------------------------------
-
 def _now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
@@ -49,9 +36,7 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if x is None:
             return default
-
         return float(x)
-
     except Exception:
         return default
 
@@ -63,22 +48,10 @@ def _pdb_id(x: Any) -> str:
 def _clean_rna(seq: Any) -> str:
     if not isinstance(seq, str):
         return ""
-
-    return "".join(
-        c for c in seq.upper().replace("T", "U")
-        if c in "ACGU"
-    )
+    return "".join(c for c in seq.upper().replace("T", "U") if c in "ACGU")
 
 
 def _has_clean_interface(row: dict) -> bool:
-    """
-    Pose-level clean-interface predicate.
-
-    A clean interface requires:
-      - docking was valid
-      - interface analysis passed
-      - no steric clash
-    """
     return (
         isinstance(row, dict)
         and row.get("dock_valid") is True
@@ -86,21 +59,6 @@ def _has_clean_interface(row: dict) -> bool:
         and row.get("interface_steric_clash") is not True
     )
 
-
-def _is_dock_valid(row: dict) -> bool:
-    return (
-        isinstance(row, dict)
-        and (
-            row.get("dock_valid") is True
-            or row.get("vina_valid") is True
-        )
-        and row.get("binding_mode") != "rejected_docking"
-    )
-
-
-# ---------------------------------------------------------------------------
-# FailureMemory
-# ---------------------------------------------------------------------------
 
 class FailureMemory:
     """
@@ -116,10 +74,8 @@ class FailureMemory:
       - record_target_failure(pdb_id, reason)
       - get_partial_success_targets()
       - get_hard_failed_targets()
-      - get_successful_targets()
     """
 
-    # Hard failures should usually be excluded from future target selection.
     HARD_TARGET_FAILURES = {
         "too_large",
         "implausible_hdock_score",
@@ -128,10 +84,8 @@ class FailureMemory:
         "hdock_timeout",
         "hdock_exception",
         "receptor_unavailable",
-        "protein_wrapper_failed",
     }
 
-    # Soft failures may still be useful for future exploitation/refinement.
     SOFT_TARGET_FAILURES = {
         "only_one_clean_pose",
         "interface_partial",
@@ -139,19 +93,13 @@ class FailureMemory:
         "weak_hdock_score",
         "no_clean_interface",
         "insufficient_dock_valid",
-        "no_docking_valid_results",
-        "no_proxy_valid_results",
-        "unknown",
     }
 
     def __init__(self, path: str | None = None):
-        self.path = path or os.getenv(
-            "VLAB_FAILURE_MEMORY_PATH",
-            "failure_memory.json",
-        )
+        self.path = path or os.getenv("VLAB_FAILURE_MEMORY_PATH", "failure_memory.json")
 
         self.memory: Dict[str, Any] = {
-            "schema_version": "failure_memory.v3",
+            "schema_version": "failure_memory.v2",
             "sequence_failures": [],
             "motif_failures": [],
             "energy_failures": [],
@@ -160,7 +108,6 @@ class FailureMemory:
             "target_failures": [],
             "partial_success_targets": [],
             "partial_success_sequences": [],
-            "successful_targets": [],
             "successful_pose_features": [],
             "run_summaries": [],
         }
@@ -169,12 +116,11 @@ class FailureMemory:
         self._ensure_schema()
 
     # ------------------------------------------------------------------
-    # Load / save
+    # LOAD / SAVE
     # ------------------------------------------------------------------
-
     def _ensure_schema(self) -> None:
         defaults = {
-            "schema_version": "failure_memory.v3",
+            "schema_version": "failure_memory.v2",
             "sequence_failures": [],
             "motif_failures": [],
             "energy_failures": [],
@@ -183,21 +129,20 @@ class FailureMemory:
             "target_failures": [],
             "partial_success_targets": [],
             "partial_success_sequences": [],
-            "successful_targets": [],
             "successful_pose_features": [],
             "run_summaries": [],
         }
 
-        for key, value in defaults.items():
-            self.memory.setdefault(key, value)
+        for k, v in defaults.items():
+            self.memory.setdefault(k, v)
 
     def _load(self) -> None:
         if not os.path.exists(self.path):
             return
 
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                loaded = json.load(handle)
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
 
             if isinstance(loaded, dict):
                 self.memory.update(loaded)
@@ -208,102 +153,34 @@ class FailureMemory:
 
     def save(self) -> None:
         try:
-            self._compact_memory()
-
-            with open(self.path, "w", encoding="utf-8") as handle:
-                json.dump(self.memory, handle, indent=2, ensure_ascii=False)
-
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.memory, f, indent=2, ensure_ascii=False)
         except Exception:
-            # Memory persistence must be non-fatal.
             pass
 
     # ------------------------------------------------------------------
-    # Internal dedupe/compaction
+    # INTERNAL DEDUPE
     # ------------------------------------------------------------------
-
     def _dedupe_by_field(self, collection: str, field: str) -> None:
-        """
-        Dedupe dict records by a single field.
-
-        Latest record for each key wins.
-        """
         rows = self.memory.get(collection, []) or []
-        seen: dict[str, dict] = {}
+        seen = {}
 
         for row in rows:
             if not isinstance(row, dict):
                 continue
 
             key = str(row.get(field, "") or "").strip().upper()
-
             if not key:
                 continue
 
+            # latest record wins
             seen[key] = row
 
         self.memory[collection] = list(seen.values())
 
-    def _dedupe_by_composite_key(
-        self,
-        collection: str,
-        fields: list[str],
-    ) -> None:
-        """
-        Dedupe dict records by a tuple of fields.
-
-        Latest record for each composite key wins.
-        """
-        rows = self.memory.get(collection, []) or []
-        seen: dict[tuple, dict] = {}
-
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-
-            key = tuple(str(row.get(field, "") or "").strip().upper() for field in fields)
-
-            if not any(key):
-                continue
-
-            seen[key] = row
-
-        self.memory[collection] = list(seen.values())
-
-    def _cap_collection(self, collection: str, limit: int) -> None:
-        rows = self.memory.get(collection, []) or []
-
-        if isinstance(rows, list) and len(rows) > limit:
-            self.memory[collection] = rows[-limit:]
-
-    def _compact_memory(self) -> None:
-        """
-        Keep memory useful and bounded.
-        """
-        self._dedupe_by_composite_key(
-            "interface_failures",
-            ["target_pdb", "sequence", "reason"],
-        )
-        self._dedupe_by_composite_key(
-            "successful_pose_features",
-            ["target_pdb", "sequence"],
-        )
-        self._dedupe_by_field("target_failures", "pdb_id")
-        self._dedupe_by_field("partial_success_targets", "pdb_id")
-        self._dedupe_by_field("partial_success_sequences", "sequence")
-        self._dedupe_by_field("successful_targets", "pdb_id")
-
-        self._cap_collection("sequence_failures", 500)
-        self._cap_collection("motif_failures", 300)
-        self._cap_collection("energy_failures", 300)
-        self._cap_collection("structural_failures", 300)
-        self._cap_collection("interface_failures", 300)
-        self._cap_collection("successful_pose_features", 300)
-        self._cap_collection("run_summaries", 200)
-
     # ------------------------------------------------------------------
-    # Record methods
+    # RECORD METHODS
     # ------------------------------------------------------------------
-
     def record_sequence_failure(
         self,
         seq: str,
@@ -311,7 +188,6 @@ class FailureMemory:
         metadata: Optional[dict] = None,
     ) -> None:
         seq = _clean_rna(seq)
-
         if not seq:
             return
 
@@ -332,12 +208,7 @@ class FailureMemory:
         units: str = "hdock_relative_score",
         metadata: Optional[dict] = None,
     ) -> None:
-        """
-        Record docking/ranking-score failure or spread issue.
-
-        best_dg is kept for backward compatibility, but HDOCK values are not
-        physical binding free energies.
-        """
+        # Backward compatibility: old callers pass best_dg.
         score = best_score if best_score is not None else best_dg
 
         if score is None:
@@ -375,7 +246,6 @@ class FailureMemory:
 
     def record_motif_failure(self, motif_desc: str) -> None:
         motif_desc = str(motif_desc or "").strip()
-
         if not motif_desc:
             return
 
@@ -416,7 +286,6 @@ class FailureMemory:
         metadata: Optional[dict] = None,
     ) -> None:
         pdb_id = _pdb_id(pdb_id)
-
         if not pdb_id:
             return
 
@@ -438,7 +307,6 @@ class FailureMemory:
         row: Optional[dict] = None,
     ) -> None:
         pdb_id = _pdb_id(pdb_id)
-
         if not pdb_id:
             return
 
@@ -450,7 +318,6 @@ class FailureMemory:
                 "pdb_id": pdb_id,
                 "sequence": seq,
                 "dock_score": row.get("dock_score"),
-                "binding_rank_score": row.get("binding_rank_score"),
                 "interface_quality_score": row.get("interface_quality_score"),
                 "interface_min_distance_A": row.get("interface_min_distance_A"),
                 "interface_basic_residue_contacts": row.get("interface_basic_residue_contacts"),
@@ -472,34 +339,9 @@ class FailureMemory:
 
             self._dedupe_by_field("partial_success_sequences", "sequence")
 
-    def record_successful_target(
-        self,
-        pdb_id: str,
-        clean_pose_count: int,
-        binding_result_count: int,
-        metadata: Optional[dict] = None,
-    ) -> None:
-        pdb_id = _pdb_id(pdb_id)
-
-        if not pdb_id:
-            return
-
-        self.memory["successful_targets"].append(
-            {
-                "pdb_id": pdb_id,
-                "clean_pose_count": int(clean_pose_count or 0),
-                "binding_result_count": int(binding_result_count or 0),
-                "metadata": metadata or {},
-                "timestamp": _now_iso(),
-            }
-        )
-
-        self._dedupe_by_field("successful_targets", "pdb_id")
-
     # ------------------------------------------------------------------
-    # Ingest methods
+    # INGEST METHODS
     # ------------------------------------------------------------------
-
     def ingest_skeptic_output(
         self,
         critique: str,
@@ -535,7 +377,6 @@ class FailureMemory:
 
                 if m_best:
                     best_score = _safe_float(m_best.group(1))
-
                 if m_spread:
                     spread = _safe_float(m_spread.group(1))
 
@@ -556,28 +397,21 @@ class FailureMemory:
 
     def ingest_run_state(self, state: dict) -> None:
         """
-        Ingest final/intermediate run state with interface-aware labels.
-
-        This is the main bridge from docking results to persistent memory.
+        Ingest final/intermediate state with interface-aware labels.
+        This is the main bridge from docking results to memory.
         """
         if not isinstance(state, dict):
             return
 
         binding_results = state.get("binding_results", []) or []
         accepted_target = state.get("target_pdb")
-        accepted_target_norm = _pdb_id(accepted_target)
 
-        clean_rows: list[dict] = []
-        clash_rows: list[dict] = []
+        clean_rows = []
+        clash_rows = []
 
-        # ------------------------------------------------------------
-        # Pose-level signals
-        # ------------------------------------------------------------
         for row in binding_results:
             if not isinstance(row, dict):
                 continue
-
-            row_target = _pdb_id(row.get("target_pdb"))
 
             if _has_clean_interface(row):
                 clean_rows.append(row)
@@ -585,7 +419,7 @@ class FailureMemory:
                 self.memory["successful_pose_features"].append(
                     {
                         "sequence": _clean_rna(row.get("sequence")),
-                        "target_pdb": row_target,
+                        "target_pdb": _pdb_id(row.get("target_pdb")),
                         "dock_score": row.get("dock_score"),
                         "binding_rank_score": row.get("binding_rank_score"),
                         "interface_quality_score": row.get("interface_quality_score"),
@@ -596,24 +430,19 @@ class FailureMemory:
                     }
                 )
 
-                # Partial success if no accepted target OR this clean pose belongs
-                # to a non-accepted/competing target.
-                if not accepted_target_norm or row_target != accepted_target_norm:
+                if accepted_target is None:
                     self.record_partial_success_target(
-                        row_target,
+                        row.get("target_pdb"),
                         sequence=row.get("sequence"),
                         row=row,
                     )
 
-            elif _is_dock_valid(row):
+            elif row.get("dock_valid"):
                 if row.get("interface_steric_clash"):
                     clash_rows.append(row)
                     self.record_interface_failure(row, reason="steric_clash")
 
-        # ------------------------------------------------------------
-        # Explicit failed targets from state
-        # Supports legacy list[str] and new list[dict].
-        # ------------------------------------------------------------
+        # Ingest failed targets. Supports list[str] and list[dict].
         for item in state.get("failed_target_pdbs", []) or []:
             if isinstance(item, dict):
                 self.record_target_failure(
@@ -624,87 +453,7 @@ class FailureMemory:
             elif item:
                 self.record_target_failure(str(item), "unknown")
 
-        # ------------------------------------------------------------
-        # Derived target-level outcomes from interface results.
-        # This ensures target failure reasons exist even if the protein agent
-        # only stored raw binding rows.
-        # ------------------------------------------------------------
-        target_to_rows: dict[str, list[dict]] = {}
-
-        for row in binding_results:
-            if not isinstance(row, dict):
-                continue
-
-            pdb = _pdb_id(row.get("target_pdb"))
-
-            if not pdb:
-                continue
-
-            target_to_rows.setdefault(pdb, []).append(row)
-
-        for pdb, rows in target_to_rows.items():
-            dock_valid_rows = [r for r in rows if _is_dock_valid(r)]
-            clean_count = sum(1 for r in rows if _has_clean_interface(r))
-
-            if not dock_valid_rows:
-                continue
-
-            # Do not mark the accepted target as failed if it exists.
-            if accepted_target_norm and pdb == accepted_target_norm:
-                continue
-
-            if clean_count == 0:
-                self.record_target_failure(
-                    pdb,
-                    "no_clean_interface",
-                    {
-                        "clean_count": 0,
-                        "dock_valid_count": len(dock_valid_rows),
-                        "row_count": len(rows),
-                    },
-                )
-
-            elif clean_count == 1:
-                self.record_target_failure(
-                    pdb,
-                    "only_one_clean_pose",
-                    {
-                        "clean_count": 1,
-                        "dock_valid_count": len(dock_valid_rows),
-                        "row_count": len(rows),
-                    },
-                )
-
-        # ------------------------------------------------------------
-        # Accepted target success memory
-        # ------------------------------------------------------------
-        if accepted_target_norm:
-            accepted_rows = [
-                r for r in binding_results
-                if isinstance(r, dict)
-                and _pdb_id(r.get("target_pdb")) == accepted_target_norm
-            ]
-
-            accepted_clean_count = sum(
-                1 for r in accepted_rows
-                if _has_clean_interface(r)
-            )
-
-            self.record_successful_target(
-                accepted_target_norm,
-                clean_pose_count=accepted_clean_count,
-                binding_result_count=len(accepted_rows),
-                metadata={
-                    "research_topic": state.get("research_topic"),
-                    "target_selection_reason": state.get("target_pdb_selection_reason"),
-                },
-            )
-
-        # ------------------------------------------------------------
-        # Energy / joint physics memory
-        # ------------------------------------------------------------
         feedback = state.get("joint_physics_feedback", {}) or {}
-
         self.record_energy_failure(
             best_score=feedback.get("best_binding_score"),
             spread=feedback.get("binding_score_spread"),
@@ -712,10 +461,7 @@ class FailureMemory:
             metadata={"source": "joint_physics_feedback"},
         )
 
-        # ------------------------------------------------------------
-        # Run summary
-        # ------------------------------------------------------------
-        if accepted_target_norm:
+        if accepted_target:
             run_label = "successful_target_selected"
         elif clean_rows:
             run_label = "partial_success_clean_pose_no_target"
@@ -736,15 +482,13 @@ class FailureMemory:
             }
         )
 
-        self._compact_memory()
         self.save()
 
     # ------------------------------------------------------------------
-    # Query methods
+    # QUERY METHODS
     # ------------------------------------------------------------------
-
     def get_hard_failed_targets(self) -> set[str]:
-        out: set[str] = set()
+        out = set()
 
         for row in self.memory.get("target_failures", []) or []:
             if not isinstance(row, dict):
@@ -752,14 +496,13 @@ class FailureMemory:
 
             if row.get("reason") in self.HARD_TARGET_FAILURES:
                 pdb = _pdb_id(row.get("pdb_id"))
-
                 if pdb:
                     out.add(pdb)
 
         return out
 
     def get_soft_failed_targets(self) -> set[str]:
-        out: set[str] = set()
+        out = set()
 
         for row in self.memory.get("target_failures", []) or []:
             if not isinstance(row, dict):
@@ -767,83 +510,39 @@ class FailureMemory:
 
             if row.get("reason") in self.SOFT_TARGET_FAILURES:
                 pdb = _pdb_id(row.get("pdb_id"))
-
                 if pdb:
                     out.add(pdb)
 
         return out
 
-    def get_successful_targets(self) -> list[str]:
-        hard_failed = self.get_hard_failed_targets()
-        rows = self.memory.get("successful_targets", []) or []
-
-        rows = sorted(
-            [
-                r for r in rows
-                if isinstance(r, dict) and _pdb_id(r.get("pdb_id")) not in hard_failed
-            ],
-            key=lambda r: (
-                -(int(r.get("clean_pose_count") or 0)),
-                -(int(r.get("binding_result_count") or 0)),
-            ),
-        )
-
-        out = [_pdb_id(r.get("pdb_id")) for r in rows if _pdb_id(r.get("pdb_id"))]
-
-        return list(dict.fromkeys(out))
-
     def get_partial_success_targets(self) -> list[str]:
-        """
-        Return partial-success targets sorted by interface quality.
-
-        Hard-failed targets are excluded.
-        """
         hard_failed = self.get_hard_failed_targets()
-        rows = self.memory.get("partial_success_targets", []) or []
+        out = []
 
-        usable_rows = [
-            r for r in rows
-            if isinstance(r, dict)
-            and _pdb_id(r.get("pdb_id"))
-            and _pdb_id(r.get("pdb_id")) not in hard_failed
-        ]
+        for row in self.memory.get("partial_success_targets", []) or []:
+            if not isinstance(row, dict):
+                continue
 
-        usable_rows = sorted(
-            usable_rows,
-            key=lambda r: (
-                -float(r.get("interface_quality_score") or 0.0),
-                float(r.get("interface_min_distance_A") or 999.0),
-                -float(r.get("interface_rna_span_covered") or 0.0),
-            ),
-        )
+            pdb = _pdb_id(row.get("pdb_id"))
 
-        out = [
-            _pdb_id(r.get("pdb_id"))
-            for r in usable_rows
-            if _pdb_id(r.get("pdb_id"))
-        ]
+            if pdb and pdb not in hard_failed:
+                out.append(pdb)
 
         return list(dict.fromkeys(out))
 
     def get_partial_success_sequences(self) -> list[str]:
-        out: list[str] = []
+        out = []
 
         for row in self.memory.get("partial_success_sequences", []) or []:
             if isinstance(row, dict):
                 seq = _clean_rna(row.get("sequence"))
-
                 if seq:
                     out.append(seq)
 
         return list(dict.fromkeys(out))
 
     def get_failure_penalty(self, seq: str) -> float:
-        """
-        Returns a penalty scalar in [0, 1] based on similarity to past
-        sequence-level failures.
-        """
         seq = _clean_rna(seq)
-
         if not seq:
             return 0.0
 
@@ -856,14 +555,10 @@ class FailureMemory:
                 continue
 
             n = min(len(seq), len(failed_seq))
-
             if n == 0:
                 continue
 
-            matches = sum(
-                1 for a, b in zip(seq[:n], failed_seq[:n])
-                if a == b
-            )
+            matches = sum(1 for a, b in zip(seq[:n], failed_seq[:n]) if a == b)
             similarity = matches / max(1, n)
 
             if similarity > 0.7:
@@ -872,51 +567,35 @@ class FailureMemory:
         return min(penalty, 1.0)
 
     def get_energy_bias(self) -> float:
-        """
-        Returns scalar pressure for increasing binding exploration.
+        values = []
 
-        HDOCK-relative scores are not physical free energies. This simply
-        detects whether recent best scores are weak/near zero.
-        """
-        values: list[float] = []
-
-        for item in self.memory.get("energy_failures", []) or []:
-            if not isinstance(item, dict):
+        for e in self.memory.get("energy_failures", []) or []:
+            if not isinstance(e, dict):
                 continue
 
-            value = item.get("best_score", item.get("best_dg"))
-            value = _safe_float(value)
+            v = e.get("best_score", e.get("best_dg"))
+            v = _safe_float(v)
 
-            if value is not None:
-                values.append(value)
+            if v is not None:
+                values.append(v)
 
         if not values:
             return 0.0
 
         avg = sum(values) / len(values)
 
-        if avg > -20:
-            return 0.30
-
-        if avg > -50:
-            return 0.15
+        # For HDOCK-relative scores, weak/absent binding often trends near zero.
+        if avg > -30:
+            return 0.2
 
         return 0.0
 
     # ------------------------------------------------------------------
-    # Backward-compatible update
+    # BACKWARD-COMPAT UPDATE
     # ------------------------------------------------------------------
-
     def update(self, parsed: Dict) -> None:
         """
-        Accept parsed Skeptic output and convert into memory entries.
-
-        Expected parser keys may include:
-          - best_binding_score
-          - dg_best
-          - spread
-          - concerns
-          - missing_controls
+        Accept parsed skeptic output and convert into memory entries.
         """
         if not parsed:
             return
@@ -937,10 +616,6 @@ class FailureMemory:
 
         self.save()
 
-    # ------------------------------------------------------------------
-    # Objective weights
-    # ------------------------------------------------------------------
-
     def compute_failure_weights(self) -> Dict[str, float]:
         """
         Convert persistent memory into objective bias weights for PI.
@@ -952,7 +627,6 @@ class FailureMemory:
         motif_failures = self.memory.get("motif_failures", []) or []
         interface_failures = self.memory.get("interface_failures", []) or []
         partial_success = self.memory.get("partial_success_targets", []) or []
-        successful_targets = self.memory.get("successful_targets", []) or []
 
         if len(energy_failures) > 3:
             weights["binding_pressure"] = 0.2
@@ -966,88 +640,23 @@ class FailureMemory:
         if len(interface_failures) > 2:
             weights["interface_pressure"] = 0.35
             weights["clash_avoidance_pressure"] = 0.30
-            weights["structure_pressure"] = max(
-                weights.get("structure_pressure", 0.0),
-                0.2,
-            )
+            weights["structure_pressure"] = max(weights.get("structure_pressure", 0.0), 0.2)
 
         if partial_success:
-            weights["interface_pressure"] = max(
-                weights.get("interface_pressure", 0.0),
-                0.35,
-            )
+            weights["interface_pressure"] = max(weights.get("interface_pressure", 0.0), 0.35)
             weights["target_specific_exploitation"] = 1.0
 
-        if successful_targets:
-            weights["target_reuse_pressure"] = 0.25
-            weights["interface_pressure"] = max(
-                weights.get("interface_pressure", 0.0),
-                0.25,
-            )
-
         spreads = []
-
-        for item in energy_failures:
-            if not isinstance(item, dict):
-                continue
-
-            spread = _safe_float(item.get("spread"))
-
-            if spread is not None:
-                spreads.append(spread)
+        for e in energy_failures:
+            if isinstance(e, dict):
+                s = _safe_float(e.get("spread"))
+                if s is not None:
+                    spreads.append(s)
 
         if spreads and sum(spreads) / len(spreads) < 3:
             weights["convergence_pressure"] = 0.3
 
-        energy_bias = self.get_energy_bias()
-
-        if energy_bias > 0:
-            weights["binding_pressure"] = max(
-                weights.get("binding_pressure", 0.0),
-                energy_bias,
-            )
-
         return weights
 
     # ------------------------------------------------------------------
-    # Apply to scoring
-    # ------------------------------------------------------------------
-
-    def adjust_score(self, seq: str, score: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Adjust a candidate score dict using persistent failure memory.
-
-        This is intentionally lightweight because it runs inside optimisation.
-        """
-        score = dict(score)
-        penalty = self.get_failure_penalty(seq)
-
-        if penalty > 0:
-            for key, value in list(score.items()):
-                try:
-                    if isinstance(value, (int, float)):
-                        score[key] = float(value) * (1 - penalty)
-                except Exception:
-                    pass
-
-        weights = self.compute_failure_weights()
-
-        if "binding" in score:
-            score["binding"] = float(score.get("binding", 0.0)) + weights.get(
-                "binding_pressure",
-                0.0,
-            )
-
-        if "structure" in score:
-            score["structure"] = float(score.get("structure", 0.0)) + weights.get(
-                "structure_pressure",
-                0.0,
-            )
-
-        if "interface" in score:
-            score["interface"] = float(score.get("interface", 0.0)) + weights.get(
-                "interface_pressure",
-                0.0,
-            )
-
-        return score
+    # APPLY TO SCORING

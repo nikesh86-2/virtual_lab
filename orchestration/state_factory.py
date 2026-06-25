@@ -51,6 +51,9 @@ def build_initial_state(
         "target_pdb": None,
         "target_pdb_candidates": [],
         "failed_target_pdbs": [],
+        "partial_success_targets": [],
+        "partial_success_sequences": [],
+        "target_failure_records": [],
         "target_pdb_selection_reason": "",
         "target_pdb_metadata": {},
         "target_pdb_rankings": [],
@@ -71,6 +74,10 @@ def build_initial_state(
         "results_log": [],
         "stage_outputs": [],
         "conversation_history": [],
+
+        "literature_motif_hints": [],
+        "literature_target_hints": [],
+        "literature_policy_text": "",
 
         "previous_hypotheses": [],
 

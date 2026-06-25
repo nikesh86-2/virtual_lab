@@ -132,9 +132,42 @@ class HDockDocking:
             return self._fallback(f"Invalid ligand PDB: {ligand_pdb}")
 
         ligand_base = Path(ligand_pdb).with_suffix("")
-        output_out = str(ligand_base.parent / f"{ligand_base.name}_hdock.out")
-        output_complex = str(ligand_base.parent / f"{ligand_base.name}_hdock_complex.pdb")
-        run_id = self._run_id(receptor_pdb, ligand_pdb)
+        createpl_timeout = self._getenv_int(
+            "CREATEPL_TIMEOUT",
+            self.createpl_timeout,
+            min_value=1,
+        )
+
+        run_id = self._run_id(
+            receptor_pdb,
+            ligand_pdb,
+            n_models=n_models,
+            timeout=timeout,
+            createpl_timeout=createpl_timeout,
+        )
+
+        output_out = str(
+            ligand_base.parent / f"{ligand_base.name}_{run_id}_hdock.out"
+        )
+        output_complex = str(
+            ligand_base.parent / f"{ligand_base.name}_{run_id}_hdock_complex.pdb"
+        )
+        failure_meta = {
+                        "hdock_run_id": run_id,
+                        "receptor_pdb_input": receptor_pdb,
+                        "ligand_pdb_input": ligand_pdb,
+                        "n_models": n_models,
+                    }
+
+        log.info(
+            "[HDOCK RUN] run_id=%s receptor=%s ligand=%s output=%s complex=%s",
+            run_id,
+            receptor_pdb,
+            ligand_pdb,
+            output_out,
+            output_complex,
+        )
+
 
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -154,14 +187,23 @@ class HDockDocking:
                 log.info("[HDOCK CMD] %s", " ".join(cmd))
                 log.info("[HDOCK CONFIG] timeout=%s n_models=%s", timeout, n_models)
 
-                result = subprocess.run(
-                    cmd,
-                    cwd=work,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=timeout,
-                )
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        cwd=work,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=timeout,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    self._maybe_preserve_debug(work, run_id)
+                    return self._fallback(
+                        f"HDOCK timed out after {timeout}s",
+                        stdout=e.stdout or "",
+                        stderr=e.stderr or "",
+                        **failure_meta,
+                    )
 
                 stdout = result.stdout or ""
                 stderr = result.stderr or ""
@@ -172,6 +214,7 @@ class HDockDocking:
                         f"HDOCK failed rc={result.returncode}: {self._trim(stderr or stdout)}",
                         stdout=stdout,
                         stderr=stderr,
+                        **failure_meta
                     )
 
                 out_file = self._discover_hdock_output(work)
@@ -182,6 +225,7 @@ class HDockDocking:
                         "No hdock.out generated",
                         stdout=stdout,
                         stderr=stderr,
+                        **failure_meta
                     )
 
                 shutil.copy2(out_file, output_out)
@@ -191,16 +235,20 @@ class HDockDocking:
                 if score is None:
                     self._maybe_preserve_debug(work, run_id)
                     return self._fallback(
-                        "Score parse failed",
-                        stdout=stdout,
-                        stderr=stderr,
-                    )
+                    "Score parse failed",
+                    stdout=stdout,
+                    stderr=stderr,
+                    **failure_meta,
+                )
+
 
                 complex_status = self._create_complex(
                     work_dir=work,
                     hdock_out=out_file,
                     n_models=n_models,
+                    createpl_timeout=createpl_timeout,
                 )
+
 
                 final_complex = None
 
@@ -229,7 +277,11 @@ class HDockDocking:
                     "dock_complex_file": final_complex,
                     "complex_status": complex_status,
 
-                    # Legacy Vina compatibility fields.
+                    "hdock_run_id": run_id,
+                    "receptor_pdb_input": receptor_pdb,
+                    "ligand_pdb_input": ligand_pdb,
+                    "n_models": n_models,
+
                     "vina_energy": score,
                     "vina_valid": True,
                     "vina_method": "hdock",
@@ -247,6 +299,7 @@ class HDockDocking:
         work_dir: Path,
         hdock_out: Path,
         n_models: int,
+        createpl_timeout: Optional[int] = None,
     ) -> dict:
         if not self._binary_exists(self.createpl_path):
             return {"valid": False, "error": "createpl missing"}
@@ -297,11 +350,7 @@ class HDockDocking:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=self._getenv_int(
-                        "CREATEPL_TIMEOUT",
-                        self.createpl_timeout,
-                        min_value=1,
-                    ),
+                    timeout=createpl_timeout if createpl_timeout is not None else self.createpl_timeout,
                 )
 
             except Exception as e:
@@ -428,7 +477,8 @@ class HDockDocking:
         text = Path(path_like).read_text(errors="ignore")
 
         patterns = [
-            r"^\s*1\s+(-?\d+(?:\.\d+)?)",
+            r"^\s*1\s+(-?\d+(?:\.\d+)?)\s+",
+            r"^\s*MODEL\s+1\b.*?score\s*[:=]\s*(-?\d+(?:\.\d+)?)",
             r"score\s*[:=]\s*(-?\d+(?:\.\d+)?)",
             r"energy\s*[:=]\s*(-?\d+(?:\.\d+)?)",
         ]
@@ -442,18 +492,6 @@ class HDockDocking:
                 except Exception:
                     pass
 
-        values = re.findall(r"-?\d+\.\d+", text)
-
-        for value in values:
-            try:
-                f = float(value)
-
-                if f < -1:
-                    return f
-
-            except Exception:
-                continue
-
         return None
 
     def _fallback(
@@ -461,8 +499,9 @@ class HDockDocking:
         error: str,
         stdout: str = "",
         stderr: str = "",
+        **metadata,
     ) -> dict:
-        return {
+        result = {
             "valid": False,
             "dock_valid": False,
             "error": error,
@@ -484,6 +523,9 @@ class HDockDocking:
             "vina_error": error,
         }
 
+        result.update(metadata)
+        return result
+
     @staticmethod
     def _binary_exists(path_like) -> bool:
         if not path_like:
@@ -501,11 +543,52 @@ class HDockDocking:
         return text[:n] + "...[truncated]"
 
     @staticmethod
-    def _run_id(receptor_pdb: str, ligand_pdb: str) -> str:
+    def _file_sha1(path_like: str | Path) -> str:
         h = hashlib.sha1()
-        h.update(str(receptor_pdb).encode())
-        h.update(str(ligand_pdb).encode())
-        return h.hexdigest()[:12]
+        path = Path(path_like)
+
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                h.update(chunk)
+
+        return h.hexdigest()
+
+
+    def _run_id(
+        self,
+        receptor_pdb: str,
+        ligand_pdb: str,
+        n_models: Optional[int] = None,
+        timeout: Optional[int] = None,
+        createpl_timeout: Optional[int] = None,
+    ) -> str:
+        h = hashlib.sha1()
+
+        try:
+            receptor_hash = self._file_sha1(receptor_pdb)
+        except Exception:
+            receptor_hash = str(receptor_pdb)
+
+        try:
+            ligand_hash = self._file_sha1(ligand_pdb)
+        except Exception:
+            ligand_hash = str(ligand_pdb)
+
+        payload = "|".join(
+            [
+                "hdock_v2",
+                receptor_hash,
+                ligand_hash,
+                str(n_models if n_models is not None else self.models),
+                str(timeout if timeout is not None else self.timeout),
+                str(createpl_timeout if createpl_timeout is not None else self.createpl_timeout),
+                str(self.hdock_path),
+                str(self.createpl_path),
+            ]
+        )
+
+        h.update(payload.encode("utf-8"))
+        return h.hexdigest()[:16]
 
     def _maybe_preserve_debug(
         self,

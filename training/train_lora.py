@@ -1,104 +1,70 @@
 """
-train_lora.py
+auto_retrain.py
 
-Fine-tunes your model using LoRA on your lab-generated dataset
+Automated pipeline:
+postrun JSONL → clean → HF dataset → LoRA training
+
+Usage:
+  PY=/path/to/python python training/auto_retrain.py
 """
 
-import torch
-import yaml
-from datasets import load_from_disk
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling,
-)
-from peft import LoraConfig, get_peft_model
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
 
 
-# ------------------------------------------------------------
-# LOAD CONFIG
-# ------------------------------------------------------------
-with open("training/training_config.yaml") as f:
-    config = yaml.safe_load(f)
-
-model_name = config["model_name"]
-output_dir = config["output_dir"]
-
-train_config = config["training"]
-lora_config = config["lora"]
-max_length = config["max_length"]
-
-# ------------------------------------------------------------
-# LOAD MODEL
-# ------------------------------------------------------------
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    device_map="auto",
-    torch_dtype=torch.float16,
-)
+PY = os.getenv("PY", "python")
+POSTRUN_DIR = Path("postrun_training_data")
+TRAINING_DIR = Path("training")
 
 
-# ------------------------------------------------------------
-# APPLY LORA
-# ------------------------------------------------------------
-peft_config = LoraConfig(
-    r=lora_config["r"],
-    lora_alpha=lora_config["alpha"],
-    lora_dropout=lora_config["dropout"],
-    target_modules=["q_proj", "v_proj"],
-)
-
-model = get_peft_model(model, peft_config)
+def run(cmd: str) -> None:
+    print(f"\n>>> {cmd}\n")
+    subprocess.run(cmd, shell=True, check=True)
 
 
-# ------------------------------------------------------------
-# LOAD DATASET
-# ------------------------------------------------------------
-dataset = load_from_disk("training/hf_dataset")
+def count_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as f:
+        return sum(1 for _ in f)
 
 
-def tokenize(example):
-    return tokenizer(
-        example["text"],
-        truncation=True,
-        padding="max_length",
-        max_length=max_length,
-    )
+def main() -> None:
+    print("=== AUTO RETRAIN PIPELINE ===")
+
+    TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Validate + clean selected SFT data.
+    run(f"{PY} training/validate_dataset.py")
+
+    cleaned_path = TRAINING_DIR / "clean_dataset.jsonl"
+
+    if not cleaned_path.exists():
+        print("Clean dataset not found — skipping training")
+        return
+
+    num_lines = count_lines(cleaned_path)
+    size_bytes = cleaned_path.stat().st_size
+
+    print(f"Clean dataset rows: {num_lines}")
+    print(f"Clean dataset size: {size_bytes} bytes")
+
+    if num_lines < int(os.getenv("VLAB_MIN_TRAIN_ROWS", "20")) or size_bytes < int(os.getenv("VLAB_MIN_TRAIN_BYTES", "5000")):
+        print("Dataset too small — skipping training")
+        return
+
+    # 2. Convert to HF dataset.
+    run(f"{PY} training/convert_to_hf_dataset.py")
+
+    # 3. Train LoRA.
+    run(f"{PY} training/train_lora.py")
+
+    print("\nRetrain complete")
 
 
-dataset = dataset.map(tokenize, batched=True)
-
-
-# ------------------------------------------------------------
-# TRAINER
-# ------------------------------------------------------------
-training_args = TrainingArguments(
-    output_dir=output_dir,
-    per_device_train_batch_size=train_config["batch_size"],
-    gradient_accumulation_steps=train_config["gradient_accumulation_steps"],
-    num_train_epochs=train_config["epochs"],
-    learning_rate=float(train_config["learning_rate"]),
-    fp16=True,
-    logging_steps=10,
-    save_strategy="epoch",
-    report_to="none",
-)
-
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=dataset,
-    data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
-)
-
-trainer.train()
-
-model.save_pretrained(output_dir)
-tokenizer.save_pretrained(output_dir)
-
-print("\n✅ Training complete")
-print(f"✅ Model saved to: {output_dir}")
+if __name__ == "__main__":
+    main()

@@ -10,13 +10,13 @@ from VLAB2.optimisation.final_rna_design_system import run_system
 from VLAB2.utils.pareto_analysis import analyse_pareto
 
 from VLAB2.orchestration.failure_memory import FailureMemory
+from VLAB2.orchestration.literature_memory import LiteratureMemory
 from VLAB2.orchestration.llm import get_llm
 from VLAB2.orchestration.state_schema import LabState
 
 from VLAB2.orchestration.utils.env_utils import getenv_float
 from VLAB2.orchestration.utils.fold_utils import motif_summary_from_state
 from VLAB2.orchestration.utils.hypothesis_utils import (
-    critique_reports_high_spread,
     critique_signal_summary_for_pi,
     fallback_qualitative_hypothesis,
     hypothesis_contains_bad_metric_threshold,
@@ -90,6 +90,7 @@ def _parse_n_valid_from_critique(critique: str) -> int | None:
 
     return None
 
+
 def _parse_score_spread_from_critique(critique: str) -> float | None:
     """
     Extract score spread from Skeptic critique.
@@ -107,19 +108,64 @@ def _parse_score_spread_from_critique(critique: str) -> float | None:
             critique,
             flags=re.IGNORECASE,
         )
+
         if m:
             return float(m.group(1))
+
     except Exception:
         return None
 
     return None
 
 
+def _normalise_failed_target_records(records: list) -> list[dict]:
+    """
+    Normalise failed_target_pdbs to list[dict] while supporting legacy list[str].
+
+    Output shape:
+      {
+        "pdb_id": "2GE7",
+        "reason": "only_one_clean_pose",
+        "metadata": {...}
+      }
+    """
+    out: dict[str, dict] = {}
+
+    for item in records or []:
+        if isinstance(item, dict):
+            pdb = str(item.get("pdb_id", "") or "").strip().upper()
+
+            if not pdb:
+                continue
+
+            out[pdb] = {
+                "pdb_id": pdb,
+                "reason": item.get("reason", "unknown"),
+                "metadata": item.get("metadata", {}),
+            }
+
+        elif item:
+            pdb = str(item).strip().upper()
+
+            if pdb:
+                out[pdb] = {
+                    "pdb_id": pdb,
+                    "reason": "unknown",
+                    "metadata": {},
+                }
+
+    return list(out.values())
+
+
+# ---------------------------------------------------------------------------
+# Target reset logic
+# ---------------------------------------------------------------------------
+
 def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
     """
     Conservatively reset target_pdb when Skeptic reports problematic docking spread.
 
-    New behaviour:
+    Behaviour:
       - Do not reset a target solely because spread is moderate/high.
       - Keep a target if the best HDOCK-relative score is already favourable.
       - Reset only when spread is high AND best binding is weak.
@@ -210,9 +256,25 @@ def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
     )
 
     if mark_reset_as_failed:
-        failed_targets = list(state.get("failed_target_pdbs", []))
-        failed_targets.append(str(target_pdb).upper())
-        state["failed_target_pdbs"] = list(dict.fromkeys(failed_targets))
+        failed_targets = _normalise_failed_target_records(
+            list(state.get("failed_target_pdbs", []) or [])
+        )
+
+        failed_targets.append(
+            {
+                "pdb_id": str(target_pdb).upper(),
+                "reason": "reset_high_spread",
+                "metadata": {
+                    "score_spread": score_spread,
+                    "best_binding_score": best_score,
+                    "accept_binding_score": accept_binding_score,
+                    "max_accept_spread": max_accept_spread,
+                },
+            }
+        )
+
+        state["failed_target_pdbs"] = _normalise_failed_target_records(failed_targets)
+
     else:
         log.info(
             "Target %s was reset but not marked failed because "
@@ -224,11 +286,16 @@ def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
 
     return None
 
+
+# ---------------------------------------------------------------------------
+# Joint physics feedback
+# ---------------------------------------------------------------------------
+
 def _compute_joint_physics_feedback(state: LabState) -> dict:
     """
-    Combine docking and MD signals into unified PI feedback.
+    Combine docking, interface, and MD signals into unified PI feedback.
 
-    Returns normalised-ish signals in [0, 1]:
+    Returns heuristic signals in [0, 1]:
 
       binding_signal:
         Uses binding_rank_score/dg. More negative docking/ranking scores are better.
@@ -239,8 +306,10 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
       fluctuation_signal:
         Uses MD energy_fluctuation. Lower fluctuation is better.
 
-    These are intentionally heuristic signals for adaptive objective pressure,
-    not physical free-energy estimates.
+      interface_signal:
+        Uses interface quality, clean-interface count, and clash penalties.
+
+    These are optimisation heuristics, not physical free-energy estimates.
     """
     # ------------------------------------------------------------------
     # Docking / binding signal
@@ -252,7 +321,6 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
         if not isinstance(r, dict):
             continue
 
-        # Prefer docking-validated, non-rejected results only.
         if not (r.get("dock_valid") or r.get("vina_valid")):
             continue
 
@@ -285,11 +353,10 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
     if dock_scores:
         best_dock = min(dock_scores)
 
-        # More negative = better. Scale roughly assuming useful scores are
-        # frequently in the -50 to -100 range for HDOCK-relative ranks.
+        # More negative = better. HDOCK-relative/rank scale heuristic.
         binding_signal = min(1.0, max(0.0, abs(best_dock) / 100.0))
-
         score_spread = max(dock_scores) - min(dock_scores)
+
     else:
         best_dock = None
         binding_signal = 0.0
@@ -336,9 +403,6 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
 
     if min_energies:
         best_min_energy = min(min_energies)
-
-        # More negative = more stable. Cap at 1.0.
-        # The denominator is heuristic and deliberately conservative.
         stability_signal = min(1.0, max(0.0, abs(best_min_energy) / 50.0))
     else:
         best_min_energy = None
@@ -346,13 +410,50 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
 
     if fluctuations:
         mean_fluctuation = sum(fluctuations) / max(1, len(fluctuations))
-
-        # Lower fluctuation = better. This intentionally compresses very high
-        # fluctuation values toward zero.
         fluctuation_signal = 1.0 / (1.0 + mean_fluctuation)
     else:
         mean_fluctuation = None
         fluctuation_signal = 0.0
+
+    # ------------------------------------------------------------------
+    # Interface signal
+    # ------------------------------------------------------------------
+    interface_scores = []
+    clean_interface_count = 0
+    clash_count = 0
+
+    for r in binding_results:
+        if not isinstance(r, dict):
+            continue
+
+        if not r.get("dock_valid"):
+            continue
+
+        if r.get("interface_quality_score") is not None:
+            try:
+                interface_scores.append(float(r["interface_quality_score"]))
+            except Exception:
+                pass
+
+        if (
+            r.get("interface_passed") is True
+            and r.get("interface_steric_clash") is not True
+        ):
+            clean_interface_count += 1
+
+        if r.get("interface_steric_clash") is True:
+            clash_count += 1
+
+    if interface_scores:
+        interface_signal = max(0.0, min(1.0, max(interface_scores)))
+    else:
+        interface_signal = 0.0
+
+    if clean_interface_count:
+        interface_signal = max(interface_signal, 0.8)
+
+    if clash_count and not clean_interface_count:
+        interface_signal *= 0.5
 
     return {
         "has_binding": bool(dock_scores),
@@ -364,6 +465,9 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
         "binding_score_spread": score_spread,
         "best_md_min_energy": best_min_energy,
         "mean_md_fluctuation": mean_fluctuation,
+        "interface_signal": interface_signal,
+        "clean_interface_count": clean_interface_count,
+        "interface_clash_count": clash_count,
     }
 
 
@@ -371,7 +475,10 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
 # Hypothesis refinement
 # ---------------------------------------------------------------------------
 
-def _refine_hypothesis_from_critique(state: LabState, critique: str) -> str | None:
+def _refine_hypothesis_from_critique(
+    state: LabState,
+    critique: str,
+) -> str | None:
     """
     Use the LLM to rewrite the hypothesis based on qualitative Skeptic signals.
 
@@ -420,6 +527,8 @@ def _refine_hypothesis_from_critique(state: LabState, critique: str) -> str | No
                     f"Skeptic recommendation: {recommendation_line or 'N/A'}\n\n"
                     f"Qualitative critique signals, with exact metric thresholds removed:\n"
                     f"{qualitative_critique}\n\n"
+                    f"Literature-derived target/motif policy:\n"
+                    f"{truncate_str(state.get('literature_policy_text', ''), 800)}\n\n"
                     f"Write a qualitative comparative hypothesis. "
                     f"Do not include exact numeric cutoffs, exact score-spread values, "
                     f"or exact previous best_binding_score values."
@@ -470,11 +579,12 @@ def _build_combined_objectives(
       - high docking spread pressure
       - FailureMemory pressures
 
-    Adds joint MD+docking feedback:
+    Adds joint MD+docking/interface feedback:
       - weak binding -> binding + diversity pressure
       - good binding but unstable MD -> structure + thermo pressure
       - high fluctuation -> structure pressure
-      - good binding + stable MD -> diversity/exploration pressure
+      - clean partial interface -> binding + structure pressure
+      - interface clash -> structure + diversity pressure
     """
     combined_objectives = {
         "conservation": conservation_fitness,
@@ -494,6 +604,25 @@ def _build_combined_objectives(
         combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 1.0
         combined_objectives["thermo"] = combined_objectives.get("thermo", 0.0) + 0.6
         combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.3
+
+    # ------------------------------------------------------------------
+    # Interface feedback
+    # ------------------------------------------------------------------
+    interface_signal = float(joint_feedback.get("interface_signal", 0.0) or 0.0)
+    clean_interface_count = int(joint_feedback.get("clean_interface_count", 0) or 0)
+    interface_clash_count = int(joint_feedback.get("interface_clash_count", 0) or 0)
+
+    if clean_interface_count > 0:
+        combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.3
+        combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.3
+
+    if interface_clash_count > 0:
+        combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.4
+        combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.2
+
+    if interface_signal > 0.8 and not state.get("target_pdb"):
+        combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.2
+        combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.2
 
     # ------------------------------------------------------------------
     # Docking spread feedback from Skeptic critique
@@ -516,12 +645,32 @@ def _build_combined_objectives(
     for k, v in failure_weights.items():
         if k == "binding_pressure":
             combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + v
+
         elif k == "structure_pressure":
             combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + v
+
         elif k == "diversity_pressure":
             combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + v
+
         elif k == "convergence_pressure":
             combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + v
+
+        elif k == "interface_pressure":
+            combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.5 * v
+            combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.5 * v
+
+        elif k == "clash_avoidance_pressure":
+            combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.7 * v
+            combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.3 * v
+
+        elif k == "target_specific_exploitation":
+            combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.2
+            combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.2
+
+        elif k == "target_reuse_pressure":
+            combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.15
+            combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.10
+
         elif k.startswith("concern"):
             if "entropy" in k or "structure" in k:
                 combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + v
@@ -544,37 +693,29 @@ def _build_combined_objectives(
 
     max_target_score_spread = getenv_float("VLAB_MAX_TARGET_SCORE_SPREAD", 25.0)
 
-    # Strong best binding but inconsistent docking modes means optimise for
-    # robustness, not simply stronger best score.
     if has_binding and binding > 0.5 and binding_spread is not None:
         if binding_spread > max_target_score_spread:
             combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.8
             combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.7
             combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.3
 
-
     if has_binding:
-        # Weak binding -> search harder for binders and keep exploration alive.
         if binding < 0.3:
             combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 1.0
             combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.4
 
-        # Strong-ish binding but unstable MD -> fix fold/thermo rather than only chasing docking.
         if has_md and binding > 0.5 and stability < 0.3:
             combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.8
             combined_objectives["thermo"] = combined_objectives.get("thermo", 0.0) + 0.6
 
     if has_md:
-        # High fluctuation -> enforce structural stability/rigidity.
         if fluct < 0.4:
             combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.7
 
-        # Weak MD stability even without binding information.
         if stability < 0.3:
             combined_objectives["thermo"] = combined_objectives.get("thermo", 0.0) + 0.5
             combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.4
 
-    # Good combined physics -> allow exploration of variants.
     if has_binding and has_md and binding > 0.7 and stability > 0.7 and fluct > 0.6:
         combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.6
 
@@ -705,6 +846,8 @@ def _capture_optimisation_step_if_available(
                 "score_spread": score_spread,
                 "combined_objectives": combined_objectives,
                 "joint_feedback": joint_feedback,
+                "literature_motif_hints": state.get("literature_motif_hints", []),
+                "literature_target_hints": state.get("literature_target_hints", []),
             },
         )
 
@@ -732,6 +875,9 @@ def _fallback_result(
         "mutation_bias": state.get("mutation_bias", {}),
         "hypothesis": topic,
         "iterations": state.get("iterations", 0) + 1,
+        "literature_motif_hints": state.get("literature_motif_hints", []),
+        "literature_target_hints": state.get("literature_target_hints", []),
+        "literature_policy_text": state.get("literature_policy_text", ""),
     }
 
 
@@ -750,9 +896,10 @@ def pi_agent(state: LabState) -> dict:
           * Skeptic parser
           * objective injector
           * failure memory
+          * literature memory
           * fold thresholds
           * docking score spread
-          * joint MD+docking feedback
+          * joint MD+docking/interface feedback
       - run NSGA-II optimisation
       - select Pareto/extreme sequences
       - return updated hypothesis, sequences, mutation bias, and iteration count
@@ -772,6 +919,9 @@ def pi_agent(state: LabState) -> dict:
             "iterations": state.get("iterations", 0) + 1,
             "target_pdb": target_pdb,
             "failed_target_pdbs": state.get("failed_target_pdbs", []),
+            "literature_motif_hints": state.get("literature_motif_hints", []),
+            "literature_target_hints": state.get("literature_target_hints", []),
+            "literature_policy_text": state.get("literature_policy_text", ""),
         }
 
     if not target_pdb and sequences:
@@ -786,6 +936,9 @@ def pi_agent(state: LabState) -> dict:
             "iterations": state.get("iterations", 0),
             "target_pdb": target_pdb,
             "failed_target_pdbs": state.get("failed_target_pdbs", []),
+            "literature_motif_hints": state.get("literature_motif_hints", []),
+            "literature_target_hints": state.get("literature_target_hints", []),
+            "literature_policy_text": state.get("literature_policy_text", ""),
         }
 
     try:
@@ -801,6 +954,30 @@ def pi_agent(state: LabState) -> dict:
 
         failure_weights = memory_model.compute_failure_weights()
         log.info("Failure memory weights: %s", failure_weights)
+
+        # ------------------------------------------------------------------
+        # Literature memory
+        # ------------------------------------------------------------------
+        try:
+            literature_model = LiteratureMemory()
+            literature_motif_hints = literature_model.get_motif_hints(limit=8)
+            literature_target_hints = literature_model.get_target_policy_hints(limit=8)
+            literature_policy_text = literature_model.build_target_policy_text()
+        except Exception as e:
+            log.warning("Failed to load LiteratureMemory in PI agent: %s", e)
+            literature_motif_hints = []
+            literature_target_hints = []
+            literature_policy_text = ""
+
+        state["literature_motif_hints"] = literature_motif_hints
+        state["literature_target_hints"] = literature_target_hints
+        state["literature_policy_text"] = literature_policy_text
+
+        log.info(
+            "Literature memory hints | targets=%s motifs=%s",
+            literature_target_hints,
+            literature_motif_hints,
+        )
 
         parsed = {
             "dg_best": None,
@@ -843,17 +1020,21 @@ def pi_agent(state: LabState) -> dict:
         state["conserved_regions"] = conservation.get("conserved_regions", [])
 
         # ------------------------------------------------------------------
-        # Docking spread + joint MD/docking physics feedback
+        # Docking spread + joint MD/docking/interface physics feedback
         # ------------------------------------------------------------------
         score_spread = _parse_score_spread_from_critique(critique)
         joint_feedback = _compute_joint_physics_feedback(state)
 
         log.info(
             "Joint physics feedback | binding=%.3f stability=%.3f fluct=%.3f "
-            "| best_binding=%s spread=%s best_md_min=%s md_fluct=%s",
+            "interface=%.3f clean=%s clash=%s | best_binding=%s spread=%s "
+            "best_md_min=%s md_fluct=%s",
             joint_feedback.get("binding_signal", 0.0),
             joint_feedback.get("stability_signal", 0.0),
             joint_feedback.get("fluctuation_signal", 0.0),
+            joint_feedback.get("interface_signal", 0.0),
+            joint_feedback.get("clean_interface_count", 0),
+            joint_feedback.get("interface_clash_count", 0),
             joint_feedback.get("best_binding_score"),
             joint_feedback.get("binding_score_spread"),
             joint_feedback.get("best_md_min_energy"),
@@ -953,7 +1134,14 @@ def pi_agent(state: LabState) -> dict:
             f"Joint feedback: "
             f"binding={joint_feedback.get('binding_signal', 0.0):.3f}, "
             f"stability={joint_feedback.get('stability_signal', 0.0):.3f}, "
-            f"fluctuation={joint_feedback.get('fluctuation_signal', 0.0):.3f}"
+            f"fluctuation={joint_feedback.get('fluctuation_signal', 0.0):.3f}, "
+            f"interface={joint_feedback.get('interface_signal', 0.0):.3f}, "
+            f"clean_interface={joint_feedback.get('clean_interface_count', 0)}, "
+            f"clash={joint_feedback.get('interface_clash_count', 0)}\n"
+            f"Literature target hints: "
+            f"{', '.join(literature_target_hints) if literature_target_hints else 'N/A'}\n"
+            f"Literature motif hints: "
+            f"{', '.join(literature_motif_hints) if literature_motif_hints else 'N/A'}"
         )
 
         target_sequence = state.get("target_sequence")
@@ -975,6 +1163,9 @@ def pi_agent(state: LabState) -> dict:
             "_run_system_selected_motifs": selected_motifs,
             "_run_system_min_fold_thresholds": min_fold_thresholds,
             "joint_physics_feedback": joint_feedback,
+            "literature_motif_hints": literature_motif_hints,
+            "literature_target_hints": literature_target_hints,
+            "literature_policy_text": literature_policy_text,
         }
 
     except Exception as e:
@@ -993,4 +1184,7 @@ def pi_agent(state: LabState) -> dict:
             "mutation_bias": state.get("mutation_bias", {}),
             "hypothesis": state.get("hypothesis", ""),
             "iterations": state.get("iterations", 0) + 1,
+            "literature_motif_hints": state.get("literature_motif_hints", []),
+            "literature_target_hints": state.get("literature_target_hints", []),
+            "literature_policy_text": state.get("literature_policy_text", ""),
         }

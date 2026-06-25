@@ -1,161 +1,137 @@
 """
 validate_dataset.py
 
-Validates and cleans your JSONL training data before fine-tuning.
+Validates and cleans JSONL training data before fine-tuning.
 
-Filters:
-- empty / corrupt entries
-- low-information outputs
-- malformed instruction structure
-- duplicates
+Reads:
+  postrun_training_data/supervised.jsonl
+  postrun_training_data/examples.jsonl
+  postrun_training_data/literature_evidence.jsonl
+
+Writes:
+  training/clean_dataset.jsonl
 """
 
+from __future__ import annotations
+
 import json
+from pathlib import Path
+from typing import Iterable
 
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
+
+INPUT_FILES = [
+    Path("postrun_training_data/supervised.jsonl"),
+    Path("postrun_training_data/examples.jsonl"),
+    Path("postrun_training_data/literature_evidence.jsonl"),
+]
+
+OUTPUT_PATH = Path("training/clean_dataset.jsonl")
+
 MIN_OUTPUT_LENGTH = 30
-MAX_REPEAT_THRESHOLD = 0.3  # repeated characters ratio
+MAX_INPUT_CHARS = 12000
+MAX_OUTPUT_CHARS = 4000
 
 
-# ----------------------------------------------------------------------
-# LOAD DATA
-# ----------------------------------------------------------------------
-def load_jsonl(path):
+def load_jsonl(path: Path) -> list[dict]:
     data = []
+    if not path.exists():
+        return data
 
-    with open(path, "r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
             try:
-                data.append(json.loads(line))
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    data.append(item)
             except Exception:
                 continue
 
     return data
 
 
-# ----------------------------------------------------------------------
-# BASIC VALIDATION
-# ----------------------------------------------------------------------
-def is_valid_entry(entry):
-    """Basic structural validation"""
-
+def is_valid_entry(entry: dict) -> bool:
     if not isinstance(entry, dict):
         return False
 
-    if "instruction" not in entry:
-        return False
-
-    if "output" not in entry:
-        return False
-
-    if not entry["output"]:
-        return False
-
-    if len(entry["output"]) < MIN_OUTPUT_LENGTH:
-        return False
-
-    return True
-
-
-# ----------------------------------------------------------------------
-# QUALITY FILTER
-# ----------------------------------------------------------------------
-def is_low_quality(text):
-    """Detect low-information outputs"""
-
-    text = text.strip()
-
-    if not text:
+    # Instruction-format examples.
+    if "instruction" in entry and "output" in entry:
+        if not str(entry.get("instruction", "")).strip():
+            return False
+        if len(str(entry.get("output", "")).strip()) < MIN_OUTPUT_LENGTH:
+            return False
         return True
 
-    # repeated character spam
-    repeats = max(text.count(c) for c in set(text)) / max(len(text), 1)
-    if repeats > MAX_REPEAT_THRESHOLD:
-        return True
-
-    # generic failure patterns
-    bad_patterns = [
-        "failed",
-        "error",
-        "unknown",
-        "could not",
-        "n/a",
-    ]
-
-    lower = text.lower()
-
-    if any(p in lower for p in bad_patterns):
-        return True
+    # Chat-format examples.
+    if "messages" in entry and isinstance(entry["messages"], list):
+        return len(entry["messages"]) >= 2
 
     return False
 
 
-# ----------------------------------------------------------------------
-# DEDUPLICATION
-# ----------------------------------------------------------------------
-def deduplicate(data):
+def normalise_entry(entry: dict) -> dict | None:
+    if not is_valid_entry(entry):
+        return None
+
+    if "instruction" in entry:
+        out = dict(entry)
+        out["instruction"] = str(out.get("instruction", ""))[:MAX_INPUT_CHARS]
+        out["input"] = str(out.get("input", ""))[:MAX_INPUT_CHARS]
+        out["output"] = str(out.get("output", ""))[:MAX_OUTPUT_CHARS]
+        return out
+
+    return entry
+
+
+def deduplicate(data: Iterable[dict]) -> list[dict]:
     seen = set()
-    filtered = []
+    out = []
 
     for item in data:
-        key = (
-            item.get("instruction", "") +
-            item.get("input", "") +
-            item.get("output", "")[:100]
-        )
+        key = json.dumps(
+            {
+                "instruction": item.get("instruction"),
+                "input": item.get("input"),
+                "output": item.get("output"),
+                "messages": item.get("messages"),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )[:3000]
 
-        if key not in seen:
-            seen.add(key)
-            filtered.append(item)
+        if key in seen:
+            continue
 
-    return filtered
+        seen.add(key)
+        out.append(item)
 
-
-# ----------------------------------------------------------------------
-# SCORING (OPTIONAL)
-# ----------------------------------------------------------------------
-def score_entry(entry):
-    score = 0
-
-    output = entry.get("output", "")
-
-    # reward detail
-    if len(output) > 200:
-        score += 1
-
-    # reward structure
-    if ":" in output or "\n" in output:
-        score += 1
-
-    # reward scientific content
-    keywords = ["structure", "binding", "energy", "rna", "protein"]
-
-    if any(k in output.lower() for k in keywords):
-        score += 1
-
-    return score
+    return out
 
 
-# ----------------------------------------------------------------------
-# MAIN CLEANING PIPELINE
-# ----------------------------------------------------------------------
-def clean_dataset(input_path, output_path, min_score=1):
-    print(f"\nLoading: {input_path}")
+def main() -> None:
+    all_rows = []
 
-    data = load_jsonl(input_path)
-    print(f"Loaded {len(data)} entries")
+    for path in INPUT_FILES:
+        rows = load_jsonl(path)
+        print(f"Loaded {len(rows)} rows from {path}")
+        all_rows.extend(rows)
 
-    # Step 1: structure validation
-    valid = [d for d in data if is_valid_entry(d)]
-    print(f"After validation: {len(valid)}")
+    cleaned = []
+    for row in all_rows:
+        normalised = normalise_entry(row)
+        if normalised:
+            cleaned.append(normalised)
 
-    # Step 2: remove low quality
-    filtered = [d for d in valid if not is_low_quality(d["output"])]
-    print(f"After quality filter: {len(filtered)}")
+    cleaned = deduplicate(cleaned)
 
-    # Step 3: deduplicate
-    deduped = deduplicate(filtered)
-    print(f"After deduplication: {len(deduped)}")
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+    with OUTPUT_PATH.open("w", encoding="utf-8") as f:
+        for row in cleaned:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    print(f"Clean rows: {len(cleaned)}")
+    print(f"Wrote: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()

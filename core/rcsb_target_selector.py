@@ -5,8 +5,6 @@ import logging
 import os
 import re
 import time
-import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -18,7 +16,9 @@ log = logging.getLogger("virtual_lab.rcsb_target_selector")
 
 RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 RCSB_ENTRY_URL = "https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
-RCSB_POLYMER_ENTITY_URL = "https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity_id}"
+RCSB_POLYMER_ENTITY_URL = (
+    "https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity_id}"
+)
 
 
 @dataclass
@@ -49,6 +49,7 @@ class PDBTargetCandidate:
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name, str(default))
+
     try:
         return int(raw)
     except Exception:
@@ -58,6 +59,7 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default))
+
     try:
         return float(raw)
     except Exception:
@@ -79,7 +81,7 @@ def _http_json(
     data = None
     headers = {
         "Accept": "application/json",
-        "User-Agent": "VLAB2-RCSBTargetSelector/1.0",
+        "User-Agent": "VLAB2-RCSBTargetSelector/1.1",
     }
 
     if payload is not None:
@@ -125,6 +127,7 @@ def _http_json(
 
     raise RuntimeError(f"RCSB request failed for {url}: {last_err}")
 
+
 def _clean_terms(text: str) -> List[str]:
     if not text:
         return []
@@ -133,17 +136,43 @@ def _clean_terms(text: str) -> List[str]:
     words = [w.strip() for w in text.split() if len(w.strip()) >= 3]
 
     stop = {
-        "the", "and", "for", "with", "into", "will", "than", "after",
-        "score", "spread", "lower", "higher", "less", "more", "best",
-        "binding", "relative", "hdock",
+        "the",
+        "and",
+        "for",
+        "with",
+        "into",
+        "will",
+        "than",
+        "after",
+        "score",
+        "spread",
+        "lower",
+        "higher",
+        "less",
+        "more",
+        "best",
+        "binding",
+        "relative",
+        "hdock",
+        "using",
+        "current",
+        "compared",
+        "optimized",
+        "optimised",
+        "stronger",
+        "weaker",
+        "stable",
+        "stability",
     }
 
     out = []
 
     for w in words:
         wl = w.lower()
+
         if wl in stop:
             continue
+
         out.append(w)
 
     return list(dict.fromkeys(out))
@@ -155,14 +184,20 @@ def build_rcsb_query_text(
     virus_name: str = "",
     virus_family: str = "",
 ) -> str:
+    """
+    Backwards-compatible single-query builder.
+
+    The selector now uses build_rcsb_query_texts(...) by default, but this is kept
+    for older callers and emergency fallback inside select_pdb_targets(...).
+    """
     env_keywords = os.getenv(
         "VLAB_TARGET_KEYWORDS",
-        "capsid,coat protein,RNA binding,RNA packaging,stem-loop",
+        "RNA binding,RNA protein complex,ribonucleoprotein,nucleocapsid,capsid",
     )
 
     keyword_terms = [x.strip() for x in env_keywords.split(",") if x.strip()]
 
-    biological_terms = []
+    biological_terms: List[str] = []
 
     if virus_name:
         biological_terms.append(virus_name)
@@ -171,11 +206,74 @@ def build_rcsb_query_text(
         biological_terms.append(virus_family)
 
     if not biological_terms:
-        biological_terms.extend(["viral", "capsid"])
+        biological_terms.extend(["viral", "RNA"])
 
-    query_terms = biological_terms + keyword_terms[:3]
+    extracted_terms = _clean_terms(topic)[:4] + _clean_terms(hypothesis)[:4]
 
-    return " ".join(dict.fromkeys(query_terms)).strip()
+    query_terms = biological_terms + extracted_terms + keyword_terms[:3]
+
+    return " ".join(dict.fromkeys(x for x in query_terms if x)).strip()
+
+
+def build_rcsb_query_texts(
+    topic: str = "",
+    hypothesis: str = "",
+    virus_name: str = "",
+    virus_family: str = "",
+) -> List[str]:
+    """
+    Build multiple adaptive RCSB full-text queries.
+
+    Avoids over-reliance on one brittle query like:
+      'Coronaviridae capsid coat protein viral assembly'
+
+    The query set stays general and does not require hardcoded family profiles.
+    """
+    base_terms: List[str] = []
+
+    if virus_name:
+        base_terms.append(str(virus_name).strip())
+
+    if virus_family:
+        base_terms.append(str(virus_family).strip())
+
+    extracted_terms = _clean_terms(topic)[:6] + _clean_terms(hypothesis)[:8]
+    extracted_terms = list(dict.fromkeys(extracted_terms))
+
+    anchors = [
+        "RNA binding protein",
+        "RNA protein complex",
+        "ribonucleoprotein",
+        "viral RNA binding",
+        "nucleocapsid RNA binding",
+        "capsid RNA binding",
+        "RNA packaging protein",
+    ]
+
+    queries: List[str] = []
+
+    for anchor in anchors:
+        terms = base_terms + extracted_terms[:4] + [anchor]
+        q = " ".join(dict.fromkeys(x for x in terms if x)).strip()
+
+        if q:
+            queries.append(q)
+
+    if virus_family:
+        queries.append(f"{virus_family} RNA protein")
+        queries.append(f"{virus_family} ribonucleoprotein")
+        queries.append(f"{virus_family} nucleocapsid")
+        queries.append(f"{virus_family} RNA binding")
+
+    if virus_name:
+        queries.append(f"{virus_name} RNA binding")
+        queries.append(f"{virus_name} nucleocapsid")
+        queries.append(f"{virus_name} RNA protein complex")
+
+    if topic:
+        queries.append(topic)
+
+    return list(dict.fromkeys(q for q in queries if q))
 
 
 def search_rcsb_entries(query_text: str, rows: int = 50) -> List[str]:
@@ -186,7 +284,6 @@ def search_rcsb_entries(query_text: str, rows: int = 50) -> List[str]:
     the Data API.
     """
     rows = max(1, rows)
-
 
     payload = {
         "query": {
@@ -205,14 +302,11 @@ def search_rcsb_entries(query_text: str, rows: int = 50) -> List[str]:
         },
     }
 
-
     try:
         data = _http_json(RCSB_SEARCH_URL, payload=payload)
     except Exception as e:
-        log.warning("RCSB sorted search failed; retrying without sort: %s", e)
-
-        payload["request_options"].pop("sort", None)
-        data = _http_json(RCSB_SEARCH_URL, payload=payload)
+        log.warning("RCSB full-text search failed: %s", e)
+        raise
 
     result_set = data.get("result_set", []) or []
 
@@ -220,6 +314,7 @@ def search_rcsb_entries(query_text: str, rows: int = 50) -> List[str]:
 
     for item in result_set:
         identifier = item.get("identifier")
+
         if identifier:
             ids.append(str(identifier).upper())
 
@@ -273,7 +368,6 @@ def _parse_year(date_str: str) -> Optional[int]:
 
 def _extract_resolution(entry_data: dict) -> Optional[float]:
     info = entry_data.get("rcsb_entry_info", {}) or {}
-
     vals = info.get("resolution_combined") or []
 
     if not vals:
@@ -295,6 +389,7 @@ def _extract_methods(entry_data: dict) -> List[str]:
 
     for item in entry_data.get("exptl", []) or []:
         method = item.get("method")
+
         if method:
             methods.append(str(method))
 
@@ -341,18 +436,174 @@ def _entity_organisms(entity: dict) -> List[str]:
                         or item.get("pdbx_gene_src_scientific_name")
                         or item.get("pdbx_organism_scientific")
                     )
+
                     if name:
                         orgs.append(str(name))
+
         elif isinstance(val, dict):
             name = (
                 val.get("scientific_name")
                 or val.get("pdbx_gene_src_scientific_name")
                 or val.get("pdbx_organism_scientific")
             )
+
             if name:
                 orgs.append(str(name))
 
     return list(dict.fromkeys(orgs))
+
+
+def _token_set(text: str) -> set[str]:
+    return {x.lower() for x in _clean_terms(text or "")}
+
+
+def _entry_atom_count(entry_data: dict) -> Optional[int]:
+    info = entry_data.get("rcsb_entry_info", {}) or {}
+
+    for key in [
+        "deposited_atom_count",
+        "modeled_polymer_monomer_count",
+        "deposited_polymer_monomer_count",
+    ]:
+        value = info.get(key)
+
+        try:
+            if value is not None:
+                return int(value)
+        except Exception:
+            pass
+
+    return None
+
+
+def _adaptive_relevance_score(
+    candidate_text: str,
+    query_text: str,
+    polymer_text: str,
+    entry_data: dict,
+    virus_name: str = "",
+    virus_family: str = "",
+) -> tuple[float, List[str]]:
+    """
+    General-purpose relevance scoring.
+
+    IMPORTANT:
+      candidate_text must contain ONLY candidate metadata.
+      query_text contains query / state context.
+
+    This prevents query leakage where every candidate falsely inherits terms like
+    'RNA', 'nucleocapsid', or 'ribonucleoprotein' from the search query itself.
+    """
+    reasons: List[str] = []
+    score = 0.0
+
+    candidate_text_l = (candidate_text or "").lower()
+    query_text_l = (query_text or "").lower()
+
+    query_tokens = _token_set(query_text_l)
+    candidate_tokens = _token_set(candidate_text_l)
+
+    overlap = query_tokens.intersection(candidate_tokens)
+
+    if overlap:
+        score += min(4.0, 0.35 * len(overlap))
+        reasons.append(f"text_overlap:{len(overlap)}")
+
+    biological_terms = [
+        "rna",
+        "binding",
+        "rna-binding",
+        "ribonucleoprotein",
+        "nucleocapsid",
+        "nucleoprotein",
+        "n protein",
+        "capsid",
+        "core protein",
+        "viral",
+        "genome",
+        "packaging",
+        "encapsidation",
+    ]
+
+    bio_hits = [t for t in biological_terms if t in candidate_text_l]
+
+    if bio_hits:
+        score += min(4.0, 0.45 * len(bio_hits))
+        reasons.extend(f"bio_term:{t}" for t in bio_hits[:6])
+
+    receptor_terms = [
+        "nucleocapsid",
+        "nucleoprotein",
+        "n protein",
+        "rna-binding",
+        "rna binding",
+        "ribonucleoprotein",
+        "core protein",
+        "capsid protein",
+    ]
+
+    receptor_hits = [t for t in receptor_terms if t in candidate_text_l]
+
+    if receptor_hits:
+        score += min(4.0, 1.0 * len(receptor_hits))
+        reasons.append(f"receptor_term:{len(receptor_hits)}")
+
+    polymer_text_l = (polymer_text or "").lower()
+
+    has_protein = "protein" in polymer_text_l
+    has_rna = "rna" in polymer_text_l or "polyribonucleotide" in polymer_text_l
+
+    if has_protein and has_rna:
+        score += 5.0
+        reasons.append("rna_protein_complex")
+    elif has_rna:
+        score += 1.5
+        reasons.append("rna_entity")
+    elif has_protein:
+        score += 0.75
+        reasons.append("protein_entity")
+
+    for label, term in [("virus_name", virus_name), ("virus_family", virus_family)]:
+        if term:
+            term_tokens = _token_set(term)
+            n = len(term_tokens.intersection(candidate_tokens))
+
+            if n:
+                score += 1.0 * n
+                reasons.append(f"{label}_overlap:{n}")
+
+    noise_terms = [
+        "antibody",
+        "fab",
+        "nanobody",
+        "spike",
+        "ace2",
+        "receptor binding domain",
+        "polymerase",
+        "protease",
+        "fusion core",
+        "hr1",
+        "hr2",
+        "membrane protein",
+        "surface glycoprotein",
+    ]
+
+    noise_hits = [t for t in noise_terms if t in candidate_text_l]
+
+    if noise_hits:
+        score -= min(7.5, 1.5 + 1.0 * len(noise_hits))
+        reasons.append(f"noise_penalty:{len(noise_hits)}")
+
+    atom_count = _entry_atom_count(entry_data)
+
+    if atom_count:
+        max_atoms = _env_int("VLAB_MAX_RECEPTOR_ATOMS", 60000)
+
+        if atom_count > max_atoms:
+            score -= 5.0
+            reasons.append(f"too_large:{atom_count}")
+
+    return score, reasons
 
 
 def score_pdb_candidate(
@@ -367,6 +618,8 @@ def score_pdb_candidate(
     max_resolution = _env_float("VLAB_TARGET_MAX_RESOLUTION", 4.0)
 
     require_experimental = _env_bool("VLAB_TARGET_REQUIRE_EXPERIMENTAL", True)
+    require_protein_target = _env_bool("VLAB_TARGET_REQUIRE_PROTEIN", True)
+
     allow_cryoem = _env_bool("VLAB_TARGET_ALLOW_CRYOEM", True)
     allow_xray = _env_bool("VLAB_TARGET_ALLOW_XRAY", True)
     allow_nmr = _env_bool("VLAB_TARGET_ALLOW_NMR", False)
@@ -383,7 +636,6 @@ def score_pdb_candidate(
         return None
 
     year = _parse_year(release_date)
-
     method_text = " ".join(methods).lower()
 
     if require_experimental and not methods:
@@ -400,7 +652,6 @@ def score_pdb_candidate(
     if allow_nmr and "nmr" in method_text:
         allowed_method = True
 
-    # If methods are unknown but not strictly required, permit with penalty.
     if methods and not allowed_method:
         return None
 
@@ -420,47 +671,39 @@ def score_pdb_candidate(
 
         organisms.extend(_entity_organisms(entity))
 
-    combined_text = " ".join(
+    polymer_text = " ".join(polymer_types).lower()
+
+    has_protein = "protein" in polymer_text
+    has_rna = "rna" in polymer_text or "polyribonucleotide" in polymer_text
+
+    if require_protein_target and not has_protein:
+        return None
+
+    candidate_text = " ".join(
         [title]
         + entity_descriptions
         + organisms
-        + [query_text, virus_name, virus_family]
+    ).lower()
+
+    query_context_text = " ".join(
+        [query_text, virus_name, virus_family]
     ).lower()
 
     reasons = []
     score = 0.0
 
-    # Relevance keywords.
-    keyword_groups = {
-        "capsid_or_coat": ["capsid", "coat protein", "virion", "virus-like particle"],
-        "rna_binding": ["rna binding", "rna-binding", "ribonucleoprotein", "rna"],
-        "packaging": ["packaging", "assembly", "encapsidation"],
-        "stem_loop": ["stem-loop", "stem loop", "hairpin"],
-    }
+    relevance_score, relevance_reasons = _adaptive_relevance_score(
+        candidate_text=candidate_text,
+        query_text=query_context_text,
+        polymer_text=polymer_text,
+        entry_data=entry_data,
+        virus_name=virus_name,
+        virus_family=virus_family,
+    )
 
-    for label, kws in keyword_groups.items():
-        if any(k in combined_text for k in kws):
-            score += 1.0
-            reasons.append(label)
+    score += relevance_score
+    reasons.extend(relevance_reasons)
 
-    # Virus/family relevance.
-    for term in [virus_name, virus_family]:
-        if term and term.lower() in combined_text:
-            score += 1.5
-            reasons.append(f"matches:{term}")
-
-    # Polymer composition.
-    polymer_text = " ".join(polymer_types).lower()
-
-    if "protein" in polymer_text:
-        score += 0.75
-        reasons.append("protein_entity")
-
-    if "rna" in polymer_text or "polyribonucleotide" in polymer_text:
-        score += 1.25
-        reasons.append("rna_entity")
-
-    # Method quality.
     if "x-ray" in method_text:
         score += 0.75
         reasons.append("xray")
@@ -469,7 +712,6 @@ def score_pdb_candidate(
         score += 0.75
         reasons.append("cryoem")
 
-    # Resolution quality.
     if resolution is not None:
         if resolution <= max_resolution:
             score += max(0.0, 1.5 - (resolution / max_resolution))
@@ -481,7 +723,6 @@ def score_pdb_candidate(
         score -= 0.25
         reasons.append("missing_resolution")
 
-    # Recency.
     if year is not None:
         if year >= min_year:
             score += min(1.5, (year - min_year + 1) / 8.0)
@@ -493,9 +734,14 @@ def score_pdb_candidate(
         score -= 0.25
         reasons.append("missing_release_year")
 
-    # Avoid totally irrelevant hits.
-    if not any(r in reasons for r in ["capsid_or_coat", "rna_binding", "packaging"]):
-        score -= 2.0
+    if not any(
+        r.startswith("text_overlap")
+        or r.startswith("bio_term")
+        or r.startswith("receptor_term")
+        or r in {"rna_protein_complex", "protein_entity"}
+        for r in reasons
+    ):
+        score -= 2.5
         reasons.append("low_text_relevance")
 
     return PDBTargetCandidate(
@@ -513,6 +759,11 @@ def score_pdb_candidate(
         metadata={
             "query_text": query_text,
             "status": status,
+            "adaptive_selector": True,
+            "require_protein_target": require_protein_target,
+            "has_protein": has_protein,
+            "has_rna": has_rna,
+            "atom_count": _entry_atom_count(entry_data),
         },
     )
 
@@ -525,31 +776,56 @@ def select_pdb_targets(
     exclude_pdbs: Optional[List[str]] = None,
 ) -> List[dict]:
     """
-    Search and rank recent/high-quality/relevant PDB targets for RNA-capsid docking.
+    Search and rank recent/high-quality/relevant PDB targets for RNA-protein docking.
 
     Returns list of dictionaries sorted by descending target score.
     """
     max_candidates = _env_int("VLAB_TARGET_MAX_CANDIDATES", 8)
     exclude = {str(x).upper() for x in (exclude_pdbs or []) if x}
 
-    query_text = build_rcsb_query_text(
+    query_texts = build_rcsb_query_texts(
         topic=topic,
         hypothesis=hypothesis,
         virus_name=virus_name,
         virus_family=virus_family,
     )
 
-    log.info("RCSB target query: %s", query_text)
+    if not query_texts:
+        query_texts = [
+            build_rcsb_query_text(
+                topic=topic,
+                hypothesis=hypothesis,
+                virus_name=virus_name,
+                virus_family=virus_family,
+            )
+        ]
 
     search_rows = max(25, max_candidates * 8)
+    rows_per_query = max(10, search_rows // max(len(query_texts), 1))
 
     candidates: List[PDBTargetCandidate] = []
+    ids: List[str] = []
 
-    try:
-        ids = search_rcsb_entries(query_text, rows=search_rows)
-    except Exception as e:
-        log.warning("RCSB target search failed: %s", e)
-        ids = []
+    successful_queries: List[str] = []
+    failed_queries: List[str] = []
+
+    for query_text in query_texts:
+        try:
+            log.info("RCSB target query: %s", query_text)
+            query_ids = search_rcsb_entries(query_text, rows=rows_per_query)
+
+            if query_ids:
+                successful_queries.append(query_text)
+                ids.extend(query_ids)
+            else:
+                failed_queries.append(query_text)
+
+        except Exception as e:
+            failed_queries.append(query_text)
+            log.warning("RCSB target search failed for query %r: %s", query_text, e)
+
+    ids = list(dict.fromkeys(ids))
+    query_context = " | ".join(successful_queries or query_texts)
 
     for pdb_id in ids:
         pdb_id = pdb_id.upper()
@@ -565,7 +841,7 @@ def select_pdb_targets(
                 pdb_id=pdb_id,
                 entry_data=entry,
                 entities=entities,
-                query_text=query_text,
+                query_text=query_context,
                 virus_name=virus_name,
                 virus_family=virus_family,
             )
@@ -580,41 +856,59 @@ def select_pdb_targets(
 
     out = [c.to_dict() for c in candidates[:max_candidates]]
 
-    # Fallbacks.
-    fallback_env = os.getenv("VLAB_FALLBACK_PDBS", "")
-    fallback_ids = [
-        x.strip().upper()
-        for x in fallback_env.split(",")
-        if x.strip()
-    ]
+    allow_generic_fallback = _env_bool("VLAB_ALLOW_GENERIC_TARGET_FALLBACK", False)
+    min_real_candidate_score = _env_float("VLAB_MIN_REAL_TARGET_SCORE", 1.0)
 
-    existing = {x["pdb_id"] for x in out}
+    best_real_score = max((c.score for c in candidates), default=-999.0)
+    need_fallback = not out or best_real_score < min_real_candidate_score
 
-    for pdb_id in fallback_ids:
-        if pdb_id in exclude or pdb_id in existing:
-            continue
+    if allow_generic_fallback and need_fallback:
+        fallback_env = os.getenv("VLAB_FALLBACK_PDBS", "")
+        fallback_ids = [
+            x.strip().upper()
+            for x in fallback_env.split(",")
+            if x.strip()
+        ]
 
-        out.append(
-            {
-                "pdb_id": pdb_id,
-                "score": -999.0,
-                "title": "Fallback target",
-                "release_date": "",
-                "year": None,
-                "methods": [],
-                "resolution": None,
-                "entity_descriptions": [],
-                "polymer_types": [],
-                "organisms": [],
-                "reasons": ["env_fallback"],
-                "metadata": {"query_text": query_text},
-            }
+        existing = {x["pdb_id"] for x in out}
+
+        log.warning(
+            "Using generic fallback PDBs because no adequate RCSB target was found "
+            "(best_real_score=%.3f, min_real_candidate_score=%.3f): %s",
+            best_real_score,
+            min_real_candidate_score,
+            fallback_ids,
         )
 
-        existing.add(pdb_id)
+        for pdb_id in fallback_ids:
+            if pdb_id in exclude or pdb_id in existing:
+                continue
 
-        if len(out) >= max_candidates:
-            break
+            out.append(
+                {
+                    "pdb_id": pdb_id,
+                    "score": -999.0,
+                    "title": "Generic fallback target",
+                    "release_date": "",
+                    "year": None,
+                    "methods": [],
+                    "resolution": None,
+                    "entity_descriptions": [],
+                    "polymer_types": [],
+                    "organisms": [],
+                    "reasons": ["env_fallback"],
+                    "metadata": {
+                        "query_text": query_context,
+                        "successful_queries": successful_queries,
+                        "failed_queries": failed_queries,
+                    },
+                }
+            )
+
+            existing.add(pdb_id)
+
+            if len(out) >= max_candidates:
+                break
 
     return out[:max_candidates]
 

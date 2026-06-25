@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,16 @@ def _safe_float(text: str) -> float | None:
         return None
 
 
+def _safe_int(text: str) -> int | None:
+    try:
+        cleaned = "".join(ch for ch in str(text) if ch.isdigit() or ch == "-")
+        if cleaned in {"", "-"}:
+            return None
+        return int(cleaned)
+    except Exception:
+        return None
+
+
 def _atom_element(atom_name: str, element_field: str) -> str:
     element = (element_field or "").strip()
 
@@ -48,7 +58,6 @@ def _atom_element(atom_name: str, element_field: str) -> str:
     if not atom_name:
         return ""
 
-    # PDB atom names can start with digits; strip them.
     atom_name = atom_name.lstrip("0123456789")
 
     return atom_name[:1].upper()
@@ -132,12 +141,100 @@ def _neighbour_cells(key: tuple[int, int, int]):
                 yield (x + dx, y + dy, z + dz)
 
 
+def _compute_contact_entropy(rows: list[dict]) -> tuple[float, float]:
+    """
+    Shannon entropy of contact distribution over RNA residues.
+
+    Returns:
+      raw_entropy
+      normalized_entropy in [0, 1]
+    """
+    if not rows:
+        return 0.0, 0.0
+
+    counts: Counter[str] = Counter()
+
+    for row in rows:
+        rna_id = row.get("rna_residue_id")
+        weight = row.get("atom_contact_count", 1) or 1
+
+        if rna_id:
+            counts[str(rna_id)] += int(weight)
+
+    if not counts:
+        return 0.0, 0.0
+
+    total = sum(counts.values())
+
+    entropy = 0.0
+
+    for value in counts.values():
+        p = value / total
+        entropy -= p * math.log(p + 1e-12)
+
+    max_entropy = math.log(max(len(counts), 2))
+    normalized = entropy / max_entropy if max_entropy > 0 else 0.0
+
+    return round(entropy, 4), round(normalized, 4)
+
+
+def _count_rna_contact_clusters(rows: list[dict], gap_threshold: int = 3) -> int:
+    """
+    Count rough RNA contact clusters using residue-index gaps.
+
+    Example:
+      contacted RNA residues: 1,2,3,10,11 -> 2 clusters
+    """
+    positions: set[int] = set()
+
+    for row in rows:
+        pos = _safe_int(row.get("rna_resseq", ""))
+
+        if pos is not None:
+            positions.add(pos)
+
+    if not positions:
+        return 0
+
+    ordered = sorted(positions)
+
+    clusters = 1
+    prev = ordered[0]
+
+    for pos in ordered[1:]:
+        if abs(pos - prev) > gap_threshold:
+            clusters += 1
+        prev = pos
+
+    return clusters
+
+
+def _cluster_quality(cluster_count: int) -> float:
+    """
+    Heuristic cluster quality.
+
+    1-3 clusters are generally plausible.
+    Too many clusters suggests diffuse/noisy contacts.
+    """
+    if cluster_count <= 0:
+        return 0.0
+    if cluster_count <= 3:
+        return 1.0
+    if cluster_count <= 5:
+        return 0.65
+    return 0.35
+
+
 def _score_interface(
     residue_contacts: int,
     basic_contacts: int,
     min_distance: float | None,
     min_residue_contacts: int,
     min_basic_contacts: int,
+    contact_entropy_normalized: float,
+    rna_span_covered: float,
+    cluster_count: int,
+    min_rna_span: float,
 ) -> tuple[float, bool, bool]:
     """
     Return:
@@ -148,23 +245,29 @@ def _score_interface(
     Heuristic only:
       - rewards broad protein/RNA interface
       - rewards basic residue involvement
-      - penalises unrealistically short atom distances
+      - rewards RNA span coverage
+      - rewards non-overconcentrated contact distribution
+      - penalises diffuse/noisy cluster count
+      - strongly penalises unrealistically short atom distances
     """
     residue_component = min(residue_contacts / max(min_residue_contacts, 1), 1.0)
     basic_component = min(basic_contacts / max(min_basic_contacts, 1), 1.0)
+    span_component = min(rna_span_covered / max(min_rna_span, 1e-6), 1.0)
+    entropy_component = max(0.0, min(float(contact_entropy_normalized), 1.0))
+    cluster_component = _cluster_quality(cluster_count)
 
     steric_clash = False
+    severe_clash = False
 
     if min_distance is None:
         distance_component = 0.0
 
     elif min_distance < 1.2:
-        # Severe atom overlap / steric clash.
         distance_component = 0.0
         steric_clash = True
+        severe_clash = True
 
     elif min_distance < 1.8:
-        # Suspiciously close.
         distance_component = 0.25
         steric_clash = True
 
@@ -181,21 +284,28 @@ def _score_interface(
         distance_component = 0.0
 
     score = (
-        0.45 * residue_component
-        + 0.30 * basic_component
-        + 0.25 * distance_component
+        0.25 * residue_component
+        + 0.18 * basic_component
+        + 0.22 * distance_component
+        + 0.15 * span_component
+        + 0.12 * entropy_component
+        + 0.08 * cluster_component
     )
 
-    if steric_clash:
-        score *= 0.35
+    if severe_clash:
+        score *= 0.20
+    elif steric_clash:
+        score *= 0.45
 
     passed = (
         residue_contacts >= min_residue_contacts
         and basic_contacts >= min_basic_contacts
+        and rna_span_covered >= min_rna_span
         and not steric_clash
     )
 
     return round(score, 4), passed, steric_clash
+
 
 def extract_protein_rna_contacts(
     complex_pdb: str,
@@ -204,6 +314,7 @@ def extract_protein_rna_contacts(
     cutoff: float = 5.0,
     min_residue_contacts: int = 5,
     min_basic_contacts: int = 1,
+    min_rna_span: float = 0.15,
 ) -> dict:
     """
     Extract protein-RNA interface contacts from a docked complex PDB.
@@ -239,6 +350,8 @@ def extract_protein_rna_contacts(
             "contact_csv": None,
             "contact_json": None,
         }
+
+    rna_residue_set = {a["residue_id"] for a in rna_atoms}
 
     grid: dict[tuple[int, int, int], list[dict]] = defaultdict(list)
 
@@ -282,12 +395,17 @@ def extract_protein_rna_contacts(
                     }
                 else:
                     pair_stats[pair_key]["atom_contact_count"] += 1
+
                     if d < pair_stats[pair_key]["min_distance_A"]:
                         pair_stats[pair_key]["min_distance_A"] = d
 
     rows = sorted(
         pair_stats.values(),
-        key=lambda r: (r["min_distance_A"], r["protein_residue_id"], r["rna_residue_id"]),
+        key=lambda r: (
+            r["min_distance_A"],
+            r["protein_residue_id"],
+            r["rna_residue_id"],
+        ),
     )
 
     output_csv_path = Path(output_csv)
@@ -314,15 +432,8 @@ def extract_protein_rna_contacts(
         for row in rows:
             writer.writerow(row)
 
-    protein_contact_residues = {
-        r["protein_residue_id"]
-        for r in rows
-    }
-
-    rna_contact_residues = {
-        r["rna_residue_id"]
-        for r in rows
-    }
+    protein_contact_residues = {r["protein_residue_id"] for r in rows}
+    rna_contact_residues = {r["rna_residue_id"] for r in rows}
 
     basic_contact_residues = {
         r["protein_residue_id"]
@@ -339,12 +450,26 @@ def extract_protein_rna_contacts(
         else 0.0
     )
 
+    contact_entropy, contact_entropy_norm = _compute_contact_entropy(rows)
+    cluster_count = _count_rna_contact_clusters(rows)
+
+    rna_total_residues = len(rna_residue_set)
+
+    if rna_total_residues > 0:
+        rna_span_covered = len(rna_contact_residues) / rna_total_residues
+    else:
+        rna_span_covered = 0.0
+
     interface_score, interface_passed, steric_clash = _score_interface(
         residue_contacts=residue_contact_count,
         basic_contacts=basic_contact_count,
         min_distance=min_distance,
         min_residue_contacts=min_residue_contacts,
         min_basic_contacts=min_basic_contacts,
+        contact_entropy_normalized=contact_entropy_norm,
+        rna_span_covered=rna_span_covered,
+        cluster_count=cluster_count,
+        min_rna_span=min_rna_span,
     )
 
     summary = {
@@ -365,9 +490,14 @@ def extract_protein_rna_contacts(
         "min_distance_A": round(min_distance, 3) if min_distance is not None else None,
         "interface_quality_score": interface_score,
         "interface_passed": interface_passed,
+        "interface_steric_clash": steric_clash,
+        "interface_contact_entropy": contact_entropy,
+        "interface_contact_entropy_normalized": contact_entropy_norm,
+        "interface_rna_span_covered": round(rna_span_covered, 4),
+        "interface_cluster_count": cluster_count,
         "min_required_residue_contacts": min_residue_contacts,
         "min_required_basic_contacts": min_basic_contacts,
-        "interface_steric_clash": steric_clash,
+        "min_required_rna_span": min_rna_span,
     }
 
     if output_json:
@@ -401,6 +531,7 @@ def analyse_interface_contacts_for_results(state: dict) -> dict:
     cutoff = float(os.getenv("VLAB_INTERFACE_CONTACT_CUTOFF", "5.0"))
     min_residue_contacts = int(os.getenv("VLAB_MIN_INTERFACE_RESIDUE_CONTACTS", "5"))
     min_basic_contacts = int(os.getenv("VLAB_MIN_INTERFACE_BASIC_CONTACTS", "1"))
+    min_rna_span = float(os.getenv("VLAB_MIN_INTERFACE_RNA_SPAN", "0.15"))
 
     out_dir = Path(
         os.getenv(
@@ -447,6 +578,7 @@ def analyse_interface_contacts_for_results(state: dict) -> dict:
             cutoff=cutoff,
             min_residue_contacts=min_residue_contacts,
             min_basic_contacts=min_basic_contacts,
+            min_rna_span=min_rna_span,
         )
 
         copied["interface_contacts_valid"] = summary.get("valid", False)
@@ -472,6 +604,14 @@ def analyse_interface_contacts_for_results(state: dict) -> dict:
         copied["interface_quality_score"] = summary.get("interface_quality_score")
         copied["interface_passed"] = summary.get("interface_passed")
         copied["interface_steric_clash"] = summary.get("interface_steric_clash")
+        copied["interface_contact_entropy"] = summary.get("interface_contact_entropy")
+        copied["interface_contact_entropy_normalized"] = summary.get(
+            "interface_contact_entropy_normalized"
+        )
+        copied["interface_rna_span_covered"] = summary.get(
+            "interface_rna_span_covered"
+        )
+        copied["interface_cluster_count"] = summary.get("interface_cluster_count")
 
         if summary.get("valid"):
             contact_files.append(csv_path)

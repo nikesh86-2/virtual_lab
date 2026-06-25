@@ -48,12 +48,18 @@ def skeptic_agent(state: LabState) -> dict:
         binding_results = state.get("binding_results", [])
         current_target = state.get("target_pdb")
 
-        valid = [
+        all_valid = [
             r for r in binding_results
-            if r.get("valid") and (
-                not current_target or r.get("target_pdb") == current_target
-            )
+            if isinstance(r, dict) and r.get("valid")
         ]
+
+        if current_target:
+            valid = [
+                r for r in all_valid
+                if r.get("target_pdb") == current_target
+            ]
+        else:
+            valid = all_valid
 
         # ------------------------------------------------------------
         # No valid binding data
@@ -126,10 +132,16 @@ def skeptic_agent(state: LabState) -> dict:
         fold_passed = state.get("fold_thresholds_passed")
         fold_reasons = state.get("fold_threshold_reasons", [])
         motifs = motif_summary_from_state(state)
+        accepted_target_status = (
+                        f"Accepted target PDB: {current_target}"
+                        if current_target
+                        else "Accepted target PDB: None. Binding rows represent attempted-target evidence only."
+                    )
 
         prompt = (
+
             f"Hypothesis:\n{truncate_str(state.get('hypothesis', ''), 600)}\n\n"
-            f"Target PDB: {state.get('target_pdb')}\n"
+            f"{accepted_target_status}\n"
             f"Binding results (n={n_valid}, source: {score_source}):\n"
             f"{binding_summary}\n"
             f"Best binding rank score: {best_score} "
@@ -195,6 +207,13 @@ def skeptic_agent(state: LabState) -> dict:
 
         fm = FailureMemory()
         fm.update(parsed)
+
+        # New: ingest state-level docking/interface information.
+        try:
+            fm.ingest_run_state(state)
+        except Exception as mem_err:
+            log.warning("FailureMemory ingest_run_state failed: %s", mem_err)
+
         fm.save()
 
         memory = state.get("failure_memory", [])

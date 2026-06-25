@@ -290,11 +290,21 @@ class LabState(TypedDict, total=False):
     target_pdb: Optional[str]
     target_pdb_candidates: List[str]
     target_pdb_rankings: List[dict]
-    failed_target_pdbs: List[str]
+    failed_target_pdbs: List[Any]
+    target_failure_records: List[dict]
+    partial_success_targets: List[str]
+    partial_success_sequences: List[str]
     target_pdb_selection_reason: str
     target_pdb_metadata: dict
     target_selection_mode: str
     target_sequence: Optional[str]
+
+    # ----------------------------------------------------------------
+    # Literature learning / biological priors
+    # ----------------------------------------------------------------
+    literature_motif_hints: List[str]
+    literature_target_hints: List[str]
+    literature_policy_text: str
 
     # ----------------------------------------------------------------
     # Docking exports
@@ -407,3 +417,19 @@ def safe_jsonable(obj: Any) -> Any:
     if isinstance(obj, set):
         return [safe_jsonable(x) for x in sorted(obj, key=str)]
 
+    if isinstance(obj, dict):
+        out = {}
+
+        for k, v in obj.items():
+            # Skip runtime-only/non-serialisable objects.
+            if k in {"wrappers", "data_collector"}:
+                continue
+
+            out[str(k)] = safe_jsonable(v)
+
+        return out
+
+    try:
+        return str(obj)
+    except Exception:
+        return f"<non_jsonable:{type(obj).__name__}>"

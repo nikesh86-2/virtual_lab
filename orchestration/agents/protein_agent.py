@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List
+from typing import Any, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -10,21 +10,21 @@ from VLAB2.core.gpu_manager import clear_gpu
 from VLAB2.core.protein_prep import ensure_protein_pdb
 from VLAB2.core.rna_prep import prepare_rna_pdb_for_hdock
 
+from VLAB2.orchestration.failure_memory import FailureMemory
 from VLAB2.orchestration.llm import get_llm
 from VLAB2.orchestration.state_schema import (
     LabState,
     add_conversation_entry,
     record_stage_output,
 )
+
+from VLAB2.orchestration.utils.checkpointing import save_checkpoint
 from VLAB2.orchestration.utils.docking_visuals import (
     render_docking_snapshots_for_results,
 )
 from VLAB2.orchestration.utils.interface_contacts import (
     analyse_interface_contacts_for_results,
 )
-
-from VLAB2.orchestration.utils.checkpointing import save_checkpoint
-
 from VLAB2.orchestration.utils.docking_utils import (
     export_docking_outputs,
     parse_pdb_candidates,
@@ -32,7 +32,7 @@ from VLAB2.orchestration.utils.docking_utils import (
 )
 from VLAB2.orchestration.utils.env_utils import getenv_int
 from VLAB2.orchestration.utils.sequence_utils import dedupe_rna_sequences
-
+from VLAB2.orchestration.literature_memory import LiteratureMemory
 
 try:
     from VLAB2.core.rcsb_target_selector import select_pdb_targets
@@ -44,6 +44,118 @@ log = logging.getLogger("virtual_lab")
 
 __all__ = ["protein_agent"]
 
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+
+    if raw is None:
+        return default
+
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _normalise_pdb_id(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _failed_target_record(
+    pdb_id: str,
+    reason: str,
+    metadata: dict | None = None,
+) -> dict:
+    return {
+        "pdb_id": _normalise_pdb_id(pdb_id),
+        "reason": reason or "unknown",
+        "metadata": metadata or {},
+    }
+
+
+def _dedupe_failed_targets(records: list[Any]) -> list[dict]:
+    """
+    Dedupe failed targets while supporting both legacy list[str] and new list[dict].
+
+    Latest record for each PDB wins.
+    """
+    seen: dict[str, dict] = {}
+
+    for item in records or []:
+        if isinstance(item, dict):
+            pdb = _normalise_pdb_id(item.get("pdb_id"))
+
+            if not pdb:
+                continue
+
+            seen[pdb] = {
+                "pdb_id": pdb,
+                "reason": item.get("reason", "unknown"),
+                "metadata": item.get("metadata", {}),
+            }
+
+        elif item:
+            pdb = _normalise_pdb_id(item)
+
+            if pdb:
+                seen[pdb] = {
+                    "pdb_id": pdb,
+                    "reason": "unknown",
+                    "metadata": {},
+                }
+
+    return list(seen.values())
+
+
+def _split_failed_target_sets(records: list[Any]) -> tuple[set[str], set[str]]:
+    """
+    Return:
+      hard_failed_set, soft_failed_set
+
+    Legacy string failures are treated as hard/unknown exclusions to preserve
+    old behaviour. New dict records can be soft and therefore reusable.
+    """
+    hard: set[str] = set()
+    soft: set[str] = set()
+
+    for item in records or []:
+        if isinstance(item, dict):
+            pdb = _normalise_pdb_id(item.get("pdb_id"))
+            reason = item.get("reason", "unknown")
+
+            if not pdb:
+                continue
+
+            if reason in FailureMemory.HARD_TARGET_FAILURES:
+                hard.add(pdb)
+            elif reason in FailureMemory.SOFT_TARGET_FAILURES:
+                soft.add(pdb)
+            else:
+                # Unknown dict reason is conservative but not as hard as old strings.
+                soft.add(pdb)
+
+        elif item:
+            pdb = _normalise_pdb_id(item)
+
+            if pdb:
+                hard.add(pdb)
+
+    return hard, soft
+
+
+def _has_clean_interface(row: dict) -> bool:
+    return (
+        isinstance(row, dict)
+        and row.get("dock_valid") is True
+        and row.get("interface_passed") is True
+        and row.get("interface_steric_clash") is not True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sequence collection / fold gating
+# ---------------------------------------------------------------------------
 
 def _collect_sequences_for_protein(state: LabState, eval_top_n: int) -> list[str]:
     """
@@ -97,110 +209,44 @@ def _fold_gate_blocks_protein(state: LabState) -> bool:
     return not any_passed
 
 
+# ---------------------------------------------------------------------------
+# Target selection
+# ---------------------------------------------------------------------------
+
 def _select_candidate_pdbs(state: LabState) -> tuple[list[str], str, list[dict]]:
     """
     Select candidate protein PDB IDs.
 
     Order:
-      1. existing target_pdb
-      2. existing target_pdb_candidates
-      3. dynamic RCSB ranking if enabled
-      4. LLM PDB selection fallback
-      5. VLAB_FALLBACK_PDBS env fallback
+      1. existing target_pdb, unless reuse is disabled or target has hard-failed
+      2. partial-success target memory
+      3. existing target_pdb_candidates
+      4. dynamic RCSB ranking if enabled
+      5. LLM PDB selection fallback, if enabled
+      6. VLAB_FALLBACK_PDBS env fallback, only if explicitly enabled
 
     Failed and blacklisted target PDBs are excluded after candidate gathering.
+
+    Generic fallback PDBs are disabled by default via:
+      VLAB_ALLOW_GENERIC_TARGET_FALLBACK=0
     """
     candidate_pdbs: list[str] = []
     selection_reason = ""
     target_rankings: list[dict] = list(state.get("target_pdb_rankings", []) or [])
 
-    if state.get("target_pdb"):
-        candidate_pdbs.append(str(state["target_pdb"]).upper())
-        selection_reason = "reused_existing_target"
+    state_failed_records = state.get("failed_target_pdbs", []) or []
+    hard_failed_set, _ = _split_failed_target_sets(state_failed_records)
 
-    elif state.get("target_pdb_candidates"):
-        candidate_pdbs.extend(
-            [str(p).upper() for p in state["target_pdb_candidates"]]
-        )
-        selection_reason = "reused_candidate_list"
+    try:
+        fm = FailureMemory()
+        memory_partial_targets = fm.get_partial_success_targets()
+        memory_hard_failed_targets = fm.get_hard_failed_targets()
+    except Exception as e:
+        log.warning("Failed to load FailureMemory for target selection: %s", e)
+        memory_partial_targets = []
+        memory_hard_failed_targets = set()
 
-    else:
-        target_selection_mode = os.getenv(
-            "VLAB_TARGET_SELECTION_MODE",
-            "llm_fallback",
-        ).strip().lower()
-
-        topic_text = (
-            state.get("hypothesis")
-            or state.get("topic_description")
-            or state.get("research_topic")
-            or ""
-        )
-
-        if target_selection_mode == "rcsb_dynamic" and select_pdb_targets is not None:
-            try:
-                ranked_targets = select_pdb_targets(
-                    topic=state.get("research_topic", ""),
-                    hypothesis=topic_text,
-                    virus_name=state.get("virus_name", ""),
-                    virus_family=state.get("virus_family", ""),
-                    exclude_pdbs=state.get("failed_target_pdbs", []),
-                )
-
-                target_rankings = ranked_targets
-
-                candidate_pdbs.extend(
-                    [x["pdb_id"] for x in ranked_targets if x.get("pdb_id")]
-                )
-
-                selection_reason = "rcsb_dynamic_ranked"
-
-                log.info(
-                    "RCSB dynamic target candidates: %s",
-                    ", ".join(candidate_pdbs),
-                )
-
-            except Exception as e:
-                log.warning("RCSB dynamic target selection failed: %s", e)
-
-        if not candidate_pdbs:
-            lookup_msg = get_llm(temperature=0.0).invoke(
-                [
-                    SystemMessage(
-                        content=(
-                            "You are a structural biologist selecting protein targets "
-                            "from the RCSB PDB for RNA docking.\n\n"
-                            "Return exactly 5 PDB IDs, one per line, no other text.\n"
-                            "Prefer experimentally resolved viral capsid or coat-protein "
-                            "RNA complexes, RNA packaging, capsid assembly, or RNA stem-loop "
-                            "binding systems.\n"
-                            "Fallback: 2HW8."
-                        )
-                    ),
-                    HumanMessage(content=topic_text),
-                ]
-            )
-
-            candidate_pdbs.extend(parse_pdb_candidates(lookup_msg.content))
-            selection_reason = "llm_generated_candidates"
-
-    extra = os.getenv("VLAB_FALLBACK_PDBS", "")
-
-    if extra.strip():
-        env_candidates = [x.strip().upper() for x in extra.split(",") if x.strip()]
-        log.info("[DOCKING CONFIG] Adding env fallback PDBs: %s", env_candidates)
-        candidate_pdbs.extend(env_candidates)
-
-    candidate_pdbs = list(dict.fromkeys(candidate_pdbs))
-
-    invalid_tokens = {"NONE", "NULL", "N/A", ""}
-
-    candidate_pdbs = [
-        p for p in candidate_pdbs
-        if p not in invalid_tokens and len(p) == 4 and p[0].isdigit()
-    ]
-
-    failed_set = {str(x).upper() for x in state.get("failed_target_pdbs", [])}
+    hard_failed_set = set(hard_failed_set) | set(memory_hard_failed_targets)
 
     blacklist = {
         x.strip().upper()
@@ -208,37 +254,233 @@ def _select_candidate_pdbs(state: LabState) -> tuple[list[str], str, list[dict]]
         if x.strip()
     }
 
-    candidate_pdbs = [
-        p for p in candidate_pdbs
-        if p.upper() not in failed_set and p.upper() not in blacklist
-    ]
+    invalid_tokens = {"NONE", "NULL", "N/A", ""}
 
-    if not candidate_pdbs:
-        fallback_env = os.getenv("VLAB_FALLBACK_PDBS", "")
-        fallback_list = [
-            x.strip().upper()
-            for x in fallback_env.split(",")
-            if x.strip()
-        ]
+    allow_reuse_existing_target = _env_bool(
+        "VLAB_ALLOW_REUSE_EXISTING_TARGET",
+        default=True,
+    )
 
-        fallback_list = [
-            p for p in fallback_list
-            if (
-                len(p) == 4
-                and p[0].isdigit()
-                and p.upper() not in failed_set
-                and p.upper() not in blacklist
+    allow_llm_target_fallback = _env_bool(
+        "VLAB_ALLOW_LLM_TARGET_FALLBACK",
+        default=True,
+    )
+
+    allow_generic_fallback = _env_bool(
+        "VLAB_ALLOW_GENERIC_TARGET_FALLBACK",
+        default=False,
+    )
+
+    use_partial_success_memory = _env_bool(
+        "VLAB_USE_PARTIAL_SUCCESS_TARGET_MEMORY",
+        default=True,
+    )
+
+    target_selection_mode = os.getenv(
+        "VLAB_TARGET_SELECTION_MODE",
+        "llm_fallback",
+    ).strip().lower()
+
+    topic_text = (
+        state.get("hypothesis")
+        or state.get("topic_description")
+        or state.get("research_topic")
+        or ""
+    )
+
+    try:
+        lm = LiteratureMemory()
+        literature_policy_text = lm.build_target_policy_text()
+    except Exception:
+        literature_policy_text = ""
+
+    def _normalise_pdbs(values: list[Any]) -> list[str]:
+        out: list[str] = []
+
+        for p in values or []:
+            p = _normalise_pdb_id(p)
+
+            if p in invalid_tokens:
+                continue
+
+            if len(p) != 4 or not p[0].isdigit():
+                continue
+
+            if p in hard_failed_set:
+                continue
+
+            if p in blacklist:
+                continue
+
+            out.append(p)
+
+        return list(dict.fromkeys(out))
+
+    # ------------------------------------------------------------------
+    # 1. Reuse existing accepted target only if allowed and not hard-failed.
+    # ------------------------------------------------------------------
+    existing_target = state.get("target_pdb")
+
+    if existing_target and allow_reuse_existing_target:
+        existing = _normalise_pdbs([existing_target])
+
+        if existing:
+            candidate_pdbs.extend(existing)
+            selection_reason = "reused_existing_target"
+        else:
+            log.info(
+                "Not reusing existing target_pdb=%s because it is invalid, hard-failed, "
+                "or blacklisted.",
+                existing_target,
             )
-        ]
+
+    # ------------------------------------------------------------------
+    # 2. Reuse partial-success target memory.
+    # ------------------------------------------------------------------
+    if not candidate_pdbs and use_partial_success_memory:
+        partial_targets = []
+        partial_targets.extend(state.get("partial_success_targets", []) or [])
+        partial_targets.extend(memory_partial_targets)
+
+        partial_targets = _normalise_pdbs(partial_targets)
+
+        if partial_targets:
+            candidate_pdbs.extend(partial_targets)
+            selection_reason = "partial_success_target_memory"
+
+            log.info(
+                "Using partial-success target candidates from memory: %s",
+                ", ".join(candidate_pdbs),
+            )
+
+    # ------------------------------------------------------------------
+    # 3. Reuse existing candidate list.
+    # ------------------------------------------------------------------
+    if not candidate_pdbs and state.get("target_pdb_candidates"):
+        reused_candidates = _normalise_pdbs(
+            [str(p) for p in state.get("target_pdb_candidates", []) or []]
+        )
+
+        if reused_candidates:
+            candidate_pdbs.extend(reused_candidates)
+            selection_reason = "reused_candidate_list"
+
+    # ------------------------------------------------------------------
+    # 4. Dynamic RCSB ranking.
+    # ------------------------------------------------------------------
+    if not candidate_pdbs:
+        if target_selection_mode == "rcsb_dynamic" and select_pdb_targets is not None:
+            try:
+                ranked_targets = select_pdb_targets(
+                    topic=state.get("research_topic", ""),
+                    hypothesis=(
+                        f"{topic_text}\n\n"
+                        f"{literature_policy_text}"
+                    ),
+                    virus_name=state.get("virus_name", ""),
+                    virus_family=state.get("virus_family", ""),
+                    exclude_pdbs=list(hard_failed_set),
+                )
+
+                target_rankings = ranked_targets
+
+                ranked_pdbs = _normalise_pdbs(
+                    [x.get("pdb_id") for x in ranked_targets if isinstance(x, dict)]
+                )
+
+                if ranked_pdbs:
+                    candidate_pdbs.extend(ranked_pdbs)
+                    selection_reason = "rcsb_dynamic_ranked"
+
+                    log.info(
+                        "RCSB dynamic target candidates: %s",
+                        ", ".join(candidate_pdbs),
+                    )
+                else:
+                    log.warning(
+                        "RCSB dynamic target selection returned no usable candidates."
+                    )
+
+            except Exception as e:
+                log.warning("RCSB dynamic target selection failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # 5. LLM target fallback, optional.
+    # ------------------------------------------------------------------
+    if not candidate_pdbs and allow_llm_target_fallback:
+        try:
+            lookup_msg = get_llm(temperature=0.0).invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "You are a structural biologist selecting protein targets "
+                            "from the RCSB PDB for RNA docking.\n\n"
+                            "Return exactly 5 PDB IDs, one per line, no other text.\n"
+                            "Prefer experimentally resolved viral RNA-binding proteins, "
+                            "nucleocapsid or capsid proteins, RNA packaging proteins, "
+                            "RNA-protein complexes, or RNA stem-loop binding systems.\n"
+                            "Avoid antibody-only, spike-only, polymerase, protease, "
+                            "membrane fusion-core, and oversized whole-particle targets."
+                        )
+                    ),
+
+                    HumanMessage(
+                        content=(
+                            f"Topic/hypothesis:\n{topic_text}\n\n"
+                            f"{literature_policy_text}"
+                        )
+                    ),
+
+                ]
+            )
+
+            llm_candidates = _normalise_pdbs(
+                parse_pdb_candidates(lookup_msg.content)
+            )
+
+            if llm_candidates:
+                candidate_pdbs.extend(llm_candidates)
+                selection_reason = "llm_generated_candidates"
+
+        except Exception as e:
+            log.warning("LLM target selection failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # 6. Generic env fallback, explicitly opt-in only.
+    # ------------------------------------------------------------------
+    if not candidate_pdbs and allow_generic_fallback:
+        fallback_env = os.getenv("VLAB_FALLBACK_PDBS", "")
+
+        fallback_list = _normalise_pdbs(
+            [x.strip().upper() for x in fallback_env.split(",") if x.strip()]
+        )
 
         if fallback_list:
+            log.warning(
+                "[DOCKING CONFIG] Using generic env fallback PDBs because no "
+                "dynamic/LLM/partial-memory candidates were usable: %s",
+                fallback_list,
+            )
+            candidate_pdbs.extend(fallback_list)
             selection_reason = "env_fallback_candidates"
-            candidate_pdbs = fallback_list
 
-    candidate_pdbs = list(dict.fromkeys(candidate_pdbs))
+    elif not candidate_pdbs and not allow_generic_fallback:
+        log.warning(
+            "No usable PDB targets found and generic fallback is disabled. "
+            "Set VLAB_ALLOW_GENERIC_TARGET_FALLBACK=1 to allow VLAB_FALLBACK_PDBS."
+        )
+
+    candidate_pdbs = _normalise_pdbs(candidate_pdbs)
+
+    if not selection_reason and candidate_pdbs:
+        selection_reason = "unknown_candidate_source"
 
     return candidate_pdbs, selection_reason, target_rankings
 
+
+# ---------------------------------------------------------------------------
+# Docking result helpers
+# ---------------------------------------------------------------------------
 
 def _find_md_result_for_sequence(state: LabState, seq: str) -> dict | None:
     for m in state.get("md_results", []):
@@ -366,6 +608,63 @@ def _count_pdb_atoms(path: str) -> int:
     return count
 
 
+def _reject_implausible_hdock_score(result: dict) -> dict:
+    """
+    Reject pathological HDOCK-relative scores that usually indicate receptor,
+    chain, complex-preparation, or parser artefacts.
+
+    HDOCK scores are relative docking scores, not physical binding energies.
+    Extremely large absolute values, e.g. ~-1000, are treated as invalid for
+    this workflow.
+    """
+    if not isinstance(result, dict):
+        return result
+
+    try:
+        max_abs_reasonable_hdock = float(
+            os.getenv("VLAB_MAX_ABS_REASONABLE_HDOCK_SCORE", "300")
+        )
+    except Exception:
+        max_abs_reasonable_hdock = 300.0
+
+    score = result.get("dock_score")
+
+    if score is None:
+        score = result.get("hdock_score")
+
+    if score is None:
+        return result
+
+    try:
+        score_f = float(score)
+    except Exception:
+        return result
+
+    if abs(score_f) > max_abs_reasonable_hdock:
+        error_msg = (
+            f"HDOCK score {score_f} exceeds plausible absolute bound "
+            f"{max_abs_reasonable_hdock}; likely receptor/complex artefact."
+        )
+
+        result["dock_valid"] = False
+        result["valid"] = False
+        result["vina_valid"] = False
+        result["binding_mode"] = "rejected_docking"
+        result["dock_error"] = error_msg
+        result["error"] = error_msg
+        result["vina_error"] = error_msg
+        result["implausible_hdock_score"] = True
+        result["max_abs_reasonable_hdock_score"] = max_abs_reasonable_hdock
+
+        log.warning(
+            "[HDOCK REJECTED] implausible score %.3f exceeds abs bound %.3f",
+            score_f,
+            max_abs_reasonable_hdock,
+        )
+
+    return result
+
+
 def _updated_md_results_with_docking(
     state: LabState,
     seq: str,
@@ -404,6 +703,23 @@ def _updated_md_results_with_docking(
     return updated
 
 
+def _update_failure_memory_from_result(result: dict) -> None:
+    """
+    Persist interface/target outcomes after protein agent has produced result.
+    This is best-effort and must never break the run.
+    """
+    try:
+        fm = FailureMemory()
+        fm.ingest_run_state(result)
+        fm.save()
+    except Exception as e:
+        log.warning("Failed to update FailureMemory from protein result: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Main agent
+# ---------------------------------------------------------------------------
+
 def protein_agent(state: LabState) -> dict:
     """
     Protein/RNA binding evaluation agent.
@@ -415,6 +731,8 @@ def protein_agent(state: LabState) -> dict:
       - requires MD-generated RNA PDBs for HDOCK
       - prepares receptor and RNA ligand PDBs
       - runs HDOCK
+      - rejects implausible HDOCK artefacts
+      - rejects targets after interface analysis if interface-clean count is too low
       - exports docking summary files
       - returns ranked binding_results
     """
@@ -570,7 +888,9 @@ def protein_agent(state: LabState) -> dict:
             state
         )
 
-        failed_targets = list(state.get("failed_target_pdbs", []))
+        failed_targets = _dedupe_failed_targets(
+            list(state.get("failed_target_pdbs", []) or [])
+        )
 
         if not candidate_pdbs:
             summary = "No valid protein targets available after filtering."
@@ -605,7 +925,7 @@ def protein_agent(state: LabState) -> dict:
 
         chosen_pdb = None
         valid_binding_results: List[dict] = []
-        newly_failed: List[str] = []
+        newly_failed: list[dict] = []
         failed_sequences: list[dict] = []
         md_results_updated = list(state.get("md_results", []) or [])
 
@@ -619,7 +939,13 @@ def protein_agent(state: LabState) -> dict:
                 binding_results = pw.evaluate_sequences(pdb_id, sequences) or []
             except Exception as e:
                 log.warning("Protein wrapper failed for target %s: %s", pdb_id, e)
-                newly_failed.append(pdb_id)
+                newly_failed.append(
+                    _failed_target_record(
+                        pdb_id,
+                        "protein_wrapper_failed",
+                        {"error": str(e)},
+                    )
+                )
                 clear_gpu()
                 continue
 
@@ -634,7 +960,13 @@ def protein_agent(state: LabState) -> dict:
             )
 
             if not proxy_valid_results:
-                newly_failed.append(pdb_id)
+                newly_failed.append(
+                    _failed_target_record(
+                        pdb_id,
+                        "no_proxy_valid_results",
+                        {"sequence_count": len(sequences)},
+                    )
+                )
                 clear_gpu()
                 continue
 
@@ -742,6 +1074,15 @@ def protein_agent(state: LabState) -> dict:
                             }
                         )
                         enhanced_results.append(r)
+
+                        newly_failed.append(
+                            _failed_target_record(
+                                pdb_id,
+                                "missing_receptor",
+                                {"sequence": seq},
+                            )
+                        )
+
                         log.warning(
                             "Aborting target %s because receptor PDB is unavailable.",
                             pdb_id,
@@ -767,6 +1108,18 @@ def protein_agent(state: LabState) -> dict:
                             }
                         )
                         enhanced_results.append(r)
+
+                        newly_failed.append(
+                            _failed_target_record(
+                                pdb_id,
+                                "too_large",
+                                {
+                                    "receptor_atoms": receptor_atoms,
+                                    "max_receptor_atoms": max_receptor_atoms,
+                                },
+                            )
+                        )
+
                         log.warning(
                             "Aborting target %s because receptor has %d atoms > max %d.",
                             pdb_id,
@@ -799,6 +1152,42 @@ def protein_agent(state: LabState) -> dict:
                     )
 
                     log.info("[HDOCK RESULT RAW] %s", dock)
+
+                    dock = _reject_implausible_hdock_score(dock)
+
+                    if isinstance(dock, dict) and dock.get("implausible_hdock_score"):
+                        newly_failed.append(
+                            _failed_target_record(
+                                pdb_id,
+                                "implausible_hdock_score",
+                                {
+                                    "score": dock.get("dock_score", dock.get("hdock_score")),
+                                    "sequence": seq,
+                                },
+                            )
+                        )
+
+                    if isinstance(dock, dict) and dock.get("valid") and dock.get("dock_score") is not None:
+                        log.info(
+                            "[HDOCK RESULT ACCEPTABLE_FOR_FILTERING] pdb=%s seq=%s score=%s",
+                            pdb_id,
+                            seq[:16],
+                            dock.get("dock_score"),
+                        )
+                    else:
+                        log.warning(
+                            "[HDOCK REJECTED/INVALID] pdb=%s seq=%s error=%s",
+                            pdb_id,
+                            seq[:16],
+                            (
+                                dock.get("dock_error")
+                                or dock.get("error")
+                                or dock.get("vina_error")
+                                or "HDOCK returned no valid docking score"
+                            )
+                            if isinstance(dock, dict)
+                            else "HDOCK returned non-dict result",
+                        )
 
                     if dock and dock.get("valid") and dock.get("dock_score") is not None:
                         dock_score = float(dock["dock_score"])
@@ -873,11 +1262,15 @@ def protein_agent(state: LabState) -> dict:
                             if isinstance(dock, dict)
                             else "hdock_failed"
                         )
-                        r["dock_error"] = (
-                            dock.get("error")
-                            if isinstance(dock, dict) and dock.get("error")
-                            else "HDOCK returned no valid docking score"
-                        )
+                        if isinstance(dock, dict):
+                            r["dock_error"] = (
+                                dock.get("error")
+                                or dock.get("dock_error")
+                                or dock.get("vina_error")
+                                or "HDOCK returned no valid docking score"
+                            )
+                        else:
+                            r["dock_error"] = "HDOCK returned no valid docking score"
 
                         r["vina_valid"] = False
                         r["vina_energy"] = None
@@ -900,6 +1293,14 @@ def protein_agent(state: LabState) -> dict:
                             and r.get("dock_error")
                             and "timed out" in str(r.get("dock_error")).lower()
                         ):
+                            newly_failed.append(
+                                _failed_target_record(
+                                    pdb_id,
+                                    "hdock_timeout",
+                                    {"sequence": seq, "error": r.get("dock_error")},
+                                )
+                            )
+
                             log.warning(
                                 "Aborting target %s after HDOCK timeout because "
                                 "VLAB_ABORT_TARGET_ON_FIRST_TIMEOUT=1.",
@@ -923,6 +1324,14 @@ def protein_agent(state: LabState) -> dict:
                         {"sequence": seq, "target_pdb": pdb_id, "error": str(e)}
                     )
 
+                    newly_failed.append(
+                        _failed_target_record(
+                            pdb_id,
+                            "hdock_exception",
+                            {"sequence": seq, "error": str(e)},
+                        )
+                    )
+
                     log.exception(
                         "HDOCK docking failed for %s against %s",
                         seq[:15],
@@ -936,7 +1345,9 @@ def protein_agent(state: LabState) -> dict:
 
             dock_valid = [
                 r for r in enhanced_results
-                if r.get("dock_valid") or r.get("vina_valid")
+                if isinstance(r, dict)
+                and r.get("binding_mode") != "rejected_docking"
+                and (r.get("dock_valid") or r.get("vina_valid"))
             ]
 
             dock_scores = [
@@ -960,13 +1371,6 @@ def protein_agent(state: LabState) -> dict:
                 min_valid_hdock_score,
             )
 
-            # ------------------------------------------------------------
-            # Docking-convergence enforcement.
-            #
-            # Only enforce these hard gates when VLAB_REQUIRE_DOCKING=1.
-            # If VLAB_REQUIRE_DOCKING=0, allow the later proxy/enhanced-results
-            # fallback branch to preserve legacy/debug behaviour.
-            # ------------------------------------------------------------
             if require_docking and len(dock_valid) < min_valid_dockings_per_target:
                 log.warning(
                     "Rejecting target %s: only %d docking-valid results after filtering; "
@@ -975,7 +1379,18 @@ def protein_agent(state: LabState) -> dict:
                     len(dock_valid),
                     min_valid_dockings_per_target,
                 )
-                newly_failed.append(pdb_id)
+
+                newly_failed.append(
+                    _failed_target_record(
+                        pdb_id,
+                        "insufficient_dock_valid",
+                        {
+                            "dock_valid": len(dock_valid),
+                            "required": min_valid_dockings_per_target,
+                        },
+                    )
+                )
+
                 clear_gpu()
                 continue
 
@@ -991,7 +1406,18 @@ def protein_agent(state: LabState) -> dict:
                     score_spread,
                     max_target_score_spread,
                 )
-                newly_failed.append(pdb_id)
+
+                newly_failed.append(
+                    _failed_target_record(
+                        pdb_id,
+                        "score_spread",
+                        {
+                            "score_spread": score_spread,
+                            "max_target_score_spread": max_target_score_spread,
+                        },
+                    )
+                )
+
                 clear_gpu()
                 continue
 
@@ -1033,7 +1459,15 @@ def protein_agent(state: LabState) -> dict:
                     "Protein target %s produced no docking-valid results; trying next target.",
                     pdb_id,
                 )
-                newly_failed.append(pdb_id)
+
+                newly_failed.append(
+                    _failed_target_record(
+                        pdb_id,
+                        "no_docking_valid_results",
+                        {"enhanced_result_count": len(enhanced_results)},
+                    )
+                )
+
                 clear_gpu()
                 continue
 
@@ -1044,7 +1478,7 @@ def protein_agent(state: LabState) -> dict:
             clear_gpu()
             break
 
-        failed_targets = list(dict.fromkeys(failed_targets + newly_failed))
+        failed_targets = _dedupe_failed_targets(failed_targets + newly_failed)
 
         # ------------------------------------------------------------
         # No target succeeded
@@ -1093,6 +1527,7 @@ def protein_agent(state: LabState) -> dict:
                 ],
             }
 
+            _update_failure_memory_from_result({**state, **result})
             save_checkpoint({**state, **result})
             clear_gpu()
             return result
@@ -1178,7 +1613,6 @@ def protein_agent(state: LabState) -> dict:
         except Exception as e:
             log.warning("Failed to render docking snapshots: %s", e)
 
-
         # ------------------------------------------------------------
         # Extract protein-RNA interface contact metrics
         # ------------------------------------------------------------
@@ -1187,6 +1621,121 @@ def protein_agent(state: LabState) -> dict:
 
             if interface_paths:
                 result.update(interface_paths)
+
+                require_interface_for_target_acceptance = _env_bool(
+                    "VLAB_REQUIRE_INTERFACE_FOR_TARGET_ACCEPTANCE",
+                    default=False,
+                )
+
+                interface_clean = [
+                    r for r in result.get("binding_results", []) or []
+                    if _has_clean_interface(r)
+                ]
+
+                if require_interface_for_target_acceptance:
+                    if len(interface_clean) < min_valid_dockings_per_target:
+                        log.warning(
+                            "Rejecting accepted target %s after interface analysis: "
+                            "only %d interface-clean docking results; required %d.",
+                            chosen_pdb,
+                            len(interface_clean),
+                            min_valid_dockings_per_target,
+                        )
+
+                        if len(interface_clean) > 0:
+                            fail_reason = "only_one_clean_pose"
+                        else:
+                            fail_reason = "no_clean_interface"
+
+                        failed_targets = _dedupe_failed_targets(
+                            failed_targets
+                            + [
+                                _failed_target_record(
+                                    chosen_pdb,
+                                    fail_reason,
+                                    {
+                                        "interface_clean_count": len(interface_clean),
+                                        "required": min_valid_dockings_per_target,
+                                    },
+                                )
+                            ]
+                        )
+
+                        # Expose partial success targets to downstream state.
+                        partial_success_targets = list(
+                            state.get("partial_success_targets", []) or []
+                        )
+                        partial_success_sequences = list(
+                            state.get("partial_success_sequences", []) or []
+                        )
+
+                        for clean_row in interface_clean:
+                            if clean_row.get("target_pdb"):
+                                partial_success_targets.append(clean_row["target_pdb"])
+                            if clean_row.get("sequence"):
+                                partial_success_sequences.append(clean_row["sequence"])
+
+                        partial_success_targets = list(
+                            dict.fromkeys(
+                                _normalise_pdb_id(x)
+                                for x in partial_success_targets
+                                if x
+                            )
+                        )
+                        partial_success_sequences = list(
+                            dict.fromkeys(
+                                str(x)
+                                for x in partial_success_sequences
+                                if x
+                            )
+                        )
+
+                        summary = (
+                            f"Target {chosen_pdb} produced docking-valid HDOCK "
+                            f"results, but failed interface validation: only "
+                            f"{len(interface_clean)} interface-clean pose(s), "
+                            f"required {min_valid_dockings_per_target}. "
+                            "Treating target as failed for this run."
+                        )
+
+                        result.update(
+                            {
+                                "protein_analysis": summary,
+                                "target_pdb": None,
+                                "failed_target_pdbs": failed_targets,
+                                "partial_success_targets": partial_success_targets,
+                                "partial_success_sequences": partial_success_sequences,
+                                "target_pdb_selection_reason": selection_reason,
+                                "stage_outputs": [
+                                    record_stage_output(
+                                        state,
+                                        "protein",
+                                        summary,
+                                        summary=(
+                                            "Protein target rejected after interface "
+                                            "validation"
+                                        ),
+                                        metadata={
+                                            "target_pdb": chosen_pdb,
+                                            "interface_clean_count": len(interface_clean),
+                                            "required_interface_clean": (
+                                                min_valid_dockings_per_target
+                                            ),
+                                            "require_interface_for_target_acceptance": True,
+                                            "binding_units": "hdock_relative_score",
+                                        },
+                                    )
+                                ],
+                                "conversation_history": [
+                                    add_conversation_entry(
+                                        state,
+                                        "assistant",
+                                        summary,
+                                        "protein",
+                                    )
+                                ],
+                            }
+                        )
 
                 # Add compact interface notes to the human-readable protein summary.
                 interface_lines = ["", "Interface contact summary:"]
@@ -1200,7 +1749,8 @@ def protein_agent(state: LabState) -> dict:
 
                     interface_lines.append(
                         "  - Seq: {seq}... | contacts={contacts} | basic={basic} | "
-                        "min_dist={dist} Å | interface_score={score} | passed={passed}".format(
+                        "min_dist={dist} Å | interface_score={score} | "
+                        "passed={passed}".format(
                             seq=(r.get("sequence") or "")[:20],
                             contacts=r.get("interface_residue_contacts"),
                             basic=r.get("interface_basic_residue_contacts"),
@@ -1219,15 +1769,17 @@ def protein_agent(state: LabState) -> dict:
         except Exception as e:
             log.warning("Failed to analyse interface contacts: %s", e)
 
-
         # ------------------------------------------------------------
         # Export docking summaries after visuals/contact metrics
         # ------------------------------------------------------------
         try:
             export_paths = export_docking_outputs({**state, **result})
             result.update(export_paths)
+
         except Exception as e:
             log.warning("Failed to export docking summary files: %s", e)
+
+        _update_failure_memory_from_result({**state, **result})
         save_checkpoint({**state, **result})
         clear_gpu()
         return result

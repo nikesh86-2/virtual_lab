@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=/scratch/fbsnpat/bot/VLAB2/output_data/logs/lab_%j.log
 #SBATCH --error=/scratch/fbsnpat/bot/VLAB2/output_data/logs/lab_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
