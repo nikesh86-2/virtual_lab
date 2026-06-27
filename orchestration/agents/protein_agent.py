@@ -46,6 +46,21 @@ __all__ = ["protein_agent"]
 
 
 # ---------------------------------------------------------------------------
+# Target/docking status constants
+# ---------------------------------------------------------------------------
+
+ACCEPTED_TARGET_STATUS = "accepted_target"
+PARTIAL_SUCCESS_TARGET_STATUS = "partial_success_target"
+FAILED_TARGET_STATUS = "failed_target"
+
+PARTIAL_REASON_HDOCK_INTERFACE = "hdock_passed_interface_partially_failed"
+FAILED_REASON_INSUFFICIENT_INTERFACE = "insufficient_interface_clean_docking"
+FAILED_REASON_NO_CLEAN_INTERFACE = "no_clean_interface"
+FAILED_REASON_STERIC_CLASH = "steric_clash"
+FAILED_REASON_SCORE_ARTEFACT = "implausible_hdock_score"
+
+
+# ---------------------------------------------------------------------------
 # Generic helpers
 # ---------------------------------------------------------------------------
 
@@ -74,7 +89,7 @@ def _failed_target_record(
     }
 
 
-def _dedupe_failed_targets(records: list[Any]) -> list[dict]:
+def _dedupe_failed_targets(records: list[Any]) -> list:
     """
     Dedupe failed targets while supporting both legacy list[str] and new list[dict].
 
@@ -84,7 +99,7 @@ def _dedupe_failed_targets(records: list[Any]) -> list[dict]:
 
     for item in records or []:
         if isinstance(item, dict):
-            pdb = _normalise_pdb_id(item.get("pdb_id"))
+            pdb = _normalise_pdb_id(item.get("pdb_id") or item.get("target_pdb"))
 
             if not pdb:
                 continue
@@ -121,7 +136,7 @@ def _split_failed_target_sets(records: list[Any]) -> tuple[set[str], set[str]]:
 
     for item in records or []:
         if isinstance(item, dict):
-            pdb = _normalise_pdb_id(item.get("pdb_id"))
+            pdb = _normalise_pdb_id(item.get("pdb_id") or item.get("target_pdb"))
             reason = item.get("reason", "unknown")
 
             if not pdb:
@@ -144,6 +159,14 @@ def _split_failed_target_sets(records: list[Any]) -> tuple[set[str], set[str]]:
     return hard, soft
 
 
+def _is_dock_valid_row(row: dict) -> bool:
+    return (
+        isinstance(row, dict)
+        and row.get("binding_mode") != "rejected_docking"
+        and (row.get("dock_valid") is True or row.get("vina_valid") is True)
+    )
+
+
 def _has_clean_interface(row: dict) -> bool:
     return (
         isinstance(row, dict)
@@ -153,11 +176,320 @@ def _has_clean_interface(row: dict) -> bool:
     )
 
 
+def _has_steric_clash(row: dict) -> bool:
+    return isinstance(row, dict) and row.get("interface_steric_clash") is True
+
+
+def _get_hdock_relative_score(row: dict) -> float | None:
+    if not isinstance(row, dict):
+        return None
+
+    score = row.get("hdock_score")
+
+    if score is None:
+        score = row.get("dock_score")
+
+    if score is None:
+        score = row.get("vina_energy")
+
+    try:
+        return float(score)
+    except Exception:
+        return None
+
+
+def _classify_docking_training_label(row: dict) -> str:
+    """
+    Assign explicit training label for docking/interface rows.
+
+    This prevents dock_valid=True from being treated as a positive example
+    unless the interface is also clean.
+    """
+    if not isinstance(row, dict):
+        return "negative_invalid_row"
+
+    dock_valid = _is_dock_valid_row(row)
+    interface_passed = row.get("interface_passed") is True
+    steric_clash = row.get("interface_steric_clash") is True
+
+    if dock_valid and interface_passed and not steric_clash:
+        return "positive_interface_clean_pose"
+
+    if dock_valid and steric_clash:
+        return "negative_steric_clash_pose"
+
+    if dock_valid and not interface_passed:
+        return "caution_hdock_valid_interface_failed"
+
+    return "negative_docking_failed"
+
+
+def _extract_pdb_from_partial_item(item: Any) -> str:
+    """
+    Supports partial_success_targets stored as either:
+      - "8K75"
+      - {"target_pdb": "8K75", ...}
+      - {"pdb_id": "8K75", ...}
+    """
+    if isinstance(item, dict):
+        return _normalise_pdb_id(item.get("target_pdb") or item.get("pdb_id"))
+
+    return _normalise_pdb_id(item)
+
+
+def _dedupe_partial_success_targets(records: list[Any]) -> list:
+    """
+    Dedupe partial success targets.
+
+    Keeps structured dict records. Legacy string entries are upgraded to:
+      {
+        "target_pdb": PDB,
+        "pdb_id": PDB,
+        "status": "partial_success_target",
+        "reason": "legacy_partial_success_target"
+      }
+    """
+    seen: dict[str, dict] = {}
+
+    for item in records or []:
+        if isinstance(item, dict):
+            pdb = _normalise_pdb_id(item.get("target_pdb") or item.get("pdb_id"))
+
+            if not pdb:
+                continue
+
+            rec = dict(item)
+            rec["target_pdb"] = pdb
+            rec["pdb_id"] = pdb
+            rec.setdefault("status", PARTIAL_SUCCESS_TARGET_STATUS)
+            rec.setdefault("reason", PARTIAL_REASON_HDOCK_INTERFACE)
+            rec.setdefault("binding_units", "hdock_relative_score")
+            rec.setdefault("binding_energy_is_physical", False)
+            seen[pdb] = rec
+
+        elif item:
+            pdb = _normalise_pdb_id(item)
+
+            if not pdb:
+                continue
+
+            seen[pdb] = {
+                "target_pdb": pdb,
+                "pdb_id": pdb,
+                "status": PARTIAL_SUCCESS_TARGET_STATUS,
+                "reason": "legacy_partial_success_target",
+                "binding_units": "hdock_relative_score",
+                "binding_energy_is_physical": False,
+                "recommendation": "reuse_as_priority_candidate_but_not_final_target",
+            }
+
+    return list(seen.values())
+
+
+def _build_partial_success_record(
+    pdb_id: str,
+    docking_results: list[dict],
+    reason: str = PARTIAL_REASON_HDOCK_INTERFACE,
+) -> dict:
+    """
+    Build structured lower-confidence target record.
+
+    This is for targets such as 8K75:
+      - enough HDOCK-valid poses
+      - at least one clean interface
+      - not enough clean interfaces for full target acceptance
+    """
+    pdb_id = _normalise_pdb_id(pdb_id)
+
+    dock_valid = [
+        r for r in docking_results or []
+        if _is_dock_valid_row(r)
+    ]
+
+    interface_clean = [
+        r for r in dock_valid
+        if _has_clean_interface(r)
+    ]
+
+    steric_clash = [
+        r for r in dock_valid
+        if _has_steric_clash(r)
+    ]
+
+    scores = [
+        _get_hdock_relative_score(r)
+        for r in dock_valid
+    ]
+    scores = [s for s in scores if s is not None]
+
+    return {
+        "target_pdb": pdb_id,
+        "pdb_id": pdb_id,
+        "status": PARTIAL_SUCCESS_TARGET_STATUS,
+        "reason": reason,
+        "recommendation": "reuse_as_priority_candidate_but_not_final_target",
+
+        "binding_units": "hdock_relative_score",
+        "binding_energy_is_physical": False,
+
+        "dock_valid_count": len(dock_valid),
+        "interface_clean_count": len(interface_clean),
+        "steric_clash_count": len(steric_clash),
+
+        "best_hdock_relative_score": min(scores) if scores else None,
+        "score_spread": (
+            max(scores) - min(scores)
+            if len(scores) >= 2
+            else None
+        ),
+
+        "clean_sequences": [
+            r.get("sequence") for r in interface_clean if r.get("sequence")
+        ],
+        "clash_sequences": [
+            r.get("sequence") for r in steric_clash if r.get("sequence")
+        ],
+
+        "training_label": "partial_success_target",
+        "target_selection_label": PARTIAL_REASON_HDOCK_INTERFACE,
+
+        "natural_language_summary": (
+            f"Target {pdb_id} produced HDOCK-relative docking-valid results and "
+            "at least one interface-clean pose, but failed full target acceptance "
+            "because too few poses passed interface validation. Reuse as a "
+            "priority partial-success target, but do not treat as a final "
+            "validated binding system."
+        ),
+    }
+
+
+def _build_interface_preferences(
+    binding_results: list[dict],
+    research_topic: str = "",
+) -> list:
+    """
+    Generate preference examples:
+
+      1. interface-clean pose > steric-clash pose
+      2. reasonable HDOCK score + clean interface >
+         stronger HDOCK score + clash
+
+    HDOCK scores are relative docking scores, not physical binding energies.
+    """
+    clean = []
+    clashes = []
+
+    for r in binding_results or []:
+        if not _is_dock_valid_row(r):
+            continue
+
+        if _has_clean_interface(r):
+            clean.append(r)
+
+        elif _has_steric_clash(r):
+            clashes.append(r)
+
+    preferences: list[dict] = []
+
+    for good in clean:
+        for bad in clashes:
+            good_score = _get_hdock_relative_score(good)
+            bad_score = _get_hdock_relative_score(bad)
+
+            if good_score is None or bad_score is None:
+                continue
+
+            if bad_score < good_score:
+                preference_type = (
+                    "reasonable_hdock_clean_interface_over_stronger_hdock_clash"
+                )
+                rationale = (
+                    "Preferred the interface-clean pose despite a weaker "
+                    "HDOCK-relative score because the alternative has a steric clash."
+                )
+            else:
+                preference_type = "interface_clean_over_steric_clash"
+                rationale = (
+                    "Preferred the interface-clean pose over a steric-clash pose."
+                )
+
+            preferences.append(
+                {
+                    "schema_version": "docking_preference.v1",
+                    "preference_type": preference_type,
+                    "research_topic": research_topic,
+                    "label": "prefer_clean_interface_over_raw_hdock_score",
+
+                    "preferred": {
+                        "sequence": good.get("sequence"),
+                        "target_pdb": good.get("target_pdb"),
+                        "hdock_relative_score": good_score,
+                        "interface_passed": good.get("interface_passed"),
+                        "interface_steric_clash": good.get("interface_steric_clash"),
+                        "interface_quality_score": good.get("interface_quality_score"),
+                        "interface_residue_contacts": good.get("interface_residue_contacts"),
+                        "interface_basic_residue_contacts": good.get("interface_basic_residue_contacts"),
+                        "interface_min_distance_A": good.get("interface_min_distance_A"),
+                        "dock_complex_file": good.get("dock_complex_file"),
+                        "training_label": good.get("training_label"),
+                    },
+
+                    "rejected": {
+                        "sequence": bad.get("sequence"),
+                        "target_pdb": bad.get("target_pdb"),
+                        "hdock_relative_score": bad_score,
+                        "interface_passed": bad.get("interface_passed"),
+                        "interface_steric_clash": bad.get("interface_steric_clash"),
+                        "interface_quality_score": bad.get("interface_quality_score"),
+                        "interface_residue_contacts": bad.get("interface_residue_contacts"),
+                        "interface_basic_residue_contacts": bad.get("interface_basic_residue_contacts"),
+                        "interface_min_distance_A": bad.get("interface_min_distance_A"),
+                        "dock_complex_file": bad.get("dock_complex_file"),
+                        "training_label": bad.get("training_label"),
+                    },
+
+                    "rationale": rationale,
+                    "binding_units": "hdock_relative_score",
+                    "binding_energy_is_physical": False,
+                }
+            )
+
+    return preferences
+
+
+def _dedupe_preferences(preferences: list[dict]) -> list:
+    seen: set[tuple] = set()
+    out: list[dict] = []
+
+    for pref in preferences or []:
+        if not isinstance(pref, dict):
+            continue
+
+        preferred = pref.get("preferred", {}) or {}
+        rejected = pref.get("rejected", {}) or {}
+
+        key = (
+            pref.get("preference_type"),
+            preferred.get("target_pdb"),
+            preferred.get("sequence"),
+            rejected.get("target_pdb"),
+            rejected.get("sequence"),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(pref)
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Sequence collection / fold gating
 # ---------------------------------------------------------------------------
 
-def _collect_sequences_for_protein(state: LabState, eval_top_n: int) -> list[str]:
+def _collect_sequences_for_protein(state: LabState, eval_top_n: int) -> list:
     """
     Collect RNA sequences for protein/docking evaluation.
 
@@ -294,11 +626,15 @@ def _select_candidate_pdbs(state: LabState) -> tuple[list[str], str, list[dict]]
     except Exception:
         literature_policy_text = ""
 
-    def _normalise_pdbs(values: list[Any]) -> list[str]:
+    def _normalise_pdbs(values: list[Any]) -> list:
+
         out: list[str] = []
 
-        for p in values or []:
-            p = _normalise_pdb_id(p)
+        for item in values or []:
+            if isinstance(item, dict):
+                p = _normalise_pdb_id(item.get("target_pdb") or item.get("pdb_id"))
+            else:
+                p = _normalise_pdb_id(item)
 
             if p in invalid_tokens:
                 continue
@@ -338,11 +674,11 @@ def _select_candidate_pdbs(state: LabState) -> tuple[list[str], str, list[dict]]
     # 2. Reuse partial-success target memory.
     # ------------------------------------------------------------------
     if not candidate_pdbs and use_partial_success_memory:
-        partial_targets = []
-        partial_targets.extend(state.get("partial_success_targets", []) or [])
-        partial_targets.extend(memory_partial_targets)
+        partial_items: list[Any] = []
+        partial_items.extend(state.get("partial_success_targets", []) or [])
+        partial_items.extend(memory_partial_targets or [])
 
-        partial_targets = _normalise_pdbs(partial_targets)
+        partial_targets = _normalise_pdbs(partial_items)
 
         if partial_targets:
             candidate_pdbs.extend(partial_targets)
@@ -423,14 +759,12 @@ def _select_candidate_pdbs(state: LabState) -> tuple[list[str], str, list[dict]]
                             "membrane fusion-core, and oversized whole-particle targets."
                         )
                     ),
-
                     HumanMessage(
                         content=(
                             f"Topic/hypothesis:\n{topic_text}\n\n"
                             f"{literature_policy_text}"
                         )
                     ),
-
                 ]
             )
 
@@ -511,6 +845,7 @@ def _initialise_docking_fields(r: dict) -> dict:
     r["vina_error"] = None
 
     r["binding_mode"] = "proxy"
+    r["binding_energy_is_physical"] = False
 
     return r
 
@@ -521,11 +856,12 @@ def _set_docking_skip(r: dict, method: str, error: str) -> dict:
     r["vina_method"] = method
     r["vina_error"] = error
     r["binding_mode"] = "proxy"
+    r["binding_energy_is_physical"] = False
 
     return r
 
 
-def _score_and_rank_binding_results(valid_binding_results: list[dict]) -> list[dict]:
+def _score_and_rank_binding_results(valid_binding_results: list[dict]) -> list:
     """
     Convert raw HDOCK/proxy fields into binding_rank_score and ranks.
 
@@ -549,6 +885,7 @@ def _score_and_rank_binding_results(valid_binding_results: list[dict]) -> list[d
             r["binding_rank_score"] = 0.7 * dock_score + 0.3 * proxy_dg
             r["dg"] = r["binding_rank_score"]
             r["binding_units"] = "hdock_relative_score"
+            r["binding_energy_is_physical"] = False
             r["binding_mode"] = "docked"
 
         elif r.get("vina_valid") and r.get("vina_energy") is not None:
@@ -559,12 +896,14 @@ def _score_and_rank_binding_results(valid_binding_results: list[dict]) -> list[d
             r["binding_rank_score"] = 0.7 * dock_score + 0.3 * proxy_dg
             r["dg"] = r["binding_rank_score"]
             r["binding_units"] = "hdock_relative_score"
+            r["binding_energy_is_physical"] = False
             r["binding_mode"] = "docked"
 
         else:
             r["binding_rank_score"] = proxy_dg
             r["dg"] = proxy_dg
             r["binding_units"] = "proxy_score"
+            r["binding_energy_is_physical"] = False
             r["binding_mode"] = "proxy"
 
     valid_binding_results.sort(key=safe_binding_rank)
@@ -655,6 +994,8 @@ def _reject_implausible_hdock_score(result: dict) -> dict:
         result["vina_error"] = error_msg
         result["implausible_hdock_score"] = True
         result["max_abs_reasonable_hdock_score"] = max_abs_reasonable_hdock
+        result["binding_energy_is_physical"] = False
+        result["binding_units"] = "hdock_relative_score"
 
         log.warning(
             "[HDOCK REJECTED] implausible score %.3f exceeds abs bound %.3f",
@@ -670,7 +1011,7 @@ def _updated_md_results_with_docking(
     seq: str,
     pdb_id: str,
     dock_score: float,
-) -> list[dict]:
+) -> list:
     """
     Preserve old behaviour of exposing docking info inside md_results, but without
     mutating the incoming state in-place.
@@ -690,6 +1031,8 @@ def _updated_md_results_with_docking(
             copied_result["dock_valid"] = True
             copied_result["dock_target_pdb"] = pdb_id
             copied_result["dock_method"] = "hdock"
+            copied_result["binding_units"] = "hdock_relative_score"
+            copied_result["binding_energy_is_physical"] = False
 
             # Legacy compatibility.
             copied_result["vina_energy"] = dock_score
@@ -727,12 +1070,16 @@ def protein_agent(state: LabState) -> dict:
     Behaviour:
       - evaluates up to VLAB_AGENT_EVAL_TOP_N RNA candidates
       - dynamically selects or reuses target PDBs
+      - uses partial-success target memory as priority candidates
       - runs wrapper proxy scoring
       - requires MD-generated RNA PDBs for HDOCK
       - prepares receptor and RNA ligand PDBs
       - runs HDOCK
       - rejects implausible HDOCK artefacts
-      - rejects targets after interface analysis if interface-clean count is too low
+      - analyses interface contacts
+      - supports lower-confidence partial target state:
+          partial_success_target / hdock_passed_interface_partially_failed
+      - generates interface-aware preference data
       - exports docking summary files
       - returns ranked binding_results
     """
@@ -777,6 +1124,17 @@ def protein_agent(state: LabState) -> dict:
             min_value=1000,
         )
 
+        allow_partial_interface_target = _env_bool(
+            "VLAB_ALLOW_PARTIAL_INTERFACE_TARGET",
+            default=True,
+        )
+
+        min_partial_interface_clean = getenv_int(
+            "VLAB_MIN_PARTIAL_INTERFACE_CLEAN",
+            1,
+            min_value=1,
+        )
+
         if docking_backend != "hdock":
             log.warning(
                 "Unsupported VLAB_DOCKING_BACKEND=%s; falling back to hdock.",
@@ -790,7 +1148,8 @@ def protein_agent(state: LabState) -> dict:
         log.info(
             "[DOCKING CONFIG] require=%s backend=%s eval_top_n=%d max_dockings=%d "
             "min_score=%.3f min_valid=%d reject_spread=%s max_spread=%.3f "
-            "max_receptor_atoms=%d abort_timeout=%s",
+            "max_receptor_atoms=%d abort_timeout=%s partial_interface=%s "
+            "min_partial_clean=%d",
             require_docking,
             docking_backend,
             eval_top_n,
@@ -801,6 +1160,8 @@ def protein_agent(state: LabState) -> dict:
             max_target_score_spread,
             max_receptor_atoms,
             abort_target_on_first_timeout,
+            allow_partial_interface_target,
+            min_partial_interface_clean,
         )
 
         # ------------------------------------------------------------
@@ -822,6 +1183,9 @@ def protein_agent(state: LabState) -> dict:
                 "target_pdb": state.get("target_pdb"),
                 "target_pdb_candidates": state.get("target_pdb_candidates", []),
                 "failed_target_pdbs": state.get("failed_target_pdbs", []),
+                "partial_success_targets": state.get("partial_success_targets", []),
+                "partial_success_sequences": state.get("partial_success_sequences", []),
+                "target_failure_records": state.get("target_failure_records", []),
                 "target_pdb_rankings": state.get("target_pdb_rankings", []),
                 "stage_outputs": [
                     record_stage_output(
@@ -865,6 +1229,9 @@ def protein_agent(state: LabState) -> dict:
                 "protein_analysis": summary,
                 "binding_results": [],
                 "failed_sequences": [],
+                "partial_success_targets": state.get("partial_success_targets", []),
+                "partial_success_sequences": state.get("partial_success_sequences", []),
+                "target_failure_records": state.get("target_failure_records", []),
                 "stage_outputs": [
                     record_stage_output(
                         state,
@@ -892,6 +1259,20 @@ def protein_agent(state: LabState) -> dict:
             list(state.get("failed_target_pdbs", []) or [])
         )
 
+        partial_success_targets = _dedupe_partial_success_targets(
+            list(state.get("partial_success_targets", []) or [])
+        )
+
+        partial_success_sequences = list(
+            dict.fromkeys(
+                str(x)
+                for x in (state.get("partial_success_sequences", []) or [])
+                if x
+            )
+        )
+
+        target_failure_records = list(state.get("target_failure_records", []) or [])
+
         if not candidate_pdbs:
             summary = "No valid protein targets available after filtering."
 
@@ -902,6 +1283,9 @@ def protein_agent(state: LabState) -> dict:
                 "target_pdb": None,
                 "target_pdb_candidates": [],
                 "failed_target_pdbs": failed_targets,
+                "partial_success_targets": partial_success_targets,
+                "partial_success_sequences": partial_success_sequences,
+                "target_failure_records": target_failure_records,
                 "target_pdb_selection_reason": "no_valid_candidates",
                 "target_pdb_rankings": target_rankings,
                 "stage_outputs": [
@@ -1159,7 +1543,7 @@ def protein_agent(state: LabState) -> dict:
                         newly_failed.append(
                             _failed_target_record(
                                 pdb_id,
-                                "implausible_hdock_score",
+                                FAILED_REASON_SCORE_ARTEFACT,
                                 {
                                     "score": dock.get("dock_score", dock.get("hdock_score")),
                                     "sequence": seq,
@@ -1206,6 +1590,8 @@ def protein_agent(state: LabState) -> dict:
                             r["vina_method"] = "hdock_rejected_weak_score"
                             r["vina_error"] = r["dock_error"]
                             r["binding_mode"] = "rejected_docking"
+                            r["binding_units"] = "hdock_relative_score"
+                            r["binding_energy_is_physical"] = False
 
                             failed_sequences.append(
                                 {
@@ -1226,6 +1612,8 @@ def protein_agent(state: LabState) -> dict:
                             r["dock_output_file"] = dock.get("output_file")
                             r["dock_complex_file"] = dock.get("complex_file")
                             r["binding_mode"] = "docked"
+                            r["binding_units"] = "hdock_relative_score"
+                            r["binding_energy_is_physical"] = False
 
                             # Legacy compatibility shim.
                             r["vina_energy"] = dock_score
@@ -1277,6 +1665,7 @@ def protein_agent(state: LabState) -> dict:
                         r["vina_method"] = r["dock_method"]
                         r["vina_error"] = r["dock_error"]
                         r["binding_mode"] = "proxy"
+                        r["binding_energy_is_physical"] = False
 
                         failed_sequences.append(
                             {
@@ -1319,6 +1708,7 @@ def protein_agent(state: LabState) -> dict:
                     r["vina_method"] = "hdock_exception"
                     r["vina_error"] = str(e)
                     r["binding_mode"] = "proxy"
+                    r["binding_energy_is_physical"] = False
 
                     failed_sequences.append(
                         {"sequence": seq, "target_pdb": pdb_id, "error": str(e)}
@@ -1345,9 +1735,7 @@ def protein_agent(state: LabState) -> dict:
 
             dock_valid = [
                 r for r in enhanced_results
-                if isinstance(r, dict)
-                and r.get("binding_mode") != "rejected_docking"
-                and (r.get("dock_valid") or r.get("vina_valid"))
+                if _is_dock_valid_row(r)
             ]
 
             dock_scores = [
@@ -1481,7 +1869,7 @@ def protein_agent(state: LabState) -> dict:
         failed_targets = _dedupe_failed_targets(failed_targets + newly_failed)
 
         # ------------------------------------------------------------
-        # No target succeeded
+        # No target succeeded at HDOCK/proxy level
         # ------------------------------------------------------------
         if not chosen_pdb or not valid_binding_results:
             tried = ", ".join(candidate_pdbs)
@@ -1505,6 +1893,9 @@ def protein_agent(state: LabState) -> dict:
                 "target_pdb": None,
                 "target_pdb_candidates": candidate_pdbs,
                 "failed_target_pdbs": failed_targets,
+                "partial_success_targets": partial_success_targets,
+                "partial_success_sequences": partial_success_sequences,
+                "target_failure_records": target_failure_records,
                 "target_pdb_selection_reason": selection_reason,
                 "target_pdb_rankings": target_rankings,
                 "md_results": md_results_updated,
@@ -1572,10 +1963,15 @@ def protein_agent(state: LabState) -> dict:
             "target_pdb": chosen_pdb,
             "target_pdb_candidates": candidate_pdbs,
             "failed_target_pdbs": failed_targets,
+            "partial_success_targets": partial_success_targets,
+            "partial_success_sequences": partial_success_sequences,
+            "target_failure_records": target_failure_records,
             "target_pdb_selection_reason": selection_reason,
             "target_pdb_rankings": target_rankings,
             "binding_units": "hdock_relative_score",
+            "binding_energy_is_physical": False,
             "md_results": md_results_updated,
+            "docking_preferences": list(state.get("docking_preferences", []) or []),
             "stage_outputs": [
                 record_stage_output(
                     state,
@@ -1590,9 +1986,10 @@ def protein_agent(state: LabState) -> dict:
                         "docking_backend": docking_backend,
                         "dock_valid_count": sum(
                             1 for r in valid_binding_results
-                            if r.get("dock_valid") or r.get("vina_valid")
+                            if _is_dock_valid_row(r)
                         ),
                         "binding_units": "hdock_relative_score",
+                        "binding_energy_is_physical": False,
                     },
                 )
             ],
@@ -1627,115 +2024,276 @@ def protein_agent(state: LabState) -> dict:
                     default=False,
                 )
 
-                interface_clean = [
+                rows = [
                     r for r in result.get("binding_results", []) or []
-                    if _has_clean_interface(r)
+                    if isinstance(r, dict)
                 ]
+
+                # Add explicit row-level training labels after interface metrics exist.
+                for row in rows:
+                    row["training_label"] = _classify_docking_training_label(row)
+                    row["binding_units"] = "hdock_relative_score"
+                    row["binding_energy_is_physical"] = False
+
+                dock_valid_count = sum(1 for r in rows if _is_dock_valid_row(r))
+                interface_clean = [r for r in rows if _has_clean_interface(r)]
+                steric_clash_count = sum(1 for r in rows if _has_steric_clash(r))
+
+                # Build preference data regardless of final target acceptance.
+                new_preferences = _build_interface_preferences(
+                    rows,
+                    research_topic=state.get("research_topic", ""),
+                )
+                result["docking_preferences"] = _dedupe_preferences(
+                    list(result.get("docking_preferences", []) or []) + new_preferences
+                )
+
+                if new_preferences:
+                    log.info(
+                        "Generated %d interface preference examples for target %s.",
+                        len(new_preferences),
+                        chosen_pdb,
+                    )
 
                 if require_interface_for_target_acceptance:
                     if len(interface_clean) < min_valid_dockings_per_target:
-                        log.warning(
-                            "Rejecting accepted target %s after interface analysis: "
-                            "only %d interface-clean docking results; required %d.",
-                            chosen_pdb,
-                            len(interface_clean),
-                            min_valid_dockings_per_target,
+                        # ----------------------------------------------------
+                        # New behaviour:
+                        # partial_success_target if:
+                        #   enough HDOCK-valid poses AND at least one clean interface
+                        # ----------------------------------------------------
+                        is_partial_success = (
+                            allow_partial_interface_target
+                            and dock_valid_count >= min_valid_dockings_per_target
+                            and len(interface_clean) >= min_partial_interface_clean
                         )
 
-                        if len(interface_clean) > 0:
-                            fail_reason = "only_one_clean_pose"
-                        else:
-                            fail_reason = "no_clean_interface"
+                        if is_partial_success:
+                            partial_record = _build_partial_success_record(
+                                pdb_id=chosen_pdb,
+                                docking_results=rows,
+                                reason=PARTIAL_REASON_HDOCK_INTERFACE,
+                            )
 
-                        failed_targets = _dedupe_failed_targets(
-                            failed_targets
-                            + [
-                                _failed_target_record(
-                                    chosen_pdb,
-                                    fail_reason,
-                                    {
-                                        "interface_clean_count": len(interface_clean),
-                                        "required": min_valid_dockings_per_target,
-                                    },
+                            partial_success_targets = _dedupe_partial_success_targets(
+                                partial_success_targets + [partial_record]
+                            )
+
+                            for clean_row in interface_clean:
+                                if clean_row.get("sequence"):
+                                    partial_success_sequences.append(clean_row["sequence"])
+
+                            partial_success_sequences = list(
+                                dict.fromkeys(
+                                    str(x)
+                                    for x in partial_success_sequences
+                                    if x
                                 )
+                            )
+
+                            failure_record = _failed_target_record(
+                                chosen_pdb,
+                                PARTIAL_REASON_HDOCK_INTERFACE,
+                                {
+                                    "status": PARTIAL_SUCCESS_TARGET_STATUS,
+                                    "dock_valid_count": dock_valid_count,
+                                    "interface_clean_count": len(interface_clean),
+                                    "steric_clash_count": steric_clash_count,
+                                    "required_interface_clean": min_valid_dockings_per_target,
+                                    "recommendation": (
+                                        "reuse_as_priority_candidate_but_not_final_target"
+                                    ),
+                                },
+                            )
+
+                            failed_targets = _dedupe_failed_targets(
+                                failed_targets + [failure_record]
+                            )
+
+                            target_failure_records = list(target_failure_records) + [
+                                partial_record
                             ]
-                        )
 
-                        # Expose partial success targets to downstream state.
-                        partial_success_targets = list(
-                            state.get("partial_success_targets", []) or []
-                        )
-                        partial_success_sequences = list(
-                            state.get("partial_success_sequences", []) or []
-                        )
-
-                        for clean_row in interface_clean:
-                            if clean_row.get("target_pdb"):
-                                partial_success_targets.append(clean_row["target_pdb"])
-                            if clean_row.get("sequence"):
-                                partial_success_sequences.append(clean_row["sequence"])
-
-                        partial_success_targets = list(
-                            dict.fromkeys(
-                                _normalise_pdb_id(x)
-                                for x in partial_success_targets
-                                if x
+                            summary = (
+                                f"Target {chosen_pdb} produced docking-valid "
+                                f"HDOCK-relative results and at least one clean interface, "
+                                f"but failed full target acceptance: "
+                                f"{len(interface_clean)} interface-clean pose(s), "
+                                f"required {min_valid_dockings_per_target}. "
+                                f"Recorded as {PARTIAL_SUCCESS_TARGET_STATUS} with "
+                                f"reason={PARTIAL_REASON_HDOCK_INTERFACE}. "
+                                "Reuse as a priority lower-confidence target, but do not "
+                                "treat as a final validated binding system."
                             )
-                        )
-                        partial_success_sequences = list(
-                            dict.fromkeys(
-                                str(x)
-                                for x in partial_success_sequences
-                                if x
+
+                            log.warning(
+                                "Target %s recorded as %s: dock_valid=%d "
+                                "interface_clean=%d steric_clash=%d reason=%s",
+                                chosen_pdb,
+                                PARTIAL_SUCCESS_TARGET_STATUS,
+                                dock_valid_count,
+                                len(interface_clean),
+                                steric_clash_count,
+                                PARTIAL_REASON_HDOCK_INTERFACE,
                             )
-                        )
 
-                        summary = (
-                            f"Target {chosen_pdb} produced docking-valid HDOCK "
-                            f"results, but failed interface validation: only "
-                            f"{len(interface_clean)} interface-clean pose(s), "
-                            f"required {min_valid_dockings_per_target}. "
-                            "Treating target as failed for this run."
-                        )
-
-                        result.update(
-                            {
-                                "protein_analysis": summary,
-                                "target_pdb": None,
-                                "failed_target_pdbs": failed_targets,
-                                "partial_success_targets": partial_success_targets,
-                                "partial_success_sequences": partial_success_sequences,
-                                "target_pdb_selection_reason": selection_reason,
-                                "stage_outputs": [
-                                    record_stage_output(
-                                        state,
-                                        "protein",
-                                        summary,
-                                        summary=(
-                                            "Protein target rejected after interface "
-                                            "validation"
-                                        ),
-                                        metadata={
-                                            "target_pdb": chosen_pdb,
-                                            "interface_clean_count": len(interface_clean),
-                                            "required_interface_clean": (
-                                                min_valid_dockings_per_target
+                            result.update(
+                                {
+                                    "protein_analysis": summary,
+                                    # Important: not a final accepted target.
+                                    "target_pdb": None,
+                                    "failed_target_pdbs": failed_targets,
+                                    "partial_success_targets": partial_success_targets,
+                                    "partial_success_sequences": partial_success_sequences,
+                                    "target_failure_records": target_failure_records,
+                                    "target_pdb_selection_reason": (
+                                        f"{PARTIAL_SUCCESS_TARGET_STATUS}:"
+                                        f"{_normalise_pdb_id(chosen_pdb)}:"
+                                        f"{PARTIAL_REASON_HDOCK_INTERFACE}"
+                                    ),
+                                    "target_status": PARTIAL_SUCCESS_TARGET_STATUS,
+                                    "target_status_reason": PARTIAL_REASON_HDOCK_INTERFACE,
+                                    "stage_outputs": [
+                                        record_stage_output(
+                                            state,
+                                            "protein",
+                                            summary,
+                                            summary=(
+                                                "Protein target recorded as partial "
+                                                "success after interface validation"
                                             ),
-                                            "require_interface_for_target_acceptance": True,
-                                            "binding_units": "hdock_relative_score",
+                                            metadata={
+                                                "target_pdb": chosen_pdb,
+                                                "target_status": PARTIAL_SUCCESS_TARGET_STATUS,
+                                                "target_status_reason": (
+                                                    PARTIAL_REASON_HDOCK_INTERFACE
+                                                ),
+                                                "dock_valid_count": dock_valid_count,
+                                                "interface_clean_count": len(interface_clean),
+                                                "steric_clash_count": steric_clash_count,
+                                                "required_interface_clean": (
+                                                    min_valid_dockings_per_target
+                                                ),
+                                                "require_interface_for_target_acceptance": True,
+                                                "binding_units": "hdock_relative_score",
+                                                "binding_energy_is_physical": False,
+                                                "preference_count": len(new_preferences),
+                                            },
+                                        )
+                                    ],
+                                    "conversation_history": [
+                                        add_conversation_entry(
+                                            state,
+                                            "assistant",
+                                            summary,
+                                            "protein",
+                                        )
+                                    ],
+                                }
+                            )
+
+                        else:
+                            log.warning(
+                                "Rejecting accepted target %s after interface analysis: "
+                                "only %d interface-clean docking results; required %d.",
+                                chosen_pdb,
+                                len(interface_clean),
+                                min_valid_dockings_per_target,
+                            )
+
+                            if len(interface_clean) > 0:
+                                fail_reason = "only_one_clean_pose"
+                            else:
+                                fail_reason = FAILED_REASON_NO_CLEAN_INTERFACE
+
+                            failed_targets = _dedupe_failed_targets(
+                                failed_targets
+                                + [
+                                    _failed_target_record(
+                                        chosen_pdb,
+                                        fail_reason,
+                                        {
+                                            "dock_valid_count": dock_valid_count,
+                                            "interface_clean_count": len(interface_clean),
+                                            "steric_clash_count": steric_clash_count,
+                                            "required": min_valid_dockings_per_target,
                                         },
                                     )
-                                ],
-                                "conversation_history": [
-                                    add_conversation_entry(
-                                        state,
-                                        "assistant",
-                                        summary,
-                                        "protein",
-                                    )
-                                ],
-                            }
-                        )
+                                ]
+                            )
+
+                            target_failure_records = list(target_failure_records) + [
+                                {
+                                    "target_pdb": _normalise_pdb_id(chosen_pdb),
+                                    "pdb_id": _normalise_pdb_id(chosen_pdb),
+                                    "status": FAILED_TARGET_STATUS,
+                                    "reason": FAILED_REASON_INSUFFICIENT_INTERFACE,
+                                    "dock_valid_count": dock_valid_count,
+                                    "interface_clean_count": len(interface_clean),
+                                    "steric_clash_count": steric_clash_count,
+                                    "required_interface_clean": min_valid_dockings_per_target,
+                                    "binding_units": "hdock_relative_score",
+                                    "binding_energy_is_physical": False,
+                                }
+                            ]
+
+                            summary = (
+                                f"Target {chosen_pdb} produced docking-valid HDOCK "
+                                f"results, but failed interface validation: only "
+                                f"{len(interface_clean)} interface-clean pose(s), "
+                                f"required {min_valid_dockings_per_target}. "
+                                "Treating target as failed for this run."
+                            )
+
+                            result.update(
+                                {
+                                    "protein_analysis": summary,
+                                    "target_pdb": None,
+                                    "failed_target_pdbs": failed_targets,
+                                    "partial_success_targets": partial_success_targets,
+                                    "partial_success_sequences": partial_success_sequences,
+                                    "target_failure_records": target_failure_records,
+                                    "target_pdb_selection_reason": selection_reason,
+                                    "target_status": FAILED_TARGET_STATUS,
+                                    "target_status_reason": FAILED_REASON_INSUFFICIENT_INTERFACE,
+                                    "stage_outputs": [
+                                        record_stage_output(
+                                            state,
+                                            "protein",
+                                            summary,
+                                            summary=(
+                                                "Protein target rejected after interface "
+                                                "validation"
+                                            ),
+                                            metadata={
+                                                "target_pdb": chosen_pdb,
+                                                "target_status": FAILED_TARGET_STATUS,
+                                                "target_status_reason": (
+                                                    FAILED_REASON_INSUFFICIENT_INTERFACE
+                                                ),
+                                                "dock_valid_count": dock_valid_count,
+                                                "interface_clean_count": len(interface_clean),
+                                                "steric_clash_count": steric_clash_count,
+                                                "required_interface_clean": (
+                                                    min_valid_dockings_per_target
+                                                ),
+                                                "require_interface_for_target_acceptance": True,
+                                                "binding_units": "hdock_relative_score",
+                                                "binding_energy_is_physical": False,
+                                                "preference_count": len(new_preferences),
+                                            },
+                                        )
+                                    ],
+                                    "conversation_history": [
+                                        add_conversation_entry(
+                                            state,
+                                            "assistant",
+                                            summary,
+                                            "protein",
+                                        )
+                                    ],
+                                }
+                            )
 
                 # Add compact interface notes to the human-readable protein summary.
                 interface_lines = ["", "Interface contact summary:"]
@@ -1750,13 +2308,15 @@ def protein_agent(state: LabState) -> dict:
                     interface_lines.append(
                         "  - Seq: {seq}... | contacts={contacts} | basic={basic} | "
                         "min_dist={dist} Å | interface_score={score} | "
-                        "passed={passed}".format(
+                        "passed={passed} | clash={clash} | label={label}".format(
                             seq=(r.get("sequence") or "")[:20],
                             contacts=r.get("interface_residue_contacts"),
                             basic=r.get("interface_basic_residue_contacts"),
                             dist=r.get("interface_min_distance_A"),
                             score=r.get("interface_quality_score"),
                             passed=r.get("interface_passed"),
+                            clash=r.get("interface_steric_clash"),
+                            label=r.get("training_label"),
                         )
                     )
 

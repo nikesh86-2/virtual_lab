@@ -103,7 +103,6 @@ def _summary_jsonable(obj):
 
     return repr(obj)
 
-
 def export_docking_outputs(state: dict) -> dict:
     """
     Export docking summary JSON/CSV/Markdown files.
@@ -123,10 +122,14 @@ def export_docking_outputs(state: dict) -> dict:
 
     binding_results = state.get("binding_results", []) or []
 
+    # Create the docking_summaries directory if it doesn't exist
+    output_dir = Path("/scratch/fbsnpat/bot/VLAB2/docking_summaries")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     stamp = int(time.time())
-    json_path = Path(f"docking_summary_{stamp}.json")
-    csv_path = Path(f"docking_summary_{stamp}.csv")
-    md_path = Path(f"docking_summary_{stamp}.md")
+    json_path = output_dir / f"docking_summary_{stamp}.json"
+    csv_path = output_dir / f"docking_summary_{stamp}.csv"
+    md_path = output_dir / f"docking_summary_{stamp}.md"
 
     rows = []
 

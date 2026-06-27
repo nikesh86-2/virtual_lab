@@ -474,8 +474,15 @@ class HDockDocking:
 
     @staticmethod
     def _parse_hdock_score(path_like) -> Optional[float]:
+        """
+        observed in VLAB2:    Parse HDOCK-relative score from HDOCK output.
+            a b c x y z score ligand_rmsd cluster
+        where score is the 7th numeric column, index 6.
+        """
+
         text = Path(path_like).read_text(errors="ignore")
 
+        # Format 1: explicit rank followed by score.
         patterns = [
             r"^\s*1\s+(-?\d+(?:\.\d+)?)\s+",
             r"^\s*MODEL\s+1\b.*?score\s*[:=]\s*(-?\d+(?:\.\d+)?)",
@@ -485,12 +492,42 @@ class HDockDocking:
 
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-
             if match:
                 try:
                     return float(match.group(1))
                 except Exception:
                     pass
+
+        # Format 2: HDOCK numeric table.
+        # Example:
+        # 2.96663 2.89884 4.31038 22.733 -23.529 -7.133 -61.46 54.21 1.00
+        for line in text.splitlines():
+            stripped = line.strip()
+
+            if not stripped:
+                continue
+
+            # Skip obvious headers.
+            if not re.match(r"^[\s\-+]?\d", stripped):
+                continue
+
+            parts = stripped.split()
+
+            # Need at least 9 numeric columns for the HDOCK pose table.
+            if len(parts) < 9:
+                continue
+
+            try:
+                vals = [float(x) for x in parts[:9]]
+            except Exception:
+                continue
+
+            score = vals[6]
+
+            # HDOCK scores should usually be negative for meaningful poses.
+            # Avoid parsing grid/progress lines accidentally.
+            if score < -1.0:
+                return score
 
         return None
 
