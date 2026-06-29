@@ -1187,6 +1187,10 @@ def protein_agent(state: LabState) -> dict:
                 "partial_success_sequences": state.get("partial_success_sequences", []),
                 "target_failure_records": state.get("target_failure_records", []),
                 "target_pdb_rankings": state.get("target_pdb_rankings", []),
+                "target_status": "protein_skipped",
+                "target_status_reason": "fold_thresholds_failed",
+                "docking_preferences": list(state.get("docking_preferences", []) or []),
+
                 "stage_outputs": [
                     record_stage_output(
                         state,
@@ -1232,6 +1236,9 @@ def protein_agent(state: LabState) -> dict:
                 "partial_success_targets": state.get("partial_success_targets", []),
                 "partial_success_sequences": state.get("partial_success_sequences", []),
                 "target_failure_records": state.get("target_failure_records", []),
+                "target_status": "protein_skipped",
+                "target_status_reason": "no_sequences_available",
+                "docking_preferences": list(state.get("docking_preferences", []) or []),
                 "stage_outputs": [
                     record_stage_output(
                         state,
@@ -1288,6 +1295,9 @@ def protein_agent(state: LabState) -> dict:
                 "target_failure_records": target_failure_records,
                 "target_pdb_selection_reason": "no_valid_candidates",
                 "target_pdb_rankings": target_rankings,
+                "target_status": FAILED_TARGET_STATUS,
+                "target_status_reason": "no_valid_candidates",
+                "docking_preferences": list(state.get("docking_preferences", []) or []),
                 "stage_outputs": [
                     record_stage_output(
                         state,
@@ -1899,6 +1909,9 @@ def protein_agent(state: LabState) -> dict:
                 "target_pdb_selection_reason": selection_reason,
                 "target_pdb_rankings": target_rankings,
                 "md_results": md_results_updated,
+                "target_status": FAILED_TARGET_STATUS,
+                "target_status_reason": "no_docking_valid_target",
+                "docking_preferences": list(state.get("docking_preferences", []) or []),
                 "stage_outputs": [
                     record_stage_output(
                         state,
@@ -1971,6 +1984,8 @@ def protein_agent(state: LabState) -> dict:
             "binding_units": "hdock_relative_score",
             "binding_energy_is_physical": False,
             "md_results": md_results_updated,
+            "target_status": "hdock_accepted_pending_interface",
+            "target_status_reason": "hdock_filter_passed_interface_pending",
             "docking_preferences": list(state.get("docking_preferences", []) or []),
             "stage_outputs": [
                 record_stage_output(
@@ -2294,6 +2309,110 @@ def protein_agent(state: LabState) -> dict:
                                     ],
                                 }
                             )
+
+
+                    else:
+                        # ----------------------------------------------------
+                        # Full success:
+                        # enough HDOCK-valid poses AND enough clean interfaces.
+                        # ----------------------------------------------------
+                        accepted_record = {
+                            "target_pdb": _normalise_pdb_id(chosen_pdb),
+                            "pdb_id": _normalise_pdb_id(chosen_pdb),
+                            "status": ACCEPTED_TARGET_STATUS,
+                            "reason": "interface_validated",
+                            "dock_valid_count": dock_valid_count,
+                            "interface_clean_count": len(interface_clean),
+                            "steric_clash_count": steric_clash_count,
+                            "required_interface_clean": min_valid_dockings_per_target,
+                            "binding_units": "hdock_relative_score",
+                            "binding_energy_is_physical": False,
+                        }
+
+                        # Keep historical partial-success records. If this target
+                        # was previously partial, it is now resolved/accepted in
+                        # the final state, but the partial record remains useful
+                        # for training the optimisation trajectory.
+                        target_failure_records = list(target_failure_records) + [
+                            accepted_record
+                        ]
+
+                        summary = (
+                            f"Target {chosen_pdb} retained as accepted target after "
+                            f"interface validation: {len(interface_clean)} "
+                            f"interface-clean pose(s), required "
+                            f"{min_valid_dockings_per_target}. HDOCK scores are "
+                            "relative docking scores, not physical binding free "
+                            "energies."
+                        )
+
+                        result.update(
+                            {
+                                "protein_analysis": summary,
+                                "target_pdb": chosen_pdb,
+                                "failed_target_pdbs": failed_targets,
+                                "partial_success_targets": partial_success_targets,
+                                "partial_success_sequences": partial_success_sequences,
+                                "resolved_partial_success_targets": [_normalise_pdb_id(chosen_pdb)],
+                                "target_failure_records": target_failure_records,
+                                "target_pdb_selection_reason": (
+                                    f"{ACCEPTED_TARGET_STATUS}:"
+                                    f"{_normalise_pdb_id(chosen_pdb)}:"
+                                    "interface_validated"
+                                ),
+                                "target_status": ACCEPTED_TARGET_STATUS,
+                                "target_status_reason": "interface_validated",
+                                "binding_units": "hdock_relative_score",
+                                "binding_energy_is_physical": False,
+                                "stage_outputs": [
+                                    record_stage_output(
+                                        state,
+                                        "protein",
+                                        summary,
+                                        summary=(
+                                            "Protein target accepted after interface "
+                                            "validation"
+                                        ),
+                                        metadata={
+                                            "target_pdb": chosen_pdb,
+                                            "target_status": ACCEPTED_TARGET_STATUS,
+                                            "target_status_reason": "interface_validated",
+                                            "dock_valid_count": dock_valid_count,
+                                            "interface_clean_count": len(interface_clean),
+                                            "steric_clash_count": steric_clash_count,
+                                            "required_interface_clean": (
+                                                min_valid_dockings_per_target
+                                            ),
+                                            "require_interface_for_target_acceptance": True,
+                                            "binding_units": "hdock_relative_score",
+                                            "binding_energy_is_physical": False,
+                                            "preference_count": len(new_preferences),
+                                        },
+                                    )
+                                ],
+                                "conversation_history": [
+                                    add_conversation_entry(
+                                        state,
+                                        "assistant",
+                                        summary,
+                                        "protein",
+                                    )
+                                ],
+                            }
+                        )
+
+                        log.info(
+                            "Target %s retained as %s after interface analysis: "
+                            "dock_valid=%d interface_clean=%d steric_clash=%d "
+                            "required=%d.",
+                            chosen_pdb,
+                            ACCEPTED_TARGET_STATUS,
+                            dock_valid_count,
+                            len(interface_clean),
+                            steric_clash_count,
+                            min_valid_dockings_per_target,
+                        )
+
 
                 # Add compact interface notes to the human-readable protein summary.
                 interface_lines = ["", "Interface contact summary:"]
