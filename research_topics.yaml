@@ -31,3 +31,29 @@ topics:
         What sequence and structural features enable Coronaviridae-like RNA
         stem-loop motifs to maintain low-energy conformations while achieving
         efficient and specific docking into viral protein RNA-binding pockets?
+
+  - name: "Inhibitor Screening for RNA-Binding Viral Proteins"
+
+    virus_family: "Picornaviridae"
+    virus_name: "Poliovirus"
+    virus_genus: "Enterovirus"
+
+    description: >
+      Screen small-molecule and peptide inhibitors against viral RNA-binding
+      proteins to identify compounds that compete with RNA for the same binding
+      pocket. This test validates the new inhibitor screening pipeline including
+      PubChem compound fetching, AutoDock Vina docking, HDOCK peptide docking,
+      and pose comparison with RNA-protein complexes.
+
+    seed_questions:
+      - >
+        Which small-molecule inhibitors from PubChem can effectively compete
+        with RNA for binding to the viral capsid RNA-binding pocket?
+
+      - >
+        Can designed peptide inhibitors achieve comparable or better binding
+        scores than known RNA motifs for the same protein target?
+
+      - >
+        What is the binding-site overlap between inhibitor poses and RNA-binding
+        poses, indicating competitive inhibition potential?

@@ -248,6 +248,17 @@ export VLAB_CONVERGENCE_SPREAD_THRESHOLD=5.0
 export VLAB_MAX_RECEPTOR_ATOMS=60000
 export VLAB_TARGET_BLACKLIST="5TC1,8PNF"
 
+# Inhibitor screening controls
+export VLAB_INHIBITOR_ENABLED=1
+export VLAB_INHIBITOR_MAX_SMALL_MOLECULES=10
+export VLAB_INHIBITOR_MAX_PEPTIDES=5
+export VLAB_PUBCHEM_QUERIES="ribavirin|remdesivir"
+
+# AutoDock Vina for small-molecule docking
+export VLAB_VINA_BIN="${SRC_ENV}/bin/vina"
+export VLAB_VINA_TIMEOUT=300
+
+# PyMOL rendering for docking snapshots
 export PYMOL_BIN="/mnt/scratch/fbsnpat/bot/VLAB2/bin/pymol_render_env.sh"
 export VLAB_RENDER_DOCKING_SNAPSHOTS=1
 export VLAB_DOCKING_SNAPSHOT_DIR="${BASE_DIR}/output_data/docking_snapshots"

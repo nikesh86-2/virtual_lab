@@ -412,3 +412,33 @@ def should_continue(state: LabState) -> str:
         )
 
     return "continue"
+
+
+def _inhibitor_should_run(state: LabState) -> str:
+    """
+    LangGraph conditional router after protein_agent.
+
+    Returns:
+      "inhibitor" -> run inhibitor screening
+      "skeptic"   -> skip inhibitor and go directly to skeptic
+
+    The inhibitor node is skipped when:
+      - VLAB_INHIBITOR_ENABLED != "1"
+      - target_pdb is missing
+      - interface_contacts is missing or empty
+    """
+    if not _env_bool("VLAB_INHIBITOR_ENABLED", default=False):
+        log.info("Inhibitor screening disabled (VLAB_INHIBITOR_ENABLED != 1)")
+        return "skeptic"
+
+    if not state.get("target_pdb"):
+        log.info("Skipping inhibitor: no target_pdb in state")
+        return "skeptic"
+
+    interface = state.get("interface_contacts") or {}
+    if not interface.get("interface_residues"):
+        log.info("Skipping inhibitor: no interface residues in state")
+        return "skeptic"
+
+    log.info("Inhibitor screening enabled — routing to inhibitor node")
+    return "inhibitor"

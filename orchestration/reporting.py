@@ -42,6 +42,46 @@ def generate_final_report(state: LabState) -> str:
             f"- Best MD min energy: {jf.get('best_md_min_energy')}\n\n"
         )
 
+    # Inhibitor screening results
+    if state.get("inhibitor_enabled"):
+        report += "## Inhibitor Screening\n"
+        report += f"{state.get('inhibitor_summary', 'No inhibitor summary available.')}\n\n"
+
+        small_mols = state.get("inhibitor_small_molecules", []) or []
+        peptides = state.get("inhibitor_peptides", []) or []
+
+        if small_mols:
+            report += "### Small Molecules\n"
+            report += "| Name | Binding Energy (kcal/mol) | Valid |\n"
+            report += "| :--- | :----------------------- | :---- |\n"
+            for sm in small_mols:
+                report += (
+                    f"| {sm.get('name', 'unknown')} "
+                    f"| {sm.get('binding_energy', 'N/A')} "
+                    f"| {sm.get('valid', False)} |\n"
+                )
+            report += "\n"
+
+        if peptides:
+            report += "### Peptides\n"
+            report += "| Sequence | Dock Score | Valid |\n"
+            report += "| :------- | :-------- | :---- |\n"
+            for pep in peptides:
+                seq = pep.get('sequence', 'unknown')[:20]
+                report += (
+                    f"| {seq}... "
+                    f"| {pep.get('score', 'N/A')} "
+                    f"| {pep.get('valid', False)} |\n"
+                )
+            report += "\n"
+
+        overlap = state.get("inhibitor_binding_site_overlap", 0.0)
+        if overlap > 0:
+            report += f"**Binding-site overlap with RNA interface:** {overlap:.1f}%\n\n"
+
+        if state.get("inhibitor_analysis"):
+            report += f"### Inhibitor Analysis\n{state.get('inhibitor_analysis')}\n\n"
+
     report += "## Iteration History\n"
     report += "| Iter | Target | Best Binding Score | Score Range | n_valid | Critique |\n"
     report += "| :--- | :----- | :----------------- | :---------- | :------ | :------- |\n"

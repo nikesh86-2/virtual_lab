@@ -1287,6 +1287,280 @@ def _extract_final_summary_example(state: dict) -> list:
                 "partial-success targets for reuse and redesign, not confirmed "
                 "binding systems."
             )
+
+
+def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
+    """
+    Extract inhibitor screening training examples and preferences.
+
+    Generates:
+      - Small molecule ranking examples (by Vina binding energy)
+      - Peptide ranking examples (by HDOCK score)
+      - Preference examples (better binder vs worse binder)
+    """
+    examples: list[dict] = []
+    preferences: list[dict] = []
+
+    if not isinstance(state, dict):
+        return examples, preferences
+
+    small_mols = state.get("inhibitor_small_molecules", []) or []
+    peptides = state.get("inhibitor_peptides", []) or []
+    inhibitor_enabled = state.get("inhibitor_enabled", False)
+
+    if not inhibitor_enabled or (not small_mols and not peptides):
+        return examples, preferences
+
+    # ------------------------------------------------------------
+    # Small molecule examples
+    # ------------------------------------------------------------
+    valid_sm = [
+        r for r in small_mols
+        if isinstance(r, dict) and r.get("valid") and r.get("binding_energy") is not None
+    ]
+
+    if valid_sm:
+        valid_sm = sorted(valid_sm, key=lambda x: x.get("binding_energy", 999))
+
+        examples.append({
+            "type": "small_molecule_ranking",
+            "instruction": (
+                "Rank small-molecule inhibitors by AutoDock Vina binding energy. "
+                "Lower binding energy (more negative) indicates stronger predicted binding. "
+                "Vina binding energies are approximate kcal/mol estimates, not exact "
+                "experimental values."
+            ),
+            "input": json.dumps({
+                "target_pdb": state.get("target_pdb"),
+                "n_screened": len(small_mols),
+                "n_valid": len(valid_sm),
+                "compounds": [
+                    {
+                        "name": r.get("name"),
+                        "binding_energy": r.get("binding_energy"),
+                        "valid": r.get("valid"),
+                    }
+                    for r in small_mols
+                ],
+            }, indent=2, ensure_ascii=False),
+            "output": json.dumps([
+                {
+                    "rank": i + 1,
+                    "name": r.get("name"),
+                    "binding_energy": r.get("binding_energy"),
+                    "interpretation": "strong_binder" if r.get("binding_energy", 0) < -7 else "moderate_binder",
+                }
+                for i, r in enumerate(valid_sm)
+            ], indent=2, ensure_ascii=False),
+            "metadata": {
+                "source": "inhibitor_small_molecules",
+                "target_pdb": state.get("target_pdb"),
+                "binding_units": "vina_kcal_mol",
+                "n_screened": len(small_mols),
+                "n_valid": len(valid_sm),
+            },
+        })
+
+        # Small molecule preferences
+        if len(valid_sm) >= 2:
+            best = valid_sm[0]
+            for other in valid_sm[1:]:
+                preferences.append({
+                    "type": "small_molecule_binding_preference",
+                    "prompt": (
+                        "Choose the better small-molecule inhibitor. Lower AutoDock Vina "
+                        "binding energy indicates stronger predicted binding affinity."
+                    ),
+                    "chosen": {
+                        "name": best.get("name"),
+                        "binding_energy": best.get("binding_energy"),
+                        "binding_units": "vina_kcal_mol",
+                    },
+                    "rejected": {
+                        "name": other.get("name"),
+                        "binding_energy": other.get("binding_energy"),
+                        "binding_units": "vina_kcal_mol",
+                    },
+                    "metadata": {
+                        "source": "inhibitor_small_molecules",
+                        "target_pdb": state.get("target_pdb"),
+                        "criterion": "vina_binding_energy",
+                    },
+                })
+
+    # ------------------------------------------------------------
+    # Peptide examples
+    # ------------------------------------------------------------
+    valid_pep = [
+        r for r in peptides
+        if isinstance(r, dict) and r.get("valid") and r.get("score") is not None
+    ]
+
+    if valid_pep:
+        valid_pep = sorted(valid_pep, key=lambda x: x.get("score", 999))
+
+        examples.append({
+            "type": "peptide_ranking",
+            "instruction": (
+                "Rank peptide inhibitors by HDOCK docking score. Lower HDOCK score "
+                "indicates better predicted binding. HDOCK scores are relative docking "
+                "scores, not physical binding free energies."
+            ),
+            "input": json.dumps({
+                "target_pdb": state.get("target_pdb"),
+                "n_screened": len(peptides),
+                "n_valid": len(valid_pep),
+                "peptides": [
+                    {
+                        "sequence": r.get("sequence"),
+                        "score": r.get("score"),
+                        "valid": r.get("valid"),
+                    }
+                    for r in peptides
+                ],
+            }, indent=2, ensure_ascii=False),
+            "output": json.dumps([
+                {
+                    "rank": i + 1,
+                    "sequence": r.get("sequence"),
+                    "score": r.get("score"),
+                    "interpretation": "strong_binder" if r.get("score", 0) < -200 else "moderate_binder",
+                }
+                for i, r in enumerate(valid_pep)
+            ], indent=2, ensure_ascii=False),
+            "metadata": {
+                "source": "inhibitor_peptides",
+                "target_pdb": state.get("target_pdb"),
+                "binding_units": "hdock_relative_score",
+                "n_screened": len(peptides),
+                "n_valid": len(valid_pep),
+            },
+        })
+
+        # Peptide preferences
+        if len(valid_pep) >= 2:
+            best = valid_pep[0]
+            for other in valid_pep[1:]:
+                preferences.append({
+                    "type": "peptide_binding_preference",
+                    "prompt": (
+                        "Choose the better peptide inhibitor. Lower HDOCK score indicates "
+                        "better predicted binding affinity. HDOCK scores are relative docking "
+                        "scores, not physical kcal/mol binding free energies."
+                    ),
+                    "chosen": {
+                        "sequence": best.get("sequence"),
+                        "score": best.get("score"),
+                        "binding_units": "hdock_relative_score",
+                    },
+                    "rejected": {
+                        "sequence": other.get("sequence"),
+                        "score": other.get("score"),
+                        "binding_units": "hdock_relative_score",
+                    },
+                    "metadata": {
+                        "source": "inhibitor_peptides",
+                        "target_pdb": state.get("target_pdb"),
+                        "criterion": "hdock_score",
+                    },
+                })
+
+    # ------------------------------------------------------------
+    # Inhibitor vs RNA overlap example
+    # ------------------------------------------------------------
+    overlap = state.get("inhibitor_binding_site_overlap", 0.0)
+    if overlap > 0:
+        examples.append({
+            "type": "inhibitor_rna_overlap_analysis",
+            "instruction": (
+                "Interpret the binding-site overlap between inhibitor poses and RNA "
+                "binding poses. Higher overlap indicates the inhibitor competes with "
+                "RNA for the same pocket, suggesting competitive inhibition potential."
+            ),
+            "input": json.dumps({
+                "target_pdb": state.get("target_pdb"),
+                "overlap_percent": overlap,
+                "best_small_molecule": (valid_sm[0] if valid_sm else None),
+                "best_peptide": (valid_pep[0] if valid_pep else None),
+            }, indent=2, ensure_ascii=False),
+            "output": (
+                f"Binding-site overlap with RNA interface: {overlap:.1f}%. "
+                f"{'High overlap suggests competitive inhibition potential.' if overlap > 50 else 'Moderate overlap indicates partial pocket competition.' if overlap > 20 else 'Low overlap suggests inhibitor binds a different region.'}"
+            ),
+            "metadata": {
+                "source": "inhibitor_binding_site_overlap",
+                "target_pdb": state.get("target_pdb"),
+                "overlap_percent": overlap,
+            },
+        })
+
+    return examples, preferences
+
+
+def _extract_final_summary_example(state: dict) -> list:
+    """
+    Train compact final reporting with correct handling of:
+      - accepted vs attempted targets
+      - partial-success targets
+      - interface validation outcomes
+      - clean wording when no final target is accepted
+    """
+    binding_results = state.get("binding_results", []) or []
+
+    if not binding_results:
+        return []
+
+    accepted_target = state.get("target_pdb")
+    target_sequence = state.get("target_sequence")
+    target_status = state.get("target_status")
+    target_status_reason = state.get("target_status_reason")
+    partial_targets = state.get("partial_success_targets", []) or []
+    partial_target_ids = _normalise_partial_success_target_ids(partial_targets)
+
+    dock_valid_count = sum(
+        1 for r in binding_results
+        if isinstance(r, dict) and r.get("dock_valid")
+    )
+
+    interface_pass_count = sum(
+        1 for r in binding_results
+        if isinstance(r, dict)
+        and r.get("dock_valid")
+        and _has_clean_interface(r)
+    )
+
+    clash_count = sum(
+        1 for r in binding_results
+        if isinstance(r, dict)
+        and r.get("dock_valid")
+        and r.get("interface_steric_clash")
+    )
+
+    # ------------------------------------------------------------
+    # Interface outcome sentence
+    # ------------------------------------------------------------
+    if dock_valid_count and interface_pass_count == 0:
+        interface_sentence = (
+            " However, none of the docking-valid poses passed interface validation; "
+            f"{clash_count} pose(s) showed steric clash evidence. These results should "
+            "therefore be treated as docking hits requiring redesign or pose refinement "
+            "rather than accepted physical binders."
+        )
+
+    elif accepted_target is None and interface_pass_count > 0:
+        if target_status == "partial_success_target" or partial_target_ids:
+            target_list_text = (
+                ", ".join(partial_target_ids)
+                if partial_target_ids
+                else "unknown"
+            )
+            interface_sentence = (
+                f" {interface_pass_count} docking-valid pose(s) passed interface "
+                "validation, but target-level acceptance criteria were not met. "
+                f"Target(s) {target_list_text} should be treated as lower-confidence "
+                "partial-success targets for reuse and redesign, not confirmed "
+                "binding systems."
+            )
         else:
             interface_sentence = (
                 f" {interface_pass_count} docking-valid pose(s) passed interface validation, "
@@ -1407,6 +1681,11 @@ def _extract_examples_from_state(state: dict) -> tuple[list[dict], list[dict]]:
 
     # New: partial-success target supervised examples.
     examples.extend(_extract_partial_success_target_examples(state))
+
+    # New: inhibitor screening examples and preferences.
+    inhibitor_examples, inhibitor_preferences = _extract_inhibitor_examples(state)
+    examples.extend(inhibitor_examples)
+    preferences.extend(inhibitor_preferences)
 
     examples.extend(_extract_interface_critique_examples(state))
     examples.extend(_extract_critique_revision_examples(state))
@@ -1876,10 +2155,29 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             0,
         )
 
+        # Inhibitor preference counts
+        small_molecule_preference_count = preference_type_counts.get(
+            "small_molecule_binding_preference",
+            0,
+        )
+        peptide_preference_count = preference_type_counts.get(
+            "peptide_binding_preference",
+            0,
+        )
+
         partial_success_targets = (state or {}).get("partial_success_targets", []) or []
         partial_success_target_ids = _normalise_partial_success_target_ids(
             partial_success_targets
         )
+        resolved_partial_success_targets = (
+            (state or {}).get("resolved_partial_success_targets", []) or []
+        )
+
+        # Inhibitor statistics
+        inhibitor_enabled = (state or {}).get("inhibitor_enabled", False)
+        small_mols = (state or {}).get("inhibitor_small_molecules", []) or []
+        peptides = (state or {}).get("inhibitor_peptides", []) or []
+        inhibitor_overlap = (state or {}).get("inhibitor_binding_site_overlap", 0.0)
 
         manifest = {
             # ------------------------------------------------------------------
@@ -1900,6 +2198,8 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             "target_status_reason": (state or {}).get("target_status_reason"),
             "partial_success_target_count": len(partial_success_target_ids),
             "partial_success_targets": partial_success_target_ids,
+            "resolved_partial_success_targets": resolved_partial_success_targets,
+            "resolved_partial_success_target_count": len(resolved_partial_success_targets),
             "target_sequence": (state or {}).get("target_sequence"),
             "target_selection_mode": (state or {}).get("target_selection_mode"),
             "target_pdb_selection_reason": target_selection_reason,
@@ -1934,6 +2234,18 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             "interface_steric_clash_count": interface_clash_count,
             "interface_clash_severity_counts": clash_severity_counts,
             "pose_label_counts": pose_label_counts,
+
+            # ------------------------------------------------------------------
+            # Inhibitor screening summary
+            # ------------------------------------------------------------------
+            "inhibitor_enabled": inhibitor_enabled,
+            "inhibitor_small_molecule_count": len(small_mols),
+            "inhibitor_small_molecule_valid_count": sum(1 for r in small_mols if isinstance(r, dict) and r.get("valid")),
+            "inhibitor_peptide_count": len(peptides),
+            "inhibitor_peptide_valid_count": sum(1 for r in peptides if isinstance(r, dict) and r.get("valid")),
+            "inhibitor_binding_site_overlap_percent": inhibitor_overlap,
+            "small_molecule_preference_count": small_molecule_preference_count,
+            "peptide_preference_count": peptide_preference_count,
 
             # ------------------------------------------------------------------
             # Useful final-state summaries

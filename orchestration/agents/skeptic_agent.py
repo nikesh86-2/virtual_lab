@@ -29,6 +29,53 @@ log = logging.getLogger("virtual_lab")
 __all__ = ["skeptic_agent"]
 
 
+def _inhibitor_summary(state: LabState) -> str:
+    """
+    Generate a concise summary of inhibitor screening results for the skeptic.
+    """
+    if not state.get("inhibitor_enabled"):
+        return "Inhibitor screening disabled."
+
+    small_mols = state.get("inhibitor_small_molecules", []) or []
+    peptides = state.get("inhibitor_peptides", []) or []
+    overlap = state.get("inhibitor_binding_site_overlap", 0.0)
+    analysis = state.get("inhibitor_analysis", "")
+
+    n_valid_sm = sum(1 for r in small_mols if r.get("valid"))
+    n_valid_pep = sum(1 for r in peptides if r.get("valid"))
+
+    lines = []
+    if small_mols:
+        lines.append(f"Small molecules: {n_valid_sm}/{len(small_mols)} valid")
+        # Show best small molecule if available
+        valid_sm = [r for r in small_mols if r.get("valid")]
+        if valid_sm:
+            best_sm = min(valid_sm, key=lambda x: x.get("binding_energy", 999))
+            lines.append(
+                f"  Best: {best_sm.get('name', 'unknown')} "
+                f"(energy={best_sm.get('binding_energy', 'N/A')} kcal/mol)"
+            )
+
+    if peptides:
+        lines.append(f"Peptides: {n_valid_pep}/{len(peptides)} valid")
+        # Show best peptide if available
+        valid_pep = [r for r in peptides if r.get("valid")]
+        if valid_pep:
+            best_pep = min(valid_pep, key=lambda x: x.get("score", 999))
+            lines.append(
+                f"  Best: {best_pep.get('sequence', 'unknown')[:12]}... "
+                f"(score={best_pep.get('score', 'N/A')})"
+            )
+
+    if overlap > 0:
+        lines.append(f"Binding-site overlap with RNA interface: {overlap:.1f}%")
+
+    if analysis:
+        lines.append(f"Analysis: {analysis[:200]}")
+
+    return "\n".join(lines) if lines else "No inhibitor results available."
+
+
 def skeptic_agent(state: LabState) -> dict:
     """
     Physics-aware peer reviewer.
@@ -156,6 +203,8 @@ def skeptic_agent(state: LabState) -> dict:
             f"{truncate_str(state.get('structural_analysis', ''), 500)}\n\n"
             f"MD analysis:\n"
             f"{truncate_str(state.get('md_analysis', ''), 500)}\n\n"
+            f"Inhibitor screening results:\n"
+            f"{_inhibitor_summary(state)}\n\n"
             f"PI optimisation summary:\n"
             f"{truncate_str(state.get('pi_summary', ''), 400)}"
         )

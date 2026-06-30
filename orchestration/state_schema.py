@@ -167,6 +167,28 @@ def _md_result_key(item: dict) -> tuple:
 
     return (seq, rna_pdb, min_energy)
 
+def dedupe_string_list_reducer(
+    existing: list[str] | None,
+    new: list[str] | None,
+) -> list[str]:
+    """
+    Merge generic string lists while deduplicating and preserving insertion order.
+    """
+    combined = list(existing or []) + list(new or [])
+
+    seen = set()
+    out: list[str] = []
+
+    for item in combined:
+        s = str(item or "").strip()
+
+        if not s or s in seen:
+            continue
+
+        seen.add(s)
+        out.append(s)
+
+    return out
 
 def dedupe_md_results_reducer(
     existing: list[dict] | None,
@@ -292,12 +314,16 @@ class LabState(TypedDict, total=False):
     target_pdb_rankings: List[dict]
     failed_target_pdbs: List[Any]
     target_failure_records: List[dict]
-    partial_success_targets: List[str]
+    partial_success_targets: List[Any]
     partial_success_sequences: List[str]
     target_pdb_selection_reason: str
     target_pdb_metadata: dict
     target_selection_mode: str
     target_sequence: Optional[str]
+    target_status: str | None
+    target_status_reason: str | None
+    resolved_partial_success_targets: Annotated[list[str], dedupe_string_list_reducer]
+    docking_preferences: Annotated[List[dict], append_unique_dicts_reducer]
 
     # ----------------------------------------------------------------
     # Literature learning / biological priors
@@ -313,6 +339,18 @@ class LabState(TypedDict, total=False):
     docking_summary_json: str
     docking_summary_csv: str
     docking_summary_md: str
+
+    # ----------------------------------------------------------------
+    # Inhibitor screening
+    # ----------------------------------------------------------------
+    inhibitor_enabled: bool
+    inhibitor_small_molecules: Annotated[list[dict], append_unique_dicts_reducer]
+    inhibitor_peptides: Annotated[list[dict], append_unique_dicts_reducer]
+    inhibitor_binding_site_overlap: float
+    inhibitor_docking_box: dict
+    inhibitor_analysis: str
+    inhibitor_summary: str
+    inhibitor_snapshot_paths: list[str]
 
     # ----------------------------------------------------------------
     # Logs / conversation
