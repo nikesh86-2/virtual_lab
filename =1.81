@@ -1,7 +1,0 @@
-Requirement already satisfied: requests in /mnt/scratch/fbsnpat/envs/biophysics-research-agent-new/lib/python3.11/site-packages (2.34.2)
-Requirement already satisfied: biopython in /mnt/scratch/fbsnpat/envs/biophysics-research-agent-new/lib/python3.11/site-packages (1.87)
-Requirement already satisfied: charset_normalizer<4,>=2 in /mnt/scratch/fbsnpat/envs/biophysics-research-agent-new/lib/python3.11/site-packages (from requests) (3.4.7)
-Requirement already satisfied: idna<4,>=2.5 in /mnt/scratch/fbsnpat/envs/biophysics-research-agent-new/lib/python3.11/site-packages (from requests) (3.18)
-Requirement already satisfied: urllib3<3,>=1.26 in /mnt/scratch/fbsnpat/envs/biophysics-research-agent-new/lib/python3.11/site-packages (from requests) (2.7.0)
-Requirement already satisfied: certifi>=2023.5.7 in /mnt/scratch/fbsnpat/envs/biophysics-research-agent-new/lib/python3.11/site-packages (from requests) (2026.6.17)
-Requirement already satisfied: numpy in /mnt/scratch/fbsnpat/envs/biophysics-research-agent-new/lib/python3.11/site-packages (from biopython) (1.26.4)

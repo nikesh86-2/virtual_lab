@@ -254,6 +254,15 @@ export VLAB_INHIBITOR_MAX_SMALL_MOLECULES=10
 export VLAB_INHIBITOR_MAX_PEPTIDES=5
 export VLAB_PUBCHEM_QUERIES="ribavirin|remdesivir"
 
+# LoRA fine-tuning controls
+export VLAB_LORA_TRAIN=0
+export VLAB_MIN_TRAIN_ROWS=20
+export VLAB_MIN_TRAIN_BYTES=5000
+export VLAB_MIN_INTERFACE_VALID=5
+export VLAB_MIN_LITERATURE_EVIDENCE=2
+export VLAB_AUTO_MODEL_REPLACE=0
+export VLAB_MAX_MODEL_VERSIONS=3
+
 # AutoDock Vina for small-molecule docking
 export VLAB_VINA_BIN="${SRC_ENV}/bin/vina"
 export VLAB_VINA_TIMEOUT=300

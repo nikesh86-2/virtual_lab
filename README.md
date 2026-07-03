@@ -224,6 +224,66 @@ Detailed documentation is available in the [`docs/`](docs/) directory:
 
 ---
 
+## Inhibitor & Peptide Screening
+
+The platform includes a dedicated inhibitor screening pipeline for identifying small-molecule and peptide inhibitors that compete with RNA for viral protein binding pockets.
+
+### Current Status
+
+**✅ Fixed**: The inhibitor/peptide agent was previously not firing due to a state management bug where `interface_contacts` were analyzed but not properly stored before the inhibitor agent attempted to use them. This was caused by:
+
+1. `interface_contacts` and `interface_contact_files` fields were missing from the `LabState` schema in `orchestration/state_schema.py`
+2. LangGraph was not properly persisting these fields when merging the protein_agent's result
+
+**Fix Applied**:
+- Added `interface_contacts: Optional[dict]` and `interface_contact_files: List[str]` to the `LabState` schema
+- Updated `_build_interface_contacts()` to return explicit `None` values instead of empty dict when no valid residues are found
+
+The inhibitor screening pipeline should now execute correctly when:
+- HDOCK docking produces valid results (`dock_valid >= 2`)
+- Interface analysis completes successfully
+- `interface_residues` are properly stored in the LangGraph state
+
+### Expected Workflow (When Fixed)
+
+1. **Protein Agent** performs HDOCK docking of RNA candidates to target protein
+2. **Interface Analysis** extracts binding interface residues from successful docking results
+3. **Inhibitor Agent** uses interface residues to:
+   - Fetch relevant small-molecule compounds from PubChem
+   - Dock compounds using AutoDock Vina
+   - Generate peptide sequences and dock using HDOCK
+   - Compare inhibitor poses with native RNA binding modes
+4. **Skeptic Agent** evaluates inhibitor quality and binding competition
+
+### Configuration
+
+The inhibitor screening is controlled by the research topic selection in `research_topics.yaml`. Topic index 6 is dedicated to inhibitor screening:
+
+```yaml
+- name: "Inhibitor Screening for RNA-Binding Viral Proteins"
+  description: "Screen small-molecule and peptide inhibitors against viral RNA-binding proteins..."
+```
+
+### Dependencies for Inhibitor Screening
+
+| Tool | Purpose | Status |
+|---|---|---|
+| AutoDock Vina | Small-molecule docking | Required |
+| PubChem API | Compound library access | Required (API key) |
+| HDOCKlite | Peptide docking | Already configured |
+| OpenBabel | Format conversion | Already configured |
+
+### Troubleshooting
+
+If inhibitor screening is not firing:
+
+1. Check logs for `interface_contacts` population errors
+2. Verify that HDOCK docking produced valid results (`dock_valid >= 2`)
+3. Ensure interface analysis completed successfully before inhibitor agent execution
+4. Check that `interface_residues` are properly stored in the LangGraph state
+
+---
+
 ## Project Structure
 
 ```

@@ -31,6 +31,10 @@ def build_initial_state(
         "hypothesis": topic.get("description") or topic.get("name") or "",
         "pi_summary": "",
         "optimisation_status": "",
+        "pi_action_summary": "",
+        "pi_operational_summary": "",
+        "pi_training_metadata": {},
+        "best_interface_clean_sequence": None,
 
         "evidence": [],
 
@@ -47,6 +51,19 @@ def build_initial_state(
         "structural_candidates": [],
         "binding_results": [],
         "md_results": [],
+        "interface_contacts": None,
+        "interface_contact_files": [],
+
+        "target_pdb_id": None,
+        "target_pdb_path": None,
+        "inhibitor_enabled": False,
+        "inhibitor_small_molecules": [],
+        "inhibitor_peptides": [],
+        "inhibitor_binding_site_overlap": 0.0,
+        "inhibitor_docking_box": {},
+        "inhibitor_analysis": "",
+        "inhibitor_summary": "",
+        "inhibitor_snapshot_paths": [],
 
         "target_pdb": None,
         "target_pdb_candidates": [],

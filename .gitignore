@@ -4,7 +4,7 @@ complex_cache
 data/
 experiments/
 HDOCKlite_v1.1/
-logs/
+#logs/
 output_data/
 output/
 postrun_training_data/
@@ -24,8 +24,8 @@ pycache/
 scratch/
 
 # Logs and results
-logs/
-*.log
+#logs/
+#*.log
 *.sc
 *.json
 lab_results_*.json
@@ -59,7 +59,6 @@ Hdock.out
 SimRNA_bin
 docking_summary_*.csv
 docking_summary_*.md
-*.md
 *.csv
 *.json
 summary_*.md

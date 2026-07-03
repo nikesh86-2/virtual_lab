@@ -48,6 +48,10 @@ def _parse_best_binding_score_from_critique(critique: str) -> float | None:
     Supports:
         best_binding_score=-71.14
         best_binding_score = -71.14
+
+    Note:
+        In HDOCK runs this is a relative/ranking score, not a physical
+        binding free energy.
     """
     if not critique:
         return None
@@ -118,7 +122,7 @@ def _parse_score_spread_from_critique(critique: str) -> float | None:
     return None
 
 
-def _normalise_failed_target_records(records: list) -> list[dict]:
+def _normalise_failed_target_records(records: list) -> list:
     """
     Normalise failed_target_pdbs to list[dict] while supporting legacy list[str].
 
@@ -133,7 +137,11 @@ def _normalise_failed_target_records(records: list) -> list[dict]:
 
     for item in records or []:
         if isinstance(item, dict):
-            pdb = str(item.get("pdb_id", "") or "").strip().upper()
+            pdb = str(
+                item.get("pdb_id")
+                or item.get("target_pdb")
+                or ""
+            ).strip().upper()
 
             if not pdb:
                 continue
@@ -157,6 +165,463 @@ def _normalise_failed_target_records(records: list) -> list[dict]:
     return list(out.values())
 
 
+def _normalise_partial_success_target_ids(records: list) -> list:
+    """
+    Extract PDB IDs from partial_success_targets supporting legacy list[str]
+    and structured list[dict].
+    """
+    out: list[str] = []
+
+    for item in records or []:
+        if isinstance(item, dict):
+            pdb = str(
+                item.get("target_pdb")
+                or item.get("pdb_id")
+                or ""
+            ).strip().upper()
+        else:
+            pdb = str(item or "").strip().upper()
+
+        if pdb:
+            out.append(pdb)
+
+    return sorted(set(out))
+
+
+def _target_id_from_state(state: LabState, target_pdb: str | None = None) -> str | None:
+    """
+    Recover a stable target PDB ID when possible.
+    """
+    candidate = (
+        state.get("target_pdb_id")
+        or state.get("target_pdb")
+        or target_pdb
+    )
+
+    if isinstance(candidate, str):
+        raw = candidate.strip()
+
+        if len(raw) == 4 and raw.isalnum():
+            return raw.upper()
+
+    partial_ids = _normalise_partial_success_target_ids(
+        state.get("partial_success_targets", []) or []
+    )
+
+    if partial_ids:
+        return partial_ids[0]
+
+    return None
+
+
+def _target_status_is_final_accepted(state: LabState) -> bool:
+    """
+    True only for final accepted targets, not partial-success targets.
+    """
+    return (
+        state.get("target_pdb") is not None
+        and state.get("target_status") == "accepted_target"
+    )
+
+
+def _partial_success_target_present(state: LabState) -> bool:
+    """
+    True if current state represents or contains a partial-success target.
+    """
+    return (
+        state.get("target_status") == "partial_success_target"
+        or bool(state.get("partial_success_targets"))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Text/action helpers for training-friendly PI outputs
+# ---------------------------------------------------------------------------
+
+def _join_actions(actions: list[str]) -> str:
+    """
+    Nicely join qualitative PI actions.
+    """
+    actions = [a for a in actions if a]
+
+    if not actions:
+        return ""
+
+    if len(actions) == 1:
+        return actions[0]
+
+    if len(actions) == 2:
+        return f"{actions[0]} and {actions[1]}"
+
+    return ", ".join(actions[:-1]) + f", and {actions[-1]}"
+
+
+def _select_best_interface_clean_sequence(state: LabState) -> str | None:
+    """
+    Select the best available interface-clean sequence.
+
+    This prevents downstream summaries/training examples from calling a
+    steric-clash pose the 'best' sequence simply because it was selected
+    earlier or has a favourable raw HDOCK-relative score.
+
+    Priority:
+      1. dock_valid=True
+      2. interface_passed=True
+      3. interface_steric_clash != True
+      4. lower binding_rank_score / dg
+      5. lower HDOCK-relative score
+    """
+    rows = [
+        r for r in state.get("binding_results", []) or []
+        if isinstance(r, dict)
+        and r.get("dock_valid") is True
+        and r.get("interface_passed") is True
+        and r.get("interface_steric_clash") is not True
+        and r.get("sequence")
+    ]
+
+    if not rows:
+        return None
+
+    def _score_key(row: dict) -> tuple[float, float]:
+        rank_score = row.get("binding_rank_score", row.get("dg"))
+        hdock_score = row.get("dock_score", row.get("hdock_score"))
+
+        try:
+            rank_score_f = float(rank_score)
+        except Exception:
+            rank_score_f = 1e9
+
+        try:
+            hdock_score_f = float(hdock_score)
+        except Exception:
+            hdock_score_f = 1e9
+
+        return rank_score_f, hdock_score_f
+
+    rows.sort(key=_score_key)
+
+    return rows[0].get("sequence")
+
+
+def _build_target_phrase_for_pi(
+    state: LabState,
+    target_pdb: str | None,
+    target_status: str | None,
+) -> str:
+    """
+    Build target-status-aware PI wording.
+
+    This prevents partial-success targets from being described as accepted or
+    finally validated.
+    """
+    target_id = _target_id_from_state(state, target_pdb) or target_pdb
+
+    if target_status == "partial_success_target":
+        if target_id:
+            return (
+                f"reuse partial-success target {target_id} as a priority "
+                "lower-confidence candidate, but do not treat it as a fully "
+                "validated binding system"
+            )
+
+        return (
+            "reuse the partial-success target context as lower-confidence evidence, "
+            "but do not treat it as a fully validated binding system"
+        )
+
+    if target_status == "accepted_target":
+        if target_id:
+            return f"continue exploiting accepted target {target_id}"
+
+        return "continue exploiting the accepted target"
+
+    if target_status == "failed_target":
+        return "avoid the failed target and broaden target selection"
+
+    if target_pdb:
+        if target_id:
+            return (
+                f"retain target {target_id} for further testing while requiring "
+                "clean interface validation before final acceptance"
+            )
+
+        return (
+            "retain the current target for further testing while requiring clean "
+            "interface validation before final acceptance"
+        )
+
+    return "continue sequence-only optimisation until a usable target is available"
+
+
+def _status_reason_to_qualitative_phrase(reason: str | None) -> str | None:
+    """
+    Convert low-level status reasons into training-friendly qualitative wording.
+    """
+    if not reason:
+        return None
+
+    reason = str(reason)
+
+    mapping = {
+        "hdock_passed_interface_partially_failed": (
+            "partial interface validation rather than full target acceptance"
+        ),
+        "insufficient_interface_clean_docking": (
+            "insufficient clean-interface docking support"
+        ),
+        "interface_validated": (
+            "interface validation support"
+        ),
+        "failed_target": (
+            "target failure requiring broader target search"
+        ),
+    }
+
+    return mapping.get(reason, reason.replace("_", " "))
+
+
+def _build_pi_training_action_summary(
+    state: LabState,
+    target_pdb: str | None,
+    target_status: str | None,
+    target_status_reason: str | None,
+    top_sequences: list[str],
+    conservation_fitness: float,
+    score_spread: float | None,
+    joint_feedback: dict,
+    selected_motifs: list | None = None,
+) -> str:
+    """
+    Build a qualitative PI action summary for supervised training.
+
+    Rules:
+      - Treat HDOCK only as a relative docking/ranking score.
+      - Avoid exact cutoffs and threshold copying.
+      - Prefer qualitative optimisation instructions.
+      - Emphasise clean-interface preference over raw docking-score chasing.
+      - Never call a partial-success target an accepted/final target.
+    """
+    clean_count = int(joint_feedback.get("clean_interface_count", 0) or 0)
+    clash_count = int(joint_feedback.get("interface_clash_count", 0) or 0)
+
+    has_binding = bool(joint_feedback.get("has_binding"))
+    has_md = bool(joint_feedback.get("has_md"))
+
+    best_binding = joint_feedback.get("best_binding_score")
+    interface_signal = float(joint_feedback.get("interface_signal", 0.0) or 0.0)
+
+    target_phrase = _build_target_phrase_for_pi(
+        state=state,
+        target_pdb=target_pdb,
+        target_status=target_status,
+    )
+
+    interface_actions: list[str] = []
+
+    if clean_count > 0:
+        interface_actions.append(
+            "preserve sequence features associated with clean protein-RNA interfaces"
+        )
+
+    if clash_count > 0:
+        interface_actions.append(
+            "penalise variants that generate severe short-distance interface clashes"
+        )
+
+    if not interface_actions:
+        interface_actions.append(
+            "prioritise variants that improve interface contact quality"
+        )
+
+    if interface_signal > 0.8:
+        interface_actions.append(
+            "reuse the observed interface geometry as a positive design signal"
+        )
+
+    interface_phrase = _join_actions(interface_actions)
+
+    if conservation_fitness >= 0.5:
+        conservation_phrase = "use conserved motif-bearing regions as soft constraints"
+    else:
+        conservation_phrase = "increase exploration because conservation support is weak"
+
+    if selected_motifs:
+        conservation_phrase += " while avoiding overfitting to a single motif placement"
+
+    spread_phrase = ""
+    if score_spread is not None:
+        spread_phrase = (
+            "Maintain sequence diversity because the docking-valid population still "
+            "shows variability in HDOCK-relative ranking."
+        )
+
+    md_phrase = ""
+    if has_md:
+        md_phrase = (
+            "Preserve fold and MD stability signals while reducing interface clash risk."
+        )
+
+    binding_phrase = ""
+    if has_binding and best_binding is not None:
+        binding_phrase = (
+            "Use HDOCK-relative scores for ranking only, not as physical binding free energies."
+        )
+
+    if top_sequences:
+        sequence_phrase = (
+            f"The next generation should seed from {len(top_sequences)} selected sequence(s)"
+        )
+    else:
+        sequence_phrase = (
+            "The next generation should reseed from the best available sequence set"
+        )
+
+    parts = [
+        f"The PI should {target_phrase}.",
+        (
+            f"{sequence_phrase}, favouring clean-interface variants over raw "
+            "docking-score improvements."
+        ),
+        f"It should {interface_phrase}.",
+        f"It should {conservation_phrase}.",
+    ]
+
+    if spread_phrase:
+        parts.append(spread_phrase)
+
+    if md_phrase:
+        parts.append(md_phrase)
+
+    if binding_phrase:
+        parts.append(binding_phrase)
+
+    qualitative_reason = _status_reason_to_qualitative_phrase(target_status_reason)
+
+    if qualitative_reason:
+        if target_status == "partial_success_target":
+            parts.append(
+                f"The optimisation status reflects {qualitative_reason}, so the next "
+                "action is refinement and reuse as a lower-confidence target rather "
+                "than final target acceptance."
+            )
+        elif target_status == "accepted_target":
+            parts.append(
+                f"The optimisation status reflects {qualitative_reason}, so the next "
+                "action is focused refinement around the accepted target."
+            )
+        else:
+            parts.append(
+                f"The optimisation status reflects {qualitative_reason}, so the next "
+                "action is refinement rather than final acceptance."
+            )
+
+    return " ".join(parts)
+
+
+def _build_pi_operational_summary(
+    target_pdb: str | None,
+    top_sequences: list[str],
+    conservation_fitness: float,
+    selected_motifs,
+    min_fold_thresholds: dict,
+    binding_units: str,
+    new_bias: dict,
+    score_spread: float | None,
+    joint_feedback: dict,
+    literature_target_hints: list,
+    literature_motif_hints: list,
+    state: LabState,
+) -> str:
+    """
+    Runtime/debug summary for logs and human inspection.
+
+    This remains the backwards-compatible `pi_summary`, but it is not the
+    preferred supervised-training target. Use `pi_action_summary` for that.
+    """
+    return (
+        f"NSGA-II optimisation complete.\n"
+        f"Target PDB: {target_pdb}\n"
+        f"Target status: {state.get('target_status') or 'unknown'}\n"
+        f"Target status reason: {state.get('target_status_reason') or 'unknown'}\n"
+        f"Selected {len(top_sequences)} sequences.\n"
+        f"Conservation fitness: {float(conservation_fitness):.3f}\n"
+        f"Selected motifs: {motif_summary_from_state(state)}\n"
+        f"Min fold thresholds: {min_fold_thresholds or 'default'}\n"
+        f"Binding units: {binding_units}\n"
+        f"Adaptive mutation: {'enabled' if new_bias else 'none'}\n"
+        f"HDOCK-relative score spread feedback: "
+        f"{score_spread if score_spread is not None else 'N/A'}\n"
+        f"Joint feedback: "
+        f"binding={joint_feedback.get('binding_signal', 0.0):.3f}, "
+        f"stability={joint_feedback.get('stability_signal', 0.0):.3f}, "
+        f"fluctuation={joint_feedback.get('fluctuation_signal', 0.0):.3f}, "
+        f"interface={joint_feedback.get('interface_signal', 0.0):.3f}, "
+        f"clean_interface={joint_feedback.get('clean_interface_count', 0)}, "
+        f"clash={joint_feedback.get('interface_clash_count', 0)}\n"
+        f"Literature target hints: "
+        f"{', '.join(literature_target_hints) if literature_target_hints else 'N/A'}\n"
+        f"Literature motif hints: "
+        f"{', '.join(literature_motif_hints) if literature_motif_hints else 'N/A'}"
+    )
+
+
+def _build_pi_training_metadata(
+    state: LabState,
+    target_pdb: str | None,
+    joint_feedback: dict,
+) -> dict:
+    """
+    Structured metadata for filtering PI training examples.
+    """
+    clean_count = int(joint_feedback.get("clean_interface_count", 0) or 0)
+    clash_count = int(joint_feedback.get("interface_clash_count", 0) or 0)
+    dock_valid_count = int(joint_feedback.get("dock_valid_count", 0) or 0)
+
+    target_status = state.get("target_status")
+    target_status_reason = state.get("target_status_reason")
+    target_pdb_id = _target_id_from_state(state, target_pdb)
+
+    if clean_count > 0 and dock_valid_count > 0:
+        training_quality = "high"
+    elif joint_feedback.get("has_binding") or joint_feedback.get("has_md"):
+        training_quality = "medium"
+    else:
+        training_quality = "low"
+
+    target_policy = None
+
+    if target_status == "partial_success_target":
+        target_policy = "reuse_as_priority_candidate_but_not_final_validated_target"
+    elif target_status == "accepted_target":
+        target_policy = "accepted_target_for_focused_refinement"
+    elif target_status == "failed_target":
+        target_policy = "avoid_failed_target_and_broaden_selection"
+
+    return {
+        "schema_version": "pi_action_summary.v2",
+        "target_pdb": target_pdb_id or target_pdb,
+        "target_pdb_id": target_pdb_id,
+        "target_pdb_path": state.get("target_pdb_path"),
+        "target_status": target_status,
+        "target_status_reason": target_status_reason,
+        "target_policy": target_policy,
+        "accepted_target_present": _target_status_is_final_accepted(state),
+        "partial_success_target_present": _partial_success_target_present(state),
+        "binding_units": state.get("binding_units", "hdock_relative_score"),
+        "binding_energy_is_physical": False,
+        "dock_valid_count": dock_valid_count,
+        "clean_interface_count": clean_count,
+        "interface_clean_count": clean_count,
+        "interface_clash_count": clash_count,
+        "steric_clash_count": clash_count,
+        "best_interface_clean_sequence": _select_best_interface_clean_sequence(state),
+        "has_binding": bool(joint_feedback.get("has_binding")),
+        "has_md": bool(joint_feedback.get("has_md")),
+        "training_quality": training_quality,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Target reset logic
 # ---------------------------------------------------------------------------
@@ -168,7 +633,8 @@ def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
     Behaviour:
       - Do not reset a target solely because spread is moderate/high.
       - Keep a target if the best HDOCK-relative score is already favourable.
-      - Reset only when spread is high AND best binding is weak.
+      - Keep partial-success targets with clean interface evidence unless evidence is extreme.
+      - Reset only when spread is high AND best relative score is weak.
       - Optionally reset on extreme spread regardless of best score.
       - Do not mark reset targets as failed unless configured.
 
@@ -234,10 +700,24 @@ def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
         and best_score < accept_binding_score
     )
 
+    # Protect useful partial-success targets from being reset solely on spread.
+    if state.get("target_status") == "partial_success_target":
+        clean_seq = _select_best_interface_clean_sequence(state)
+
+        if clean_seq and binding_is_favourable and not extreme_spread:
+            log.info(
+                "Keeping partial-success target_pdb=%s despite HDOCK-relative spread %.3f "
+                "because it has clean-interface evidence and favourable relative ranking.",
+                target_pdb,
+                score_spread,
+            )
+            return target_pdb
+
     if require_weak_binding and binding_is_favourable and not extreme_spread:
         log.info(
-            "Keeping target_pdb=%s despite spread %.3f because best_binding_score %.3f "
-            "passes accept threshold %.3f. Redesigning sequences against same target.",
+            "Keeping target_pdb=%s despite HDOCK-relative spread %.3f because best "
+            "relative score %.3f passes the configured accept criterion %.3f. "
+            "Redesigning sequences against the same target.",
             target_pdb,
             score_spread,
             best_score,
@@ -246,8 +726,8 @@ def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
         return target_pdb
 
     log.info(
-        "Resetting target_pdb=%s because spread %.3f is high%s. best_binding_score=%s, "
-        "accept_threshold=%.3f.",
+        "Resetting target_pdb=%s because HDOCK-relative spread %.3f is high%s. "
+        "best_relative_score=%s, configured_accept_score=%.3f.",
         target_pdb,
         score_spread,
         " and extreme" if extreme_spread else "",
@@ -263,11 +743,11 @@ def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
         failed_targets.append(
             {
                 "pdb_id": str(target_pdb).upper(),
-                "reason": "reset_high_spread",
+                "reason": "reset_high_hdock_relative_spread",
                 "metadata": {
                     "score_spread": score_spread,
-                    "best_binding_score": best_score,
-                    "accept_binding_score": accept_binding_score,
+                    "best_hdock_relative_score": best_score,
+                    "configured_accept_score": accept_binding_score,
                     "max_accept_spread": max_accept_spread,
                 },
             }
@@ -295,27 +775,11 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
     """
     Combine docking, interface, and MD signals into unified PI feedback.
 
-    Returns heuristic signals in [0, 1]:
-
-      binding_signal:
-        Uses binding_rank_score/dg. More negative docking/ranking scores are better.
-
-      stability_signal:
-        Uses MD min_energy. More negative values are treated as more stable.
-
-      fluctuation_signal:
-        Uses MD energy_fluctuation. Lower fluctuation is better.
-
-      interface_signal:
-        Uses interface quality, clean-interface count, and clash penalties.
-
     These are optimisation heuristics, not physical free-energy estimates.
     """
-    # ------------------------------------------------------------------
-    # Docking / binding signal
-    # ------------------------------------------------------------------
     binding_results = state.get("binding_results", []) or []
     dock_scores = []
+    dock_valid_count = 0
 
     for r in binding_results:
         if not isinstance(r, dict):
@@ -323,6 +787,8 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
 
         if not (r.get("dock_valid") or r.get("vina_valid")):
             continue
+
+        dock_valid_count += 1
 
         if r.get("binding_mode") == "rejected_docking":
             continue
@@ -352,8 +818,6 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
 
     if dock_scores:
         best_dock = min(dock_scores)
-
-        # More negative = better. HDOCK-relative/rank scale heuristic.
         binding_signal = min(1.0, max(0.0, abs(best_dock) / 100.0))
         score_spread = max(dock_scores) - min(dock_scores)
 
@@ -362,9 +826,6 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
         binding_signal = 0.0
         score_spread = None
 
-    # ------------------------------------------------------------------
-    # MD stability / fluctuation signal
-    # ------------------------------------------------------------------
     md_results = state.get("md_results", []) or []
 
     min_energies = []
@@ -415,9 +876,6 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
         mean_fluctuation = None
         fluctuation_signal = 0.0
 
-    # ------------------------------------------------------------------
-    # Interface signal
-    # ------------------------------------------------------------------
     interface_scores = []
     clean_interface_count = 0
     clash_count = 0
@@ -468,6 +926,9 @@ def _compute_joint_physics_feedback(state: LabState) -> dict:
         "interface_signal": interface_signal,
         "clean_interface_count": clean_interface_count,
         "interface_clash_count": clash_count,
+        "dock_valid_count": dock_valid_count,
+        "binding_units": state.get("binding_units", "hdock_relative_score"),
+        "binding_energy_is_physical": False,
     }
 
 
@@ -571,32 +1032,14 @@ def _build_combined_objectives(
 ) -> dict:
     """
     Build and normalise combined optimisation objectives for NSGA-II.
-
-    Preserves original pressure sources:
-      - conservation
-      - Skeptic/objective injection
-      - fold failure pressure
-      - high docking spread pressure
-      - FailureMemory pressures
-
-    Adds joint MD+docking/interface feedback:
-      - weak binding -> binding + diversity pressure
-      - good binding but unstable MD -> structure + thermo pressure
-      - high fluctuation -> structure pressure
-      - clean partial interface -> binding + structure pressure
-      - interface clash -> structure + diversity pressure
     """
     combined_objectives = {
         "conservation": conservation_fitness,
     }
 
-    # Skeptic/objective-injector output
     if critique:
         combined_objectives.update(extra_objectives or {})
 
-    # ------------------------------------------------------------------
-    # Fold/structure pressure if current fold failed
-    # ------------------------------------------------------------------
     if (
         state.get("fold_thresholds_passed") is False
         and os.getenv("VLAB_RNA_ENFORCE_MIN_FOLD", "1").strip() == "1"
@@ -605,9 +1048,6 @@ def _build_combined_objectives(
         combined_objectives["thermo"] = combined_objectives.get("thermo", 0.0) + 0.6
         combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.3
 
-    # ------------------------------------------------------------------
-    # Interface feedback
-    # ------------------------------------------------------------------
     interface_signal = float(joint_feedback.get("interface_signal", 0.0) or 0.0)
     clean_interface_count = int(joint_feedback.get("clean_interface_count", 0) or 0)
     interface_clash_count = int(joint_feedback.get("interface_clash_count", 0) or 0)
@@ -624,14 +1064,11 @@ def _build_combined_objectives(
         combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.2
         combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.2
 
-    # ------------------------------------------------------------------
-    # Docking spread feedback from Skeptic critique
-    # ------------------------------------------------------------------
     max_accept_spread = getenv_float("VLAB_MAX_ACCEPT_SCORE_SPREAD", 10.0)
 
     if score_spread is not None and score_spread > max_accept_spread:
         log.info(
-            "High binding score spread %.3f detected; increasing diversity/structure pressure.",
+            "High HDOCK-relative score spread %.3f detected; increasing diversity/structure pressure.",
             score_spread,
         )
 
@@ -639,9 +1076,6 @@ def _build_combined_objectives(
         combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.5
         combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.2
 
-    # ------------------------------------------------------------------
-    # FailureMemory pressure
-    # ------------------------------------------------------------------
     for k, v in failure_weights.items():
         if k == "binding_pressure":
             combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + v
@@ -675,9 +1109,6 @@ def _build_combined_objectives(
             if "entropy" in k or "structure" in k:
                 combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + v
 
-    # ------------------------------------------------------------------
-    # Joint docking + MD adaptive control
-    # ------------------------------------------------------------------
     binding = float(joint_feedback.get("binding_signal", 0.0) or 0.0)
     stability = float(joint_feedback.get("stability_signal", 0.0) or 0.0)
     fluct = float(joint_feedback.get("fluctuation_signal", 0.0) or 0.0)
@@ -719,9 +1150,6 @@ def _build_combined_objectives(
     if has_binding and has_md and binding > 0.7 and stability > 0.7 and fluct > 0.6:
         combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.6
 
-    # ------------------------------------------------------------------
-    # Normalise
-    # ------------------------------------------------------------------
     total = sum(v for v in combined_objectives.values() if v is not None)
 
     if total > 0:
@@ -742,7 +1170,7 @@ def _build_combined_objectives(
 # Optimisation helpers
 # ---------------------------------------------------------------------------
 
-def _select_top_sequences_from_population(population, analysis: dict) -> list[str]:
+def _select_top_sequences_from_population(population, analysis: dict) -> list:
     """
     Decode Pareto-selected candidates from an NSGA-II population.
     """
@@ -819,11 +1247,10 @@ def _capture_optimisation_step_if_available(
     score_spread: float | None,
     combined_objectives: dict,
     joint_feedback: dict,
+    training_action_summary: str | None = None,
 ):
     """
     Capture optimisation data if a data_collector is available in state.
-
-    This avoids relying on a global data_collector in modular layout.
     """
     data_collector = state.get("data_collector")
 
@@ -841,11 +1268,18 @@ def _capture_optimisation_step_if_available(
             mutation_bias=new_bias,
             metadata={
                 "target_pdb": target_pdb,
+                "target_pdb_id": _target_id_from_state(state, target_pdb),
+                "target_status": state.get("target_status"),
+                "target_status_reason": state.get("target_status_reason"),
                 "iteration": state.get("iterations", 0),
                 "binding_units": state.get("binding_units", "hdock_relative_score"),
+                "binding_energy_is_physical": False,
                 "score_spread": score_spread,
                 "combined_objectives": combined_objectives,
                 "joint_feedback": joint_feedback,
+                "pi_action_summary": training_action_summary,
+                "accepted_target_present": _target_status_is_final_accepted(state),
+                "partial_success_target_present": _partial_success_target_present(state),
                 "literature_motif_hints": state.get("literature_motif_hints", []),
                 "literature_target_hints": state.get("literature_target_hints", []),
             },
@@ -864,17 +1298,35 @@ def _fallback_result(
 ) -> dict:
     fallback_seq = sequences[0] if sequences else ""
 
+    joint_feedback = _compute_joint_physics_feedback(state)
+    pi_training_metadata = _build_pi_training_metadata(
+        state=state,
+        target_pdb=state.get("target_pdb"),
+        joint_feedback=joint_feedback,
+    )
+
     return {
         "pi_summary": summary,
+        "pi_action_summary": summary,
+        "pi_operational_summary": summary,
+        "pi_training_metadata": pi_training_metadata,
         "optimisation_status": status,
         "designed_sequences": [fallback_seq] if fallback_seq else [],
         "target_sequence": state.get("target_sequence") or fallback_seq or None,
+        "best_interface_clean_sequence": _select_best_interface_clean_sequence(state),
         "structural_candidates": state.get("structural_candidates", []),
         "target_pdb": state.get("target_pdb"),
+        "target_pdb_id": state.get("target_pdb_id"),
+        "target_pdb_path": state.get("target_pdb_path"),
+        "target_status": state.get("target_status"),
+        "target_status_reason": state.get("target_status_reason"),
         "failed_target_pdbs": state.get("failed_target_pdbs", []),
+        "partial_success_targets": state.get("partial_success_targets", []),
+        "resolved_partial_success_targets": state.get("resolved_partial_success_targets", []),
         "mutation_bias": state.get("mutation_bias", {}),
         "hypothesis": topic,
         "iterations": state.get("iterations", 0) + 1,
+        "joint_physics_feedback": joint_feedback,
         "literature_motif_hints": state.get("literature_motif_hints", []),
         "literature_target_hints": state.get("literature_target_hints", []),
         "literature_policy_text": state.get("literature_policy_text", ""),
@@ -903,6 +1355,13 @@ def pi_agent(state: LabState) -> dict:
       - run NSGA-II optimisation
       - select Pareto/extreme sequences
       - return updated hypothesis, sequences, mutation bias, and iteration count
+
+    Training-output additions:
+      - pi_summary remains operational/debug summary for compatibility.
+      - pi_action_summary is the preferred supervised fine-tuning target.
+      - pi_operational_summary explicitly stores runtime/debug output.
+      - pi_training_metadata helps post-run exporters filter examples.
+      - best_interface_clean_sequence prevents clash poses being labelled as 'best'.
     """
     log.info("--- PI AGENT (ADAPTIVE MULTI-OBJECTIVE) ---")
 
@@ -913,12 +1372,31 @@ def pi_agent(state: LabState) -> dict:
     critique = state.get("critique", "") or ""
 
     if not wrappers:
+        summary = "No wrappers available."
+
+        joint_feedback = _compute_joint_physics_feedback(state)
+
         return {
-            "pi_summary": "No wrappers available.",
+            "pi_summary": summary,
+            "pi_action_summary": summary,
+            "pi_operational_summary": summary,
+            "pi_training_metadata": _build_pi_training_metadata(
+                state=state,
+                target_pdb=target_pdb,
+                joint_feedback=joint_feedback,
+            ),
             "optimisation_status": "no_wrappers",
             "iterations": state.get("iterations", 0) + 1,
             "target_pdb": target_pdb,
+            "target_pdb_id": state.get("target_pdb_id"),
+            "target_pdb_path": state.get("target_pdb_path"),
+            "target_status": state.get("target_status"),
+            "target_status_reason": state.get("target_status_reason"),
             "failed_target_pdbs": state.get("failed_target_pdbs", []),
+            "partial_success_targets": state.get("partial_success_targets", []),
+            "resolved_partial_success_targets": state.get("resolved_partial_success_targets", []),
+            "best_interface_clean_sequence": _select_best_interface_clean_sequence(state),
+            "joint_physics_feedback": joint_feedback,
             "literature_motif_hints": state.get("literature_motif_hints", []),
             "literature_target_hints": state.get("literature_target_hints", []),
             "literature_policy_text": state.get("literature_policy_text", ""),
@@ -930,12 +1408,31 @@ def pi_agent(state: LabState) -> dict:
         )
 
     if not sequences:
+        summary = "Bootstrap: waiting for structural design."
+
+        joint_feedback = _compute_joint_physics_feedback(state)
+
         return {
-            "pi_summary": "Bootstrap: waiting for structural design.",
+            "pi_summary": summary,
+            "pi_action_summary": summary,
+            "pi_operational_summary": summary,
+            "pi_training_metadata": _build_pi_training_metadata(
+                state=state,
+                target_pdb=target_pdb,
+                joint_feedback=joint_feedback,
+            ),
             "optimisation_status": "bootstrap",
             "iterations": state.get("iterations", 0),
             "target_pdb": target_pdb,
+            "target_pdb_id": state.get("target_pdb_id"),
+            "target_pdb_path": state.get("target_pdb_path"),
+            "target_status": state.get("target_status"),
+            "target_status_reason": state.get("target_status_reason"),
             "failed_target_pdbs": state.get("failed_target_pdbs", []),
+            "partial_success_targets": state.get("partial_success_targets", []),
+            "resolved_partial_success_targets": state.get("resolved_partial_success_targets", []),
+            "best_interface_clean_sequence": _select_best_interface_clean_sequence(state),
+            "joint_physics_feedback": joint_feedback,
             "literature_motif_hints": state.get("literature_motif_hints", []),
             "literature_target_hints": state.get("literature_target_hints", []),
             "literature_policy_text": state.get("literature_policy_text", ""),
@@ -944,9 +1441,6 @@ def pi_agent(state: LabState) -> dict:
     try:
         log.info("Running NSGA-II optimisation (final_rna_design_system)...")
 
-        # ------------------------------------------------------------------
-        # Failure memory
-        # ------------------------------------------------------------------
         memory_model = FailureMemory()
 
         for past in state.get("failure_memory", []):
@@ -955,9 +1449,6 @@ def pi_agent(state: LabState) -> dict:
         failure_weights = memory_model.compute_failure_weights()
         log.info("Failure memory weights: %s", failure_weights)
 
-        # ------------------------------------------------------------------
-        # Literature memory
-        # ------------------------------------------------------------------
         try:
             literature_model = LiteratureMemory()
             literature_motif_hints = literature_model.get_motif_hints(limit=8)
@@ -987,9 +1478,6 @@ def pi_agent(state: LabState) -> dict:
 
         extra_objectives = {}
 
-        # ------------------------------------------------------------------
-        # Parse Skeptic critique and generate extra objectives
-        # ------------------------------------------------------------------
         if critique:
             from VLAB2.orchestration.objective_injector import generate_objectives
             from VLAB2.orchestration.skeptic_parser import parse_skeptic_output
@@ -997,9 +1485,6 @@ def pi_agent(state: LabState) -> dict:
             parsed = parse_skeptic_output(critique)
             extra_objectives = generate_objectives(parsed)
 
-        # ------------------------------------------------------------------
-        # Qualitative hypothesis refinement
-        # ------------------------------------------------------------------
         refined_hypothesis = _refine_hypothesis_from_critique(state, critique)
 
         topic = (
@@ -1009,9 +1494,6 @@ def pi_agent(state: LabState) -> dict:
             or state.get("research_topic", "RNA secondary structure stability")
         )
 
-        # ------------------------------------------------------------------
-        # Conservation state
-        # ------------------------------------------------------------------
         conservation = state.get("conservation_signal", {}) or {}
         conservation_fitness = conservation.get("conservation_fitness", 0)
 
@@ -1019,15 +1501,12 @@ def pi_agent(state: LabState) -> dict:
         state["conservation_fitness"] = conservation_fitness
         state["conserved_regions"] = conservation.get("conserved_regions", [])
 
-        # ------------------------------------------------------------------
-        # Docking spread + joint MD/docking/interface physics feedback
-        # ------------------------------------------------------------------
         score_spread = _parse_score_spread_from_critique(critique)
         joint_feedback = _compute_joint_physics_feedback(state)
 
         log.info(
             "Joint physics feedback | binding=%.3f stability=%.3f fluct=%.3f "
-            "interface=%.3f clean=%s clash=%s | best_binding=%s spread=%s "
+            "interface=%.3f clean=%s clash=%s | best_hdock_relative_rank=%s spread=%s "
             "best_md_min=%s md_fluct=%s",
             joint_feedback.get("binding_signal", 0.0),
             joint_feedback.get("stability_signal", 0.0),
@@ -1052,9 +1531,6 @@ def pi_agent(state: LabState) -> dict:
             joint_feedback=joint_feedback,
         )
 
-        # ------------------------------------------------------------------
-        # Run optimiser
-        # ------------------------------------------------------------------
         population = run_system(
             topic=topic,
             target_pdb=target_pdb,
@@ -1087,9 +1563,6 @@ def pi_agent(state: LabState) -> dict:
                 summary="No viable sequences produced.",
             )
 
-        # ------------------------------------------------------------------
-        # Conservation-dependent exploration/exploitation
-        # ------------------------------------------------------------------
         if conservation_fitness > 0.7:
             top_sequences = top_sequences[:3]
         elif conservation_fitness < 0.2:
@@ -1100,16 +1573,48 @@ def pi_agent(state: LabState) -> dict:
 
         log.info("Top sequences selected by PI: %s", top_sequences)
 
-        # ------------------------------------------------------------------
-        # Mutation bias cleanup
-        # ------------------------------------------------------------------
         new_bias = _cleanup_mutation_bias(state)
         selected_motifs = state.get("_run_system_selected_motifs", [])
         min_fold_thresholds = state.get("_run_system_min_fold_thresholds", {})
 
-        # ------------------------------------------------------------------
-        # Training/optimisation capture
-        # ------------------------------------------------------------------
+        target_status = state.get("target_status")
+        target_status_reason = state.get("target_status_reason")
+
+        operational_summary = _build_pi_operational_summary(
+            target_pdb=target_pdb,
+            top_sequences=top_sequences,
+            conservation_fitness=conservation_fitness,
+            selected_motifs=selected_motifs,
+            min_fold_thresholds=min_fold_thresholds,
+            binding_units=state.get("binding_units", "hdock_relative_score"),
+            new_bias=new_bias,
+            score_spread=score_spread,
+            joint_feedback=joint_feedback,
+            literature_target_hints=literature_target_hints,
+            literature_motif_hints=literature_motif_hints,
+            state=state,
+        )
+
+        training_action_summary = _build_pi_training_action_summary(
+            state=state,
+            target_pdb=target_pdb,
+            target_status=target_status,
+            target_status_reason=target_status_reason,
+            top_sequences=top_sequences,
+            conservation_fitness=float(conservation_fitness or 0.0),
+            score_spread=score_spread,
+            joint_feedback=joint_feedback,
+            selected_motifs=selected_motifs,
+        )
+
+        pi_training_metadata = _build_pi_training_metadata(
+            state=state,
+            target_pdb=target_pdb,
+            joint_feedback=joint_feedback,
+        )
+
+        best_interface_clean_sequence = _select_best_interface_clean_sequence(state)
+
         _capture_optimisation_step_if_available(
             state=state,
             population=population,
@@ -1119,29 +1624,7 @@ def pi_agent(state: LabState) -> dict:
             score_spread=score_spread,
             combined_objectives=combined_objectives,
             joint_feedback=joint_feedback,
-        )
-
-        summary = (
-            f"NSGA-II optimisation complete.\n"
-            f"Target PDB: {target_pdb}\n"
-            f"Selected {len(top_sequences)} sequences.\n"
-            f"Conservation fitness: {float(conservation_fitness):.3f}\n"
-            f"Selected motifs: {motif_summary_from_state(state)}\n"
-            f"Min fold thresholds: {min_fold_thresholds or 'default'}\n"
-            f"Binding units: {state.get('binding_units', 'hdock_relative_score')}\n"
-            f"Adaptive mutation: {'enabled' if new_bias else 'none'}\n"
-            f"Score spread feedback: {score_spread if score_spread is not None else 'N/A'}\n"
-            f"Joint feedback: "
-            f"binding={joint_feedback.get('binding_signal', 0.0):.3f}, "
-            f"stability={joint_feedback.get('stability_signal', 0.0):.3f}, "
-            f"fluctuation={joint_feedback.get('fluctuation_signal', 0.0):.3f}, "
-            f"interface={joint_feedback.get('interface_signal', 0.0):.3f}, "
-            f"clean_interface={joint_feedback.get('clean_interface_count', 0)}, "
-            f"clash={joint_feedback.get('interface_clash_count', 0)}\n"
-            f"Literature target hints: "
-            f"{', '.join(literature_target_hints) if literature_target_hints else 'N/A'}\n"
-            f"Literature motif hints: "
-            f"{', '.join(literature_motif_hints) if literature_motif_hints else 'N/A'}"
+            training_action_summary=training_action_summary,
         )
 
         target_sequence = state.get("target_sequence")
@@ -1150,12 +1633,22 @@ def pi_agent(state: LabState) -> dict:
             target_sequence = top_sequences[0]
 
         return {
-            "pi_summary": summary,
+            "pi_summary": operational_summary,
+            "pi_action_summary": training_action_summary,
+            "pi_operational_summary": operational_summary,
+            "pi_training_metadata": pi_training_metadata,
             "optimisation_status": "adaptive_pareto_optimised",
             "designed_sequences": top_sequences,
             "target_sequence": target_sequence,
+            "best_interface_clean_sequence": best_interface_clean_sequence,
             "structural_candidates": state.get("structural_candidates", []),
             "target_pdb": target_pdb,
+            "target_pdb_id": state.get("target_pdb_id") or _target_id_from_state(state, target_pdb),
+            "target_pdb_path": state.get("target_pdb_path"),
+            "target_status": state.get("target_status"),
+            "target_status_reason": state.get("target_status_reason"),
+            "partial_success_targets": state.get("partial_success_targets", []),
+            "resolved_partial_success_targets": state.get("resolved_partial_success_targets", []),
             "failed_target_pdbs": state.get("failed_target_pdbs", []),
             "mutation_bias": new_bias,
             "hypothesis": topic,
@@ -1172,18 +1665,35 @@ def pi_agent(state: LabState) -> dict:
         log.exception("PI optimisation failed")
 
         fallback_seq = sequences[0] if sequences else ""
+        summary = f"Fallback due to: {e}"
+        joint_feedback = _compute_joint_physics_feedback(state)
 
         return {
-            "pi_summary": f"Fallback due to: {e}",
+            "pi_summary": summary,
+            "pi_action_summary": summary,
+            "pi_operational_summary": summary,
+            "pi_training_metadata": _build_pi_training_metadata(
+                state=state,
+                target_pdb=target_pdb,
+                joint_feedback=joint_feedback,
+            ),
             "optimisation_status": "fallback",
             "designed_sequences": [fallback_seq] if fallback_seq else [],
             "target_sequence": state.get("target_sequence") or fallback_seq or None,
+            "best_interface_clean_sequence": _select_best_interface_clean_sequence(state),
             "structural_candidates": state.get("structural_candidates", []),
             "target_pdb": target_pdb,
+            "target_pdb_id": state.get("target_pdb_id") or _target_id_from_state(state, target_pdb),
+            "target_pdb_path": state.get("target_pdb_path"),
+            "target_status": state.get("target_status"),
+            "target_status_reason": state.get("target_status_reason"),
+            "partial_success_targets": state.get("partial_success_targets", []),
+            "resolved_partial_success_targets": state.get("resolved_partial_success_targets", []),
             "failed_target_pdbs": state.get("failed_target_pdbs", []),
             "mutation_bias": state.get("mutation_bias", {}),
             "hypothesis": state.get("hypothesis", ""),
             "iterations": state.get("iterations", 0) + 1,
+            "joint_physics_feedback": joint_feedback,
             "literature_motif_hints": state.get("literature_motif_hints", []),
             "literature_target_hints": state.get("literature_target_hints", []),
             "literature_policy_text": state.get("literature_policy_text", ""),

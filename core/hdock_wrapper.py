@@ -6,11 +6,13 @@ HDOCKlite wrapper for protein-RNA / protein-protein docking.
 Keeps current working createpl path:
     createpl hdock.out top_models.pdb -nmax N -complex -models
 
+
 Adds:
 - stronger PDB validation
 - debug preservation
 - safer output discovery
-- legacy Vina-compatible fields
+- explicit HDOCK-relative score semantics
+
 """
 
 from __future__ import annotations
@@ -264,28 +266,29 @@ class HDockDocking:
                 return {
                     "dock_score": score,
                     "hdock_score": score,
+
                     "binding_energy": score,
                     "binding_energy_is_physical": False,
                     "binding_units": "hdock_relative_score",
+
                     "valid": True,
                     "dock_valid": True,
+
                     "method": "hdock",
                     "dock_method": "hdock",
+
                     "output_file": output_out,
                     "dock_output_file": output_out,
+
                     "complex_file": final_complex,
                     "dock_complex_file": final_complex,
+
                     "complex_status": complex_status,
 
                     "hdock_run_id": run_id,
                     "receptor_pdb_input": receptor_pdb,
                     "ligand_pdb_input": ligand_pdb,
                     "n_models": n_models,
-
-                    "vina_energy": score,
-                    "vina_valid": True,
-                    "vina_method": "hdock",
-                    "vina_error": None,
                 }
 
         except subprocess.TimeoutExpired:
@@ -552,12 +555,6 @@ class HDockDocking:
             "dock_method": "hdock",
             "stdout": self._trim(stdout),
             "stderr": self._trim(stderr),
-
-            # Legacy Vina compatibility fields.
-            "vina_energy": None,
-            "vina_valid": False,
-            "vina_method": "hdock",
-            "vina_error": error,
         }
 
         result.update(metadata)

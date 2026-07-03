@@ -290,6 +290,10 @@ def search_semantic_scholar(query: str, limit: int = 25) -> List[Dict]:
                 time.sleep(min(2**attempt, 30))
                 continue
 
+            if resp.status_code >= 500:
+                time.sleep(min(2**attempt, 30))
+                continue
+
             resp.raise_for_status()
             return resp.json().get("data", [])
 

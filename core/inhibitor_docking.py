@@ -19,8 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import subprocess
+import re
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -81,7 +80,10 @@ def dock_small_molecules(
             - ligand_name (str): Base name of the ligand file.
             - ligand_path (str): Full path to the ligand PDBQT.
             - binding_energy (float or None): Vina binding energy (kcal/mol).
+            - binding_units (str): "vina_kcal_mol".
+            - binding_energy_is_physical (bool): True for Vina kcal/mol estimate.
             - method (str): "vina" or "vina_failed".
+            - dock_method (str): Same as method, for downstream schema consistency.
             - valid (bool): Whether docking succeeded.
             - output_file (str or None): Path to docked PDBQT output.
             - error (str or None): Error message if failed.
@@ -94,7 +96,23 @@ def dock_small_molecules(
         log.error("Ligands directory not found: %s", ligands_dir)
         return []
 
-    ligand_files = sorted(ligands_dir.glob("*.pdbqt"))
+    receptor_resolved = Path(receptor_pdbqt).resolve()
+
+    ligand_files = []
+    for p in sorted(ligands_dir.glob("*.pdbqt")):
+        try:
+            if p.resolve() == receptor_resolved:
+                continue
+        except OSError:
+            pass
+
+        if p.name.endswith("_receptor.pdbqt"):
+            continue
+        if p.name.endswith("_docked.pdbqt"):
+            continue
+
+        ligand_files.append(p)
+
     if not ligand_files:
         log.warning("No PDBQT files found in %s", ligands_dir)
         return []
@@ -116,21 +134,38 @@ def dock_small_molecules(
             exhaustiveness=exhaustiveness,
         )
 
-        results.append({
-            "ligand_name": ligand_path.stem,
-            "ligand_path": str(ligand_path),
-            "binding_energy": result.get("binding_energy"),
-            "method": result.get("method", "vina"),
-            "valid": result.get("valid", False),
-            "output_file": result.get("output_file"),
-            "error": result.get("error"),
-        })
+        method = result.get("method", "vina")
+        binding_energy = result.get("binding_energy")
 
-        if result.get("valid"):
+        row = {
+            "name": ligand_path.stem,
+            "ligand_name": ligand_path.stem,
+            "_inhibitor_name": ligand_path.stem,
+            "ligand_type": "small_molecule",
+
+            "ligand_path": str(ligand_path),
+
+            "binding_energy": binding_energy,
+            "score": binding_energy,
+            "binding_units": "vina_kcal_mol",
+            "binding_energy_is_physical": True,
+
+            "method": method,
+            "dock_method": method,
+            "valid": result.get("valid", False),
+
+            "output_file": result.get("output_file"),
+            "docked_pdbqt": result.get("output_file"),
+            "error": result.get("error"),
+        }
+
+        results.append(row)
+
+        if result.get("valid") and binding_energy is not None:
             log.info(
                 "  → %s: %.3f kcal/mol",
                 ligand_path.stem,
-                result.get("binding_energy"),
+                binding_energy,
             )
         else:
             log.warning("  → %s: FAILED (%s)", ligand_path.stem, result.get("error"))
@@ -148,7 +183,12 @@ def rank_small_molecules(results: list) -> list:
     Returns:
         Sorted list (best binder first). Invalid results are placed at the end.
     """
-    valid = [r for r in results if r.get("valid") and r.get("binding_energy") is not None]
+    valid = [
+        r for r in results
+        if isinstance(r, dict)
+        and r.get("valid")
+        and r.get("binding_energy") is not None
+    ]
     invalid = [r for r in results if r not in valid]
 
     valid_sorted = sorted(valid, key=lambda r: r["binding_energy"])
@@ -158,6 +198,36 @@ def rank_small_molecules(results: list) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 # PEPTIDE DOCKING
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _is_clean_input_peptide_pdb(path: Path) -> bool:
+    """
+    Strictly identify peptide input PDB files produced by peptide preparation.
+
+    Expected format:
+        clean_peptide_<hash>_<sequence>.pdb
+
+    Excludes generated HDOCK complexes and other derived files so that
+    HDOCK output is never recursively re-docked as a peptide ligand.
+    """
+    if not path.is_file():
+        return False
+
+    name = path.name
+
+    if "_hdock_complex" in name:
+        return False
+    if "_docked" in name:
+        return False
+    if "_complex" in name:
+        return False
+
+    return bool(
+        re.fullmatch(
+            r"clean_peptide_[0-9A-Fa-f]+_[A-Za-z]+\.pdb",
+            name,
+        )
+    )
+
 
 def dock_peptides(
     receptor_pdb: str,
@@ -182,12 +252,20 @@ def dock_peptides(
 
     Returns:
         List of result dicts, one per peptide. Each dict has keys:
-            - peptide_sequence (str): The peptide sequence.
+            - sequence (str): Peptide sequence.
+            - peptide_sequence (str): Peptide sequence.
             - peptide_pdb (str): Path to the peptide PDB file.
-            - hdock_score (float or None): HDOCK score (lower = better).
+            - score (float or None): HDOCK-relative score.
+            - hdock_score (float or None): HDOCK-relative score.
+            - dock_score (float or None): HDOCK-relative score.
+            - binding_units (str): "hdock_relative_score".
+            - binding_energy_is_physical (bool): False.
             - method (str): "hdock" or "hdock_failed".
+            - dock_method (str): Same as method, for downstream schema consistency.
             - valid (bool): Whether docking succeeded.
             - complex_pdb (str or None): Path to the top complex PDB.
+            - complex_file (str or None): Alias for complex_pdb.
+            - dock_complex_file (str or None): Alias for complex_pdb.
             - error (str or None): Error message if failed.
     """
     hdock = HDockDocking(
@@ -202,9 +280,13 @@ def dock_peptides(
         log.error("Peptide PDB directory not found: %s", pdbs_dir)
         return []
 
-    peptide_files = sorted(pdbs_dir.glob("clean_peptide_*.pdb"))
+    peptide_files = [
+        p for p in sorted(pdbs_dir.glob("clean_peptide_*.pdb"))
+        if _is_clean_input_peptide_pdb(p)
+    ]
+
     if not peptide_files:
-        log.warning("No cleaned peptide PDB files found in %s", pdbs_dir)
+        log.warning("No peptide PDB files found in %s", pdbs_dir)
         return []
 
     log.info(
@@ -222,59 +304,94 @@ def dock_peptides(
             n_models=n_models,
         )
 
-        # Extract HDOCK score from the result
         hdock_score = _extract_hdock_score(result)
-        complex_pdb = result.get("complex_pdb") or result.get("output_complex")
 
-        results.append({
-            "peptide_sequence": _extract_sequence_from_filename(peptide_pdb.name),
+        complex_pdb = (
+            result.get("complex_pdb")
+            or result.get("output_complex")
+            or result.get("complex_file")
+            or result.get("dock_complex_file")
+        )
+
+        seq = _extract_sequence_from_filename(peptide_pdb.name)
+        method = result.get("method", "hdock")
+
+        row = {
+            "sequence": seq,
+            "peptide_sequence": seq,
+            "ligand_type": "peptide",
+
             "peptide_pdb": str(peptide_pdb),
+
+            "score": hdock_score,
+            "dock_score": hdock_score,
             "hdock_score": hdock_score,
-            "method": result.get("method", "hdock"),
+
+            "binding_units": "hdock_relative_score",
+            "binding_energy_is_physical": False,
+
+            "method": method,
+            "dock_method": method,
             "valid": result.get("valid", False),
+            "dock_valid": result.get("valid", False),
+
             "complex_pdb": complex_pdb,
+            "complex_file": complex_pdb,
+            "dock_complex_file": complex_pdb,
+
+            "output_file": result.get("output_file"),
+            "dock_output_file": result.get("dock_output_file") or result.get("output_file"),
             "error": result.get("error"),
-        })
+        }
+
+        results.append(row)
 
         if hdock_score is not None:
-            log.info("  → %s: HDOCK score = %.2f", peptide_pdb.name, hdock_score)
+            log.info(
+                "  → %s: HDOCK relative score = %.2f",
+                peptide_pdb.name,
+                hdock_score,
+            )
         else:
             log.warning("  → %s: FAILED (%s)", peptide_pdb.name, result.get("error"))
 
     return results
 
 
-def _extract_hdock_score(result: dict) -> Optional[float]:
+def _extract_hdock_score(result: dict) -> Optional:
     """Extract the best HDOCK score from a docking result dict."""
+    if not isinstance(result, dict):
+        return None
+
     if not result.get("valid"):
         return None
 
-    # HDOCK score is typically in the output file or result dict
-    # The wrapper returns scores in the result dict
-    score = result.get("best_score") or result.get("score") or result.get("hdock_score")
-    if score is not None:
+    # Avoid `or` chaining because valid scores could theoretically be 0.0.
+    for key in ("best_score", "score", "hdock_score", "dock_score"):
+        if key not in result:
+            continue
+
+        score = result.get(key)
+
+        if score is None:
+            continue
+
         try:
             return float(score)
         except (TypeError, ValueError):
-            pass
-
-    # Try to parse from stdout
-    stdout = result.get("stdout", "")
-    if stdout:
-        # HDOCK outputs scores in the .out file
-        # The createpl step generates complex PDBs
-        pass
+            continue
 
     return None
 
 
 def _extract_sequence_from_filename(filename: str) -> str:
     """Extract the peptide sequence from a peptide PDB filename."""
-    # Expected format: clean_peptide_<hash>_<sequence>.pdb
     name = Path(filename).stem  # e.g. clean_peptide_a1b2c3d4_RRM
     parts = name.split("_")
+    if len(parts) >= 4 and parts[0] == "clean" and parts[1] == "peptide":
+        return parts[-1]
     if len(parts) >= 3:
-        return parts[-1]  # Last part is the sequence
+        return parts[-1]
     return name
 
 
@@ -288,7 +405,12 @@ def rank_peptides(results: list) -> list:
     Returns:
         Sorted list (best score first). Failed results at the end.
     """
-    valid = [r for r in results if r.get("valid") and r.get("hdock_score") is not None]
+    valid = [
+        r for r in results
+        if isinstance(r, dict)
+        and r.get("valid")
+        and r.get("hdock_score") is not None
+    ]
     invalid = [r for r in results if r not in valid]
 
     valid_sorted = sorted(valid, key=lambda r: r["hdock_score"])
@@ -308,8 +430,10 @@ def compare_inhibitor_with_rna_pose(
     Compare an inhibitor binding pose with the RNA-protein docking poses
     to assess whether the inhibitor occupies the same space as the RNA.
 
-    Uses CA-atom RMSD between the inhibitor and each RNA pose after
-    superimposing on the receptor.
+    Current method:
+        Uses CA-atom RMSD between complexes after CA-based superposition.
+        This is a coarse geometric proxy, not a rigorous ligand/RNA pocket
+        overlap metric.
 
     Args:
         inhibitor_complex_pdb: Path to the inhibitor-protein complex PDB.
@@ -354,7 +478,6 @@ def compare_inhibitor_with_rna_pose(
         }
 
     try:
-        # Parse inhibitor complex
         parser = PDB.PDBParser(QUIET=True)
         inhibitor_structure = parser.get_structure("inhibitor", inhibitor_complex_pdb)
 
@@ -403,7 +526,7 @@ def compare_inhibitor_with_rna_pose(
         }
 
 
-def _compute_ca_rmsd(structure_a, structure_b) -> Optional[float]:
+def _compute_ca_rmsd(structure_a, structure_b) -> Optional:
     """
     Compute CA-atom RMSD between two structures after CA-based superposition.
 
@@ -412,23 +535,19 @@ def _compute_ca_rmsd(structure_a, structure_b) -> Optional[float]:
     try:
         from Bio.SVDSuperimposer import SVDSuperimposer
 
-        # Extract CA atoms from both structures
         ca_a = _get_ca_atoms(structure_a)
         ca_b = _get_ca_atoms(structure_b)
 
         if len(ca_a) < 3 or len(ca_b) < 3:
             return None
 
-        # Use the smaller set
         n = min(len(ca_a), len(ca_b))
         ca_a = ca_a[:n]
         ca_b = ca_b[:n]
 
-        # Get coordinates
         coords_a = np.array([a.get_coord() for a in ca_a])
         coords_b = np.array([a.get_coord() for a in ca_b])
 
-        # SVD superposition
         superimposer = SVDSuperimposer(coords_a, coords_b)
         superimposer.run(coords_a, coords_b)
 
@@ -456,7 +575,7 @@ def _get_ca_atoms(structure) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_inhibitor_screen(
-    receptor_pdbqt: str,
+    receptor_pdbqt: str | None,
     receptor_pdb: str,
     small_molecule_dir: str,
     peptide_pdb_dir: str,
@@ -494,13 +613,18 @@ def run_inhibitor_screen(
             - n_valid_small_molecules (int): Number with valid Vina scores.
             - n_valid_peptides (int): Number with valid HDOCK scores.
     """
-    center = docking_box.get("center", (0.0, 0.0, 0.0))
-    size = docking_box.get("size", (20.0, 20.0, 20.0))
+    center = docking_box.get("center") or (0.0, 0.0, 0.0)
+    size = docking_box.get("size") or (20.0, 20.0, 20.0)
 
     # ── Small molecules ──────────────────────────────────────────────────────
+
     if small_molecule_results is not None:
         sm_results = small_molecule_results
-    elif os.path.isdir(small_molecule_dir):
+    elif (
+        receptor_pdbqt
+        and os.path.exists(receptor_pdbqt)
+        and os.path.isdir(small_molecule_dir)
+    ):
         sm_results = dock_small_molecules(
             receptor_pdbqt=receptor_pdbqt,
             ligands_dir=small_molecule_dir,
@@ -508,11 +632,25 @@ def run_inhibitor_screen(
             size=size,
         )
     else:
+        if not receptor_pdbqt:
+            log.warning("Skipping small-molecule docking: receptor_pdbqt is missing")
+        elif not os.path.exists(receptor_pdbqt):
+            log.warning(
+                "Skipping small-molecule docking: receptor_pdbqt not found: %s",
+                receptor_pdbqt,
+            )
+        elif not os.path.isdir(small_molecule_dir):
+            log.warning(
+                "Skipping small-molecule docking: small_molecule_dir not found: %s",
+                small_molecule_dir,
+            )
+
         sm_results = []
 
     sm_ranked = rank_small_molecules(sm_results)
 
     # ── Peptides ─────────────────────────────────────────────────────────────
+
     if peptide_results is not None:
         pep_results = peptide_results
     elif os.path.isdir(peptide_pdb_dir):
@@ -521,17 +659,20 @@ def run_inhibitor_screen(
             peptide_pdbs_dir=peptide_pdb_dir,
         )
     else:
+        log.warning(
+            "Skipping peptide docking: peptide_pdb_dir not found: %s",
+            peptide_pdb_dir,
+        )
         pep_results = []
 
     pep_ranked = rank_peptides(pep_results)
 
     # ── Pose comparison ───────────────────────────────────────────────────────
+
     comparison = None
     if rna_poses:
         best_pep = pep_ranked[0] if pep_ranked and pep_ranked[0].get("valid") else None
-        best_sm = sm_ranked[0] if sm_ranked and sm_ranked[0].get("valid") else None
 
-        # Compare best peptide with RNA poses
         if best_pep and best_pep.get("complex_pdb"):
             comparison = compare_inhibitor_with_rna_pose(
                 best_pep["complex_pdb"],
@@ -539,27 +680,39 @@ def run_inhibitor_screen(
             )
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    n_valid_sm = sum(1 for r in sm_ranked if r.get("valid"))
-    n_valid_pep = sum(1 for r in pep_ranked if r.get("valid"))
+
+    n_valid_sm = sum(1 for r in sm_ranked if isinstance(r, dict) and r.get("valid"))
+    n_valid_pep = sum(1 for r in pep_ranked if isinstance(r, dict) and r.get("valid"))
 
     best_sm_data = sm_ranked[0] if sm_ranked else None
     best_pep_data = pep_ranked[0] if pep_ranked else None
 
     summary_parts = []
-    if best_sm_data and best_sm_data.get("valid"):
+
+    if (
+        best_sm_data
+        and best_sm_data.get("valid")
+        and best_sm_data.get("binding_energy") is not None
+    ):
         summary_parts.append(
             f"Best small molecule: {best_sm_data['ligand_name']} "
-            f"({best_sm_data['binding_energy']:.2f} kcal/mol)"
+            f"({best_sm_data['binding_energy']:.2f} kcal/mol, Vina estimate)"
         )
-    if best_pep_data and best_pep_data.get("valid"):
+
+    if (
+        best_pep_data
+        and best_pep_data.get("valid")
+        and best_pep_data.get("hdock_score") is not None
+    ):
         summary_parts.append(
             f"Best peptide: {best_pep_data['peptide_sequence']} "
-            f"(HDOCK score: {best_pep_data['hdock_score']})"
+            f"(HDOCK relative score: {best_pep_data['hdock_score']})"
         )
+
     if comparison and comparison.get("comparable"):
         summary_parts.append(
             f"RNA overlap score: {comparison['overlap_score']:.2f} "
-            f"(RMSD: {comparison['min_rmsd']:.1f} Å)"
+            f"(RMSD proxy: {comparison['min_rmsd']:.1f} Å)"
         )
 
     summary = "; ".join(summary_parts) if summary_parts else "No valid inhibitor results"

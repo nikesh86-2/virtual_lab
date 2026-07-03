@@ -121,6 +121,84 @@ def _binding_result_key(item: dict) -> tuple:
 
     return (target, seq, dock_file, str(score))
 
+def _inhibitor_sm_key(item: dict) -> tuple:
+    if not isinstance(item, dict):
+        return ("invalid", repr(item))
+
+    target = str(item.get("target_pdb", "") or item.get("target_tag", "") or "").upper()
+    name = str(
+        item.get("ligand_name")
+        or item.get("display_name")
+        or item.get("name")
+        or item.get("compound_name")
+        or ""
+    ).upper()
+    smiles = str(item.get("smiles", "") or "")
+    output_file = str(item.get("output_file", "") or item.get("docked_pdbqt", "") or "")
+    energy = str(item.get("binding_energy", "") or item.get("score", "") or "")
+
+    return (target, name, smiles, output_file, energy)
+
+
+def dedupe_inhibitor_small_molecules_reducer(
+    existing: list[dict] | None,
+    new: list[dict] | None,
+) -> list:
+
+    combined = list(existing or []) + list(new or [])
+
+    seen = set()
+    out = []
+
+    for item in combined:
+        key = _inhibitor_sm_key(item)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(item)
+
+    return out[-100:]
+
+
+def _inhibitor_peptide_key(item: dict) -> tuple:
+    if not isinstance(item, dict):
+        return ("invalid", repr(item))
+
+    target = str(item.get("target_pdb", "") or item.get("target_tag", "") or "").upper()
+    seq = str(item.get("sequence", "") or item.get("peptide_sequence", "") or "").upper()
+    complex_file = str(
+        item.get("complex_file")
+        or item.get("dock_complex_file")
+        or item.get("complex_pdb")
+        or ""
+    )
+    score = str(item.get("score", "") or item.get("hdock_score", "") or "")
+
+    return (target, seq, complex_file, score)
+
+
+def dedupe_inhibitor_peptides_reducer(
+    existing: list[dict] | None,
+    new: list[dict] | None,
+) -> list:
+
+    combined = list(existing or []) + list(new or [])
+
+    seen = set()
+    out = []
+
+    for item in combined:
+        key = _inhibitor_peptide_key(item)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(item)
+
+    return out[-100:]
 
 def dedupe_binding_results_reducer(
     existing: list[dict] | None,
@@ -275,6 +353,10 @@ class LabState(TypedDict, total=False):
     # ----------------------------------------------------------------
     hypothesis: str
     pi_summary: str
+    pi_action_summary: str
+    pi_operational_summary: str
+    pi_training_metadata: dict
+    best_interface_clean_sequence: Optional[str]
     optimisation_status: str
     mutation_bias: dict
     joint_physics_feedback: dict
@@ -310,6 +392,8 @@ class LabState(TypedDict, total=False):
     # Target protein selection
     # ----------------------------------------------------------------
     target_pdb: Optional[str]
+    target_pdb_id: Optional[str]
+    target_pdb_path: Optional[str]
     target_pdb_candidates: List[str]
     target_pdb_rankings: List[dict]
     failed_target_pdbs: List[Any]
@@ -339,13 +423,15 @@ class LabState(TypedDict, total=False):
     docking_summary_json: str
     docking_summary_csv: str
     docking_summary_md: str
+    interface_contacts: Optional[dict]
+    interface_contact_files: List[str]
 
     # ----------------------------------------------------------------
     # Inhibitor screening
     # ----------------------------------------------------------------
     inhibitor_enabled: bool
-    inhibitor_small_molecules: Annotated[list[dict], append_unique_dicts_reducer]
-    inhibitor_peptides: Annotated[list[dict], append_unique_dicts_reducer]
+    inhibitor_small_molecules: Annotated[list[dict], dedupe_inhibitor_small_molecules_reducer]
+    inhibitor_peptides: Annotated[list[dict], dedupe_inhibitor_peptides_reducer]
     inhibitor_binding_site_overlap: float
     inhibitor_docking_box: dict
     inhibitor_analysis: str

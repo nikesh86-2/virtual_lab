@@ -48,7 +48,6 @@ CACHE_DIR = os.getenv(
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-
 def _normalise_pdb_id(pdb_id: str) -> Optional[str]:
     if not pdb_id:
         return None
@@ -142,7 +141,6 @@ def _download_url(url: str, output_path: str, label: str) -> bool:
         pass
 
     return False
-
 
 def _download_pdb_rcsb(pdb_id: str, pdb_path: str) -> bool:
     """
@@ -372,7 +370,7 @@ def _convert_cif_to_pdb_fallback(cif_path: str, pdb_path: str, pdb_id: str) -> b
             e,
         )
         return False
-    
+
 def _convert_cif_to_pdb(cif_path: str, pdb_path: str, pdb_id: str) -> bool:
     """
     Convert mmCIF to PDB.

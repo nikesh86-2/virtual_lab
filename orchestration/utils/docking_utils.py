@@ -103,6 +103,7 @@ def _summary_jsonable(obj):
 
     return repr(obj)
 
+
 def export_docking_outputs(state: dict) -> dict:
     """
     Export docking summary JSON/CSV/Markdown files.
@@ -121,7 +122,6 @@ def export_docking_outputs(state: dict) -> dict:
     log = logging.getLogger("virtual_lab")
 
     binding_results = state.get("binding_results", []) or []
-
     # Create the docking_summaries directory if it doesn't exist
     output_dir = Path("/scratch/fbsnpat/bot/VLAB2/docking_summaries")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -167,6 +167,7 @@ def export_docking_outputs(state: dict) -> dict:
             "md_mean_energy": linked_md.get("mean_energy"),
             "md_energy_fluctuation": linked_md.get("energy_fluctuation"),
             "rna_pdb": linked_md.get("rna_pdb"),
+            "interface_steric_clash": r.get("interface_steric_clash"),
 
             # Visual snapshot output.
             "docking_snapshot_png": r.get("docking_snapshot_png"),
@@ -236,6 +237,7 @@ def export_docking_outputs(state: dict) -> dict:
         "md_mean_energy",
         "md_energy_fluctuation",
         "rna_pdb",
+        "interface_steric_clash",
 
         # Visuals.
         "docking_snapshot_png",
@@ -273,8 +275,8 @@ def export_docking_outputs(state: dict) -> dict:
         f"Target PDB: `{state.get('target_pdb')}`",
         f"Binding units: `{state.get('binding_units', 'hdock_relative_score')}`",
         "",
-        "| Rank | Sequence | Target | Dock score | Rank score | Valid | Mode | Method | Interface contacts | Basic contacts | Min dist Å | Interface score | Interface passed | Snapshot | Contacts CSV |",
-        "|---:|---|---|---:|---:|---|---|---|---:|---:|---:|---:|---|---|---|",
+        "| Rank | Sequence | Target | Dock score | Rank score | Valid | Mode | Method | Interface contacts | Basic contacts | Min dist Å | Interface score | Interface passed | Snapshot | Contacts CSV | Clash |",
+        "|---:|---|---|---:|---:|---|---|---|---:|---:|---:|---:|---|---|---|---|",
     ]
 
     for row in rows:

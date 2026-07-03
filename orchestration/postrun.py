@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -131,14 +134,10 @@ def _has_clean_interface(r: dict) -> bool:
     return bool(r.get("interface_passed")) and not bool(r.get("interface_steric_clash"))
 
 
-def _normalise_failed_pdb_ids(records: list[Any]) -> list[str]:
+def _normalise_failed_pdb_ids(records: list[Any]) -> list:
     """
     Extract PDB IDs from failed_target_pdbs supporting legacy list[str]
     and new list[dict].
-
-    Supports both:
-      {"pdb_id": "8K75"}
-      {"target_pdb": "8K75"}
     """
     out: list[str] = []
 
@@ -158,7 +157,7 @@ def _normalise_failed_pdb_ids(records: list[Any]) -> list[str]:
     return sorted(set(out))
 
 
-def _normalise_partial_success_target_ids(records: list[Any]) -> list[str]:
+def _normalise_partial_success_target_ids(records: list[Any]) -> list:
     """
     Extract PDB IDs from partial_success_targets supporting legacy list[str]
     and structured list[dict].
@@ -228,6 +227,191 @@ def _pose_training_label(r: dict) -> str:
     return "weak_interface"
 
 
+def _sanitize_docking_row_for_training(r: dict) -> dict:
+    """
+    Remove legacy Vina compatibility fields from HDOCK rows before supervised export.
+
+    This prevents the model from learning that HDOCK-relative RNA docking scores
+    are Vina kcal/mol scores.
+    """
+    if not isinstance(r, dict):
+        return {}
+
+    out = dict(r)
+
+    method = str(
+        out.get("dock_method")
+        or out.get("method")
+        or out.get("vina_method")
+        or ""
+    ).lower()
+
+    binding_units = str(out.get("binding_units") or "").lower()
+
+    if method == "hdock" or binding_units == "hdock_relative_score":
+        out.pop("vina_energy", None)
+        out.pop("vina_valid", None)
+        out.pop("vina_method", None)
+        out.pop("vina_error", None)
+
+    out["binding_units"] = out.get("binding_units") or "hdock_relative_score"
+    out["binding_energy_is_physical"] = bool(
+        out.get("binding_energy_is_physical", False)
+    )
+
+    return out
+
+
+def _select_best_interface_clean_sequence_from_state(state: dict) -> str | None:
+    """
+    Select best clean-interface sequence from binding results, if available.
+    """
+    rows = [
+        r for r in state.get("binding_results", []) or []
+        if isinstance(r, dict)
+        and r.get("dock_valid")
+        and _has_clean_interface(r)
+        and r.get("sequence")
+    ]
+
+    if not rows:
+        return None
+
+    def _key(r: dict) -> tuple[float, float]:
+        try:
+            rank_score = float(r.get("binding_rank_score", r.get("dg", 1e9)))
+        except Exception:
+            rank_score = 1e9
+
+        try:
+            hdock_score = float(r.get("dock_score", r.get("hdock_score", 1e9)))
+        except Exception:
+            hdock_score = 1e9
+
+        return rank_score, hdock_score
+
+    rows.sort(key=_key)
+    return rows[0].get("sequence")
+
+
+def _normalise_pi_training_metadata_for_export(
+    state: dict,
+    docking_rows: list[dict] | None = None,
+) -> dict:
+    """
+    Normalise PI training metadata against final-state target outcome.
+
+    Prevents contradictory export such as:
+      manifest.target_status = partial_success_target
+      pi_training_metadata.target_status = failed_target
+
+    Final state is authoritative for target_status/target_status_reason.
+    Docking rows are authoritative for clean/clash counts.
+    """
+    if not isinstance(state, dict):
+        return {}
+
+    meta = dict(state.get("pi_training_metadata") or {})
+
+    target_status = state.get("target_status")
+    target_status_reason = state.get("target_status_reason")
+
+    target_pdb = (
+        state.get("target_pdb")
+        or state.get("target_pdb_id")
+    )
+
+    binding_units = state.get("binding_units") or "hdock_relative_score"
+
+    if docking_rows is None:
+        docking_rows = _extract_docking_rows(state)
+
+    clean_count = sum(
+        1 for r in docking_rows or []
+        if isinstance(r, dict)
+        and r.get("dock_valid")
+        and r.get("interface_passed")
+        and not r.get("interface_steric_clash")
+    )
+
+    clash_count = sum(
+        1 for r in docking_rows or []
+        if isinstance(r, dict)
+        and r.get("dock_valid")
+        and r.get("interface_steric_clash")
+    )
+
+    dock_valid_count = sum(
+        1 for r in docking_rows or []
+        if isinstance(r, dict)
+        and r.get("dock_valid")
+    )
+
+    if target_pdb is not None:
+        meta["target_pdb"] = target_pdb
+
+    if target_status:
+        meta["target_status"] = target_status
+
+    if target_status_reason:
+        meta["target_status_reason"] = target_status_reason
+
+    meta["binding_units"] = binding_units
+    meta["binding_energy_is_physical"] = False
+
+    meta["dock_valid_count"] = dock_valid_count
+    meta["clean_interface_count"] = clean_count
+    meta["interface_clean_count"] = clean_count
+    meta["interface_clash_count"] = clash_count
+    meta["steric_clash_count"] = clash_count
+
+    meta["best_interface_clean_sequence"] = (
+        state.get("best_interface_clean_sequence")
+        or _select_best_interface_clean_sequence_from_state(state)
+    )
+
+    if not meta.get("training_quality"):
+        if dock_valid_count and clean_count:
+            meta["training_quality"] = "high"
+        elif dock_valid_count:
+            meta["training_quality"] = "medium"
+        else:
+            meta["training_quality"] = "low"
+
+    if target_status == "partial_success_target":
+        meta["target_policy"] = (
+            "reuse_as_priority_candidate_but_not_final_validated_target"
+        )
+
+    return meta
+
+
+def _sanitize_critique_for_training(critique: Any) -> str:
+    """
+    Remove explicit internal threshold notes from Skeptic critique before training export.
+    Keeps scientific critique while avoiding threshold memorisation.
+    """
+    text = "" if critique is None else str(critique)
+
+    # Remove bracketed convergence notes that expose internal thresholds.
+    text = re.sub(
+        r"\n?\[CONVERGENCE NOTE:.*?\]\s*",
+        "\n",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Remove explicit parenthetical threshold fragments if any remain.
+    text = re.sub(
+        r"\s*\(<\s*[-+]?\d+(?:\.\d+)?\s*threshold\)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return text.strip()
+
+
 def _preference_payload(r: dict) -> dict:
     if not isinstance(r, dict):
         return {}
@@ -241,9 +425,7 @@ def _preference_payload(r: dict) -> dict:
         "binding_energy_is_physical": r.get("binding_energy_is_physical", False),
         "interface_quality_score": r.get("interface_quality_score"),
         "interface_residue_contacts": r.get("interface_residue_contacts"),
-        "interface_basic_residue_contacts": r.get(
-            "interface_basic_residue_contacts"
-        ),
+        "interface_basic_residue_contacts": r.get("interface_basic_residue_contacts"),
         "interface_min_distance_A": r.get("interface_min_distance_A"),
         "interface_steric_clash": r.get("interface_steric_clash"),
         "interface_passed": r.get("interface_passed"),
@@ -261,7 +443,89 @@ def _preference_payload(r: dict) -> dict:
     }
 
 
-def _dedupe_preferences(preferences: list[dict]) -> list[dict]:
+def _inhibitor_name(r: dict, default: str = "unknown_ligand") -> str:
+    """
+    Robustly recover a small-molecule name from inhibitor result records.
+    """
+    if not isinstance(r, dict):
+        return default
+
+    name = (
+        r.get("ligand_name")
+        or r.get("display_name")
+        or r.get("name")
+        or r.get("compound_name")
+        or r.get("title")
+        or r.get("_inhibitor_name")
+    )
+
+    if name:
+        return str(name)
+
+    for key in (
+        "ligand_file",
+        "ligand_path",
+        "pdbqt_path",
+        "output_file",
+        "docked_pdbqt",
+    ):
+        value = r.get(key)
+
+        if not value:
+            continue
+
+        try:
+            stem = Path(str(value)).stem
+            stem = stem.replace("_docked", "")
+            return stem or default
+        except Exception:
+            continue
+
+    return default
+
+
+def _dedupe_inhibitor_records(
+    records: list[dict],
+    ligand_type: str = "small_molecule",
+) -> list:
+    """
+    Dedupe inhibitor records before training export and manifest counts.
+    """
+    seen: set[tuple] = set()
+    out: list[dict] = []
+
+    for r in records or []:
+        if not isinstance(r, dict):
+            continue
+
+        if ligand_type == "small_molecule":
+            key = (
+                r.get("target_pdb") or r.get("target_tag"),
+                r.get("smiles"),
+                _inhibitor_name(r),
+                r.get("binding_energy"),
+                r.get("output_file") or r.get("docked_pdbqt"),
+            )
+        else:
+            key = (
+                r.get("target_pdb") or r.get("target_tag"),
+                r.get("sequence") or r.get("peptide_sequence"),
+                r.get("score") or r.get("hdock_score"),
+                r.get("complex_file")
+                or r.get("complex_pdb")
+                or r.get("dock_complex_file"),
+            )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(r)
+
+    return out
+
+
+def _dedupe_preferences(preferences: list[dict]) -> list:
     """
     Dedupe pairwise preference examples.
     """
@@ -278,9 +542,15 @@ def _dedupe_preferences(preferences: list[dict]) -> list[dict]:
         key = (
             pref.get("type"),
             chosen.get("target_pdb"),
-            chosen.get("sequence"),
+            chosen.get("sequence") or chosen.get("name"),
+            chosen.get("binding_energy")
+            or chosen.get("score")
+            or chosen.get("dock_score"),
             rejected.get("target_pdb"),
-            rejected.get("sequence"),
+            rejected.get("sequence") or rejected.get("name"),
+            rejected.get("binding_energy")
+            or rejected.get("score")
+            or rejected.get("dock_score"),
         )
 
         if key in seen:
@@ -292,22 +562,13 @@ def _dedupe_preferences(preferences: list[dict]) -> list[dict]:
     return out
 
 
-def _extract_explicit_docking_preferences(state: dict) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Preference extractors
+# ---------------------------------------------------------------------------
+
+def _extract_explicit_docking_preferences(state: dict) -> list:
     """
     Consume explicit docking preference examples generated by protein_agent.
-
-    Supports protein-agent records like:
-      state["docking_preferences"] = [
-        {
-          "schema_version": "docking_preference.v1",
-          "preference_type": "...",
-          "preferred": {...},
-          "rejected": {...}
-        }
-      ]
-
-    Converts them into post-run preference format:
-      {"type", "prompt", "chosen", "rejected", "metadata"}
     """
     if not isinstance(state, dict):
         return []
@@ -357,15 +618,11 @@ def _extract_explicit_docking_preferences(state: dict) -> list[dict]:
     return out
 
 
-def _extract_interface_clean_over_clash_preferences(state: dict) -> list[dict]:
+def _extract_interface_clean_over_clash_preferences(state: dict) -> list:
     """
     Build explicit pairwise preferences:
-
       clean interface > steric clash
       reasonable HDOCK + clean interface > stronger HDOCK + clash
-
-    This is a fallback/post-run generator in case protein_agent did not emit
-    explicit docking_preferences.
     """
     if not isinstance(state, dict):
         return []
@@ -384,7 +641,6 @@ def _extract_interface_clean_over_clash_preferences(state: dict) -> list[dict]:
 
         if _has_clean_interface(r):
             clean.append(r)
-
         elif r.get("interface_steric_clash"):
             clash.append(r)
 
@@ -407,9 +663,7 @@ def _extract_interface_clean_over_clash_preferences(state: dict) -> list[dict]:
                 and bad_score_f is not None
                 and bad_score_f < good_score_f
             ):
-                pref_type = (
-                    "reasonable_hdock_clean_interface_over_stronger_hdock_clash"
-                )
+                pref_type = "reasonable_hdock_clean_interface_over_stronger_hdock_clash"
                 rationale = (
                     "The rejected pose has a stronger HDOCK-relative score, but "
                     "it has steric clash evidence. The preferred pose is retained "
@@ -447,19 +701,9 @@ def _extract_interface_clean_over_clash_preferences(state: dict) -> list[dict]:
     return preferences
 
 
-def _extract_partial_success_target_examples(state: dict) -> list[dict]:
+def _extract_partial_success_target_examples(state: dict) -> list:
     """
     Train target-selection behaviour for lower-confidence partial targets.
-
-    Example:
-      8K75 produced HDOCK-valid poses and at least one clean interface,
-      but failed full target acceptance because not enough poses passed
-      interface validation.
-
-    The model should learn:
-      - reuse as priority candidate
-      - do not treat as final accepted target
-      - optimise against steric clashes
     """
     if not isinstance(state, dict):
         return []
@@ -557,7 +801,11 @@ def _extract_partial_success_target_examples(state: dict) -> list[dict]:
                     "target_pdb": pdb,
                     "status": "partial_success_target",
                     "reason": reason,
-                    "accepted_target_present": state.get("target_pdb") is not None,
+                    "accepted_target_present": (
+                        state.get("target_pdb") is not None
+                        and state.get("target_status") == "accepted_target"
+                    ),
+                    "partial_success_target_present": True,
                     "binding_units": "hdock_relative_score",
                     "binding_energy_is_physical": False,
                 },
@@ -943,11 +1191,6 @@ def _extract_structural_selection_examples(state: dict) -> list:
 def _extract_docking_examples(state: dict) -> tuple[list[dict], list[dict]]:
     """
     Build supervised docking interpretation examples and pairwise preferences.
-
-    Preference examples are labelled carefully:
-      - docking_interface_preference when at least one pose passes interface validation
-      - partial_interface_evidence_preference when no final target exists but at least one pose is clean
-      - least_bad_docking_interface_preference when all poses have interface problems
     """
     examples: list[dict] = []
     preferences: list[dict] = []
@@ -970,11 +1213,21 @@ def _extract_docking_examples(state: dict) -> tuple[list[dict], list[dict]]:
         reverse=True,
     )
 
+    sanitized_valid = [
+        _sanitize_docking_row_for_training(r)
+        for r in valid
+    ]
+
     accepted_target = state.get("target_pdb")
+    target_status = state.get("target_status")
+    accepted_target_is_final = (
+        accepted_target is not None
+        and target_status == "accepted_target"
+    )
 
     any_interface_passed = any(
         _has_clean_interface(r)
-        and accepted_target
+        and accepted_target_is_final
         and r.get("target_pdb") == accepted_target
         for r in valid
     )
@@ -993,7 +1246,7 @@ def _extract_docking_examples(state: dict) -> tuple[list[dict], list[dict]]:
                 "them as physical kcal/mol binding energies. Consider interface "
                 "contact topology and steric clash flags when interpreting pose quality."
             ),
-            "input": json.dumps(valid, indent=2, ensure_ascii=False),
+            "input": json.dumps(sanitized_valid, indent=2, ensure_ascii=False),
             "output": json.dumps(
                 [
                     {
@@ -1024,7 +1277,6 @@ def _extract_docking_examples(state: dict) -> tuple[list[dict], list[dict]]:
                         ),
                         "interface_cluster_count": r.get("interface_cluster_count"),
                         "interface_clash_severity": _interface_clash_severity(r),
-                        "pose_training_label": _pose_training_label(r),
                         "training_label": r.get("training_label"),
                         "training_preference_score": _training_preference_score(r),
                         "interpretation": (
@@ -1170,9 +1422,13 @@ def _extract_target_filter_examples(state: dict) -> list:
             "metadata": {
                 "source": "target_selection",
                 "accepted_target": accepted,
+                "accepted_target_present": (
+                    accepted is not None
+                    and state.get("target_status") == "accepted_target"
+                ),
                 "partial_success_targets": partial_ids,
-                "failed_target_count": len(failed),
                 "partial_success_target_count": len(partial_ids),
+                "failed_target_count": len(failed),
             },
         }
     )
@@ -1186,11 +1442,20 @@ def _extract_critique_revision_examples(state: dict) -> list:
     """
     critique = state.get("critique")
     hypothesis = state.get("hypothesis")
-    pi_summary = state.get("pi_summary")
+
+    pi_action_summary = (
+        state.get("pi_action_summary")
+        or state.get("pi_training_summary")
+        or state.get("pi_summary")
+    )
+
     joint_feedback = state.get("joint_physics_feedback", {})
 
     if not critique:
         return []
+
+    normalised_pi_training_metadata = _normalise_pi_training_metadata_for_export(state)
+    critique_for_training = _sanitize_critique_for_training(critique)
 
     return [
         {
@@ -1203,100 +1468,40 @@ def _extract_critique_revision_examples(state: dict) -> list:
             "input": json.dumps(
                 {
                     "hypothesis": hypothesis,
-                    "critique": critique,
+                    "critique": critique_for_training,
                     "joint_physics_feedback": joint_feedback,
                     "conservation_signal": state.get("conservation_signal", {}),
                     "binding_units": state.get("binding_units"),
                     "target_status": state.get("target_status"),
                     "target_status_reason": state.get("target_status_reason"),
                     "partial_success_targets": state.get("partial_success_targets", []),
+                    "pi_training_metadata": normalised_pi_training_metadata,
+                    "best_interface_clean_sequence": state.get(
+                        "best_interface_clean_sequence"
+                    ),
                 },
                 indent=2,
                 ensure_ascii=False,
             ),
-            "output": pi_summary or critique,
+            "output": pi_action_summary or critique_for_training,
             "metadata": {
                 "source": "critique",
-                "recommendation_present": "RECOMMENDATION:" in critique,
+                "recommendation_present": "RECOMMENDATION:" in str(critique),
+                "training_quality": normalised_pi_training_metadata.get(
+                    "training_quality"
+                ),
+                "target_status": normalised_pi_training_metadata.get("target_status"),
+                "target_status_reason": normalised_pi_training_metadata.get(
+                    "target_status_reason"
+                ),
             },
         }
     ]
 
 
-def _extract_final_summary_example(state: dict) -> list:
-    """
-    Train compact final reporting with correct handling of:
-      - accepted vs attempted targets
-      - partial-success targets
-      - interface validation outcomes
-      - clean wording when no final target is accepted
-    """
-    binding_results = state.get("binding_results", []) or []
-
-    if not binding_results:
-        return []
-
-    accepted_target = state.get("target_pdb")
-    target_sequence = state.get("target_sequence")
-    target_status = state.get("target_status")
-    target_status_reason = state.get("target_status_reason")
-    partial_targets = state.get("partial_success_targets", []) or []
-    partial_target_ids = _normalise_partial_success_target_ids(partial_targets)
-
-    dock_valid_count = sum(
-        1 for r in binding_results
-        if isinstance(r, dict) and r.get("dock_valid")
-    )
-
-    interface_pass_count = sum(
-        1 for r in binding_results
-        if isinstance(r, dict)
-        and r.get("dock_valid")
-        and _has_clean_interface(r)
-    )
-
-    clash_count = sum(
-        1 for r in binding_results
-        if isinstance(r, dict)
-        and r.get("dock_valid")
-        and r.get("interface_steric_clash")
-    )
-
-    # ------------------------------------------------------------
-    # Interface outcome sentence
-    # ------------------------------------------------------------
-    if dock_valid_count and interface_pass_count == 0:
-        interface_sentence = (
-            " However, none of the docking-valid poses passed interface validation; "
-            f"{clash_count} pose(s) showed steric clash evidence. These results should "
-            "therefore be treated as docking hits requiring redesign or pose refinement "
-            "rather than accepted physical binders."
-        )
-
-    elif accepted_target is None and interface_pass_count > 0:
-        if target_status == "partial_success_target" or partial_target_ids:
-            target_list_text = (
-                ", ".join(partial_target_ids)
-                if partial_target_ids
-                else "unknown"
-            )
-            interface_sentence = (
-                f" {interface_pass_count} docking-valid pose(s) passed interface "
-                "validation, but target-level acceptance criteria were not met. "
-                f"Target(s) {target_list_text} should be treated as lower-confidence "
-                "partial-success targets for reuse and redesign, not confirmed "
-                "binding systems."
-            )
-
-
 def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
     """
     Extract inhibitor screening training examples and preferences.
-
-    Generates:
-      - Small molecule ranking examples (by Vina binding energy)
-      - Peptide ranking examples (by HDOCK score)
-      - Preference examples (better binder vs worse binder)
     """
     examples: list[dict] = []
     preferences: list[dict] = []
@@ -1304,206 +1509,292 @@ def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
     if not isinstance(state, dict):
         return examples, preferences
 
-    small_mols = state.get("inhibitor_small_molecules", []) or []
-    peptides = state.get("inhibitor_peptides", []) or []
+    small_mols = _dedupe_inhibitor_records(
+        state.get("inhibitor_small_molecules", []) or [],
+        ligand_type="small_molecule",
+    )
+    peptides = _dedupe_inhibitor_records(
+        state.get("inhibitor_peptides", []) or [],
+        ligand_type="peptide",
+    )
     inhibitor_enabled = state.get("inhibitor_enabled", False)
 
     if not inhibitor_enabled or (not small_mols and not peptides):
         return examples, preferences
 
-    # ------------------------------------------------------------
-    # Small molecule examples
-    # ------------------------------------------------------------
     valid_sm = [
         r for r in small_mols
-        if isinstance(r, dict) and r.get("valid") and r.get("binding_energy") is not None
+        if isinstance(r, dict)
+        and r.get("valid")
+        and r.get("binding_energy") is not None
     ]
 
     if valid_sm:
         valid_sm = sorted(valid_sm, key=lambda x: x.get("binding_energy", 999))
 
-        examples.append({
-            "type": "small_molecule_ranking",
-            "instruction": (
-                "Rank small-molecule inhibitors by AutoDock Vina binding energy. "
-                "Lower binding energy (more negative) indicates stronger predicted binding. "
-                "Vina binding energies are approximate kcal/mol estimates, not exact "
-                "experimental values."
-            ),
-            "input": json.dumps({
-                "target_pdb": state.get("target_pdb"),
-                "n_screened": len(small_mols),
-                "n_valid": len(valid_sm),
-                "compounds": [
+        examples.append(
+            {
+                "type": "small_molecule_ranking",
+                "instruction": (
+                    "Rank small-molecule inhibitors by AutoDock Vina binding energy. "
+                    "Lower binding energy (more negative) indicates stronger predicted binding. "
+                    "Vina binding energies are approximate kcal/mol estimates, not exact "
+                    "experimental values."
+                ),
+                "input": json.dumps(
                     {
-                        "name": r.get("name"),
-                        "binding_energy": r.get("binding_energy"),
-                        "valid": r.get("valid"),
-                    }
-                    for r in small_mols
-                ],
-            }, indent=2, ensure_ascii=False),
-            "output": json.dumps([
-                {
-                    "rank": i + 1,
-                    "name": r.get("name"),
-                    "binding_energy": r.get("binding_energy"),
-                    "interpretation": "strong_binder" if r.get("binding_energy", 0) < -7 else "moderate_binder",
-                }
-                for i, r in enumerate(valid_sm)
-            ], indent=2, ensure_ascii=False),
-            "metadata": {
-                "source": "inhibitor_small_molecules",
-                "target_pdb": state.get("target_pdb"),
-                "binding_units": "vina_kcal_mol",
-                "n_screened": len(small_mols),
-                "n_valid": len(valid_sm),
-            },
-        })
+                        "target_pdb": state.get("target_pdb"),
+                        "n_screened": len(small_mols),
+                        "n_valid": len(valid_sm),
+                        "compounds": [
+                            {
+                                "name": _inhibitor_name(r),
+                                "target_pdb": r.get("target_pdb") or state.get("target_pdb"),
+                                "binding_energy": r.get("binding_energy"),
+                                "binding_units": r.get("binding_units") or "vina_kcal_mol",
+                                "binding_energy_is_physical": bool(
+                                    r.get("binding_energy_is_physical", True)
+                                ),
+                                "valid": r.get("valid"),
+                            }
+                            for r in small_mols
+                        ],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                "output": json.dumps(
+                    [
+                        {
+                            "rank": i + 1,
+                            "name": _inhibitor_name(r),
+                            "target_pdb": r.get("target_pdb") or state.get("target_pdb"),
+                            "binding_energy": r.get("binding_energy"),
+                            "binding_units": r.get("binding_units") or "vina_kcal_mol",
+                            "binding_energy_is_physical": bool(
+                                r.get("binding_energy_is_physical", True)
+                            ),
+                            "interpretation": (
+                                "strong_binder"
+                                if r.get("binding_energy", 0) < -7
+                                else "moderate_binder"
+                            ),
+                        }
+                        for i, r in enumerate(valid_sm)
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                "metadata": {
+                    "source": "inhibitor_small_molecules",
+                    "target_pdb": state.get("target_pdb"),
+                    "binding_units": "vina_kcal_mol",
+                    "binding_energy_is_physical": True,
+                    "n_screened": len(small_mols),
+                    "n_valid": len(valid_sm),
+                },
+            }
+        )
 
-        # Small molecule preferences
         if len(valid_sm) >= 2:
             best = valid_sm[0]
-            for other in valid_sm[1:]:
-                preferences.append({
-                    "type": "small_molecule_binding_preference",
-                    "prompt": (
-                        "Choose the better small-molecule inhibitor. Lower AutoDock Vina "
-                        "binding energy indicates stronger predicted binding affinity."
-                    ),
-                    "chosen": {
-                        "name": best.get("name"),
-                        "binding_energy": best.get("binding_energy"),
-                        "binding_units": "vina_kcal_mol",
-                    },
-                    "rejected": {
-                        "name": other.get("name"),
-                        "binding_energy": other.get("binding_energy"),
-                        "binding_units": "vina_kcal_mol",
-                    },
-                    "metadata": {
-                        "source": "inhibitor_small_molecules",
-                        "target_pdb": state.get("target_pdb"),
-                        "criterion": "vina_binding_energy",
-                    },
-                })
 
-    # ------------------------------------------------------------
-    # Peptide examples
-    # ------------------------------------------------------------
+            for other in valid_sm[1:]:
+                preferences.append(
+                    {
+                        "type": "small_molecule_binding_preference",
+                        "prompt": (
+                            f"Choose the better small-molecule inhibitor for target "
+                            f"{state.get('target_pdb')}. Compare only AutoDock Vina "
+                            "scores within the small-molecule set. Lower Vina binding "
+                            "energy indicates stronger predicted binding."
+                        ),
+                        "chosen": {
+                            "name": _inhibitor_name(best),
+                            "target_pdb": best.get("target_pdb") or state.get("target_pdb"),
+                            "binding_energy": best.get("binding_energy"),
+                            "binding_units": "vina_kcal_mol",
+                            "binding_energy_is_physical": True,
+                        },
+                        "rejected": {
+                            "name": _inhibitor_name(other),
+                            "target_pdb": other.get("target_pdb") or state.get("target_pdb"),
+                            "binding_energy": other.get("binding_energy"),
+                            "binding_units": "vina_kcal_mol",
+                            "binding_energy_is_physical": True,
+                        },
+                        "metadata": {
+                            "source": "inhibitor_small_molecules",
+                            "target_pdb": state.get("target_pdb"),
+                            "criterion": "vina_binding_energy",
+                            "binding_units": "vina_kcal_mol",
+                            "binding_energy_is_physical": True,
+                        },
+                    }
+                )
+
     valid_pep = [
         r for r in peptides
-        if isinstance(r, dict) and r.get("valid") and r.get("score") is not None
+        if isinstance(r, dict)
+        and r.get("valid")
+        and (
+            r.get("score") is not None
+            or r.get("hdock_score") is not None
+        )
     ]
 
     if valid_pep:
-        valid_pep = sorted(valid_pep, key=lambda x: x.get("score", 999))
+        valid_pep = sorted(
+            valid_pep,
+            key=lambda x: x.get("score", x.get("hdock_score", 999)),
+        )
 
-        examples.append({
-            "type": "peptide_ranking",
-            "instruction": (
-                "Rank peptide inhibitors by HDOCK docking score. Lower HDOCK score "
-                "indicates better predicted binding. HDOCK scores are relative docking "
-                "scores, not physical binding free energies."
-            ),
-            "input": json.dumps({
-                "target_pdb": state.get("target_pdb"),
-                "n_screened": len(peptides),
-                "n_valid": len(valid_pep),
-                "peptides": [
+        examples.append(
+            {
+                "type": "peptide_ranking",
+                "instruction": (
+                    "Rank peptide inhibitors by HDOCK docking score. Lower HDOCK score "
+                    "indicates better predicted binding. HDOCK scores are relative docking "
+                    "scores, not physical binding free energies."
+                ),
+                "input": json.dumps(
                     {
-                        "sequence": r.get("sequence"),
-                        "score": r.get("score"),
-                        "valid": r.get("valid"),
-                    }
-                    for r in peptides
-                ],
-            }, indent=2, ensure_ascii=False),
-            "output": json.dumps([
-                {
-                    "rank": i + 1,
-                    "sequence": r.get("sequence"),
-                    "score": r.get("score"),
-                    "interpretation": "strong_binder" if r.get("score", 0) < -200 else "moderate_binder",
-                }
-                for i, r in enumerate(valid_pep)
-            ], indent=2, ensure_ascii=False),
-            "metadata": {
-                "source": "inhibitor_peptides",
-                "target_pdb": state.get("target_pdb"),
-                "binding_units": "hdock_relative_score",
-                "n_screened": len(peptides),
-                "n_valid": len(valid_pep),
-            },
-        })
+                        "target_pdb": state.get("target_pdb"),
+                        "n_screened": len(peptides),
+                        "n_valid": len(valid_pep),
+                        "peptides": [
+                            {
+                                "sequence": (
+                                    r.get("sequence")
+                                    or r.get("peptide_sequence")
+                                ),
+                                "target_pdb": r.get("target_pdb") or state.get("target_pdb"),
+                                "score": r.get("score", r.get("hdock_score")),
+                                "binding_units": "hdock_relative_score",
+                                "binding_energy_is_physical": False,
+                                "valid": r.get("valid"),
+                            }
+                            for r in peptides
+                        ],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                "output": json.dumps(
+                    [
+                        {
+                            "rank": i + 1,
+                            "sequence": (
+                                r.get("sequence")
+                                or r.get("peptide_sequence")
+                            ),
+                            "target_pdb": r.get("target_pdb") or state.get("target_pdb"),
+                            "score": r.get("score", r.get("hdock_score")),
+                            "binding_units": "hdock_relative_score",
+                            "binding_energy_is_physical": False,
+                            "interpretation": (
+                                "strong_binder"
+                                if r.get("score", r.get("hdock_score", 0)) < -200
+                                else "moderate_binder"
+                            ),
+                        }
+                        for i, r in enumerate(valid_pep)
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                "metadata": {
+                    "source": "inhibitor_peptides",
+                    "target_pdb": state.get("target_pdb"),
+                    "binding_units": "hdock_relative_score",
+                    "binding_energy_is_physical": False,
+                    "n_screened": len(peptides),
+                    "n_valid": len(valid_pep),
+                },
+            }
+        )
 
-        # Peptide preferences
         if len(valid_pep) >= 2:
             best = valid_pep[0]
-            for other in valid_pep[1:]:
-                preferences.append({
-                    "type": "peptide_binding_preference",
-                    "prompt": (
-                        "Choose the better peptide inhibitor. Lower HDOCK score indicates "
-                        "better predicted binding affinity. HDOCK scores are relative docking "
-                        "scores, not physical kcal/mol binding free energies."
-                    ),
-                    "chosen": {
-                        "sequence": best.get("sequence"),
-                        "score": best.get("score"),
-                        "binding_units": "hdock_relative_score",
-                    },
-                    "rejected": {
-                        "sequence": other.get("sequence"),
-                        "score": other.get("score"),
-                        "binding_units": "hdock_relative_score",
-                    },
-                    "metadata": {
-                        "source": "inhibitor_peptides",
-                        "target_pdb": state.get("target_pdb"),
-                        "criterion": "hdock_score",
-                    },
-                })
 
-    # ------------------------------------------------------------
-    # Inhibitor vs RNA overlap example
-    # ------------------------------------------------------------
+            for other in valid_pep[1:]:
+                preferences.append(
+                    {
+                        "type": "peptide_binding_preference",
+                        "prompt": (
+                            "Choose the better peptide inhibitor. Lower HDOCK score indicates "
+                            "better predicted binding affinity. HDOCK scores are relative docking "
+                            "scores, not physical kcal/mol binding free energies."
+                        ),
+                        "chosen": {
+                            "sequence": (
+                                best.get("sequence")
+                                or best.get("peptide_sequence")
+                            ),
+                            "target_pdb": best.get("target_pdb") or state.get("target_pdb"),
+                            "score": best.get("score", best.get("hdock_score")),
+                            "binding_units": "hdock_relative_score",
+                            "binding_energy_is_physical": False,
+                        },
+                        "rejected": {
+                            "sequence": (
+                                other.get("sequence")
+                                or other.get("peptide_sequence")
+                            ),
+                            "target_pdb": other.get("target_pdb") or state.get("target_pdb"),
+                            "score": other.get("score", other.get("hdock_score")),
+                            "binding_units": "hdock_relative_score",
+                            "binding_energy_is_physical": False,
+                        },
+                        "metadata": {
+                            "source": "inhibitor_peptides",
+                            "target_pdb": state.get("target_pdb"),
+                            "criterion": "hdock_score",
+                            "binding_units": "hdock_relative_score",
+                            "binding_energy_is_physical": False,
+                        },
+                    }
+                )
+
     overlap = state.get("inhibitor_binding_site_overlap", 0.0)
+
     if overlap > 0:
-        examples.append({
-            "type": "inhibitor_rna_overlap_analysis",
-            "instruction": (
-                "Interpret the binding-site overlap between inhibitor poses and RNA "
-                "binding poses. Higher overlap indicates the inhibitor competes with "
-                "RNA for the same pocket, suggesting competitive inhibition potential."
-            ),
-            "input": json.dumps({
-                "target_pdb": state.get("target_pdb"),
-                "overlap_percent": overlap,
-                "best_small_molecule": (valid_sm[0] if valid_sm else None),
-                "best_peptide": (valid_pep[0] if valid_pep else None),
-            }, indent=2, ensure_ascii=False),
-            "output": (
-                f"Binding-site overlap with RNA interface: {overlap:.1f}%. "
-                f"{'High overlap suggests competitive inhibition potential.' if overlap > 50 else 'Moderate overlap indicates partial pocket competition.' if overlap > 20 else 'Low overlap suggests inhibitor binds a different region.'}"
-            ),
-            "metadata": {
-                "source": "inhibitor_binding_site_overlap",
-                "target_pdb": state.get("target_pdb"),
-                "overlap_percent": overlap,
-            },
-        })
+        examples.append(
+            {
+                "type": "inhibitor_rna_overlap_analysis",
+                "instruction": (
+                    "Interpret the binding-site overlap between inhibitor poses and RNA "
+                    "binding poses. Higher overlap indicates the inhibitor competes with "
+                    "RNA for the same pocket, suggesting competitive inhibition potential."
+                ),
+                "input": json.dumps(
+                    {
+                        "target_pdb": state.get("target_pdb"),
+                        "overlap_percent": overlap,
+                        "best_small_molecule": (valid_sm[0] if valid_sm else None),
+                        "best_peptide": (valid_pep[0] if valid_pep else None),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                "output": (
+                    f"Binding-site overlap with RNA interface: {overlap:.1f}%. "
+                    f"{'High overlap suggests competitive inhibition potential.' if overlap > 50 else 'Moderate overlap indicates partial pocket competition.' if overlap > 20 else 'Low overlap suggests inhibitor binds a different region.'}"
+                ),
+                "metadata": {
+                    "source": "inhibitor_binding_site_overlap",
+                    "target_pdb": state.get("target_pdb"),
+                    "overlap_percent": overlap,
+                },
+            }
+        )
 
     return examples, preferences
 
 
 def _extract_final_summary_example(state: dict) -> list:
     """
-    Train compact final reporting with correct handling of:
-      - accepted vs attempted targets
-      - partial-success targets
-      - interface validation outcomes
-      - clean wording when no final target is accepted
+    Train compact final reporting with correct handling of accepted vs partial targets.
     """
     binding_results = state.get("binding_results", []) or []
 
@@ -1516,6 +1807,11 @@ def _extract_final_summary_example(state: dict) -> list:
     target_status_reason = state.get("target_status_reason")
     partial_targets = state.get("partial_success_targets", []) or []
     partial_target_ids = _normalise_partial_success_target_ids(partial_targets)
+
+    best_clean_sequence = (
+        state.get("best_interface_clean_sequence")
+        or _select_best_interface_clean_sequence_from_state(state)
+    )
 
     dock_valid_count = sum(
         1 for r in binding_results
@@ -1536,9 +1832,6 @@ def _extract_final_summary_example(state: dict) -> list:
         and r.get("interface_steric_clash")
     )
 
-    # ------------------------------------------------------------
-    # Interface outcome sentence
-    # ------------------------------------------------------------
     if dock_valid_count and interface_pass_count == 0:
         interface_sentence = (
             " However, none of the docking-valid poses passed interface validation; "
@@ -1547,26 +1840,26 @@ def _extract_final_summary_example(state: dict) -> list:
             "rather than accepted physical binders."
         )
 
+    elif target_status == "partial_success_target" or partial_target_ids:
+        target_list_text = (
+            ", ".join(partial_target_ids)
+            if partial_target_ids
+            else str(accepted_target or "unknown")
+        )
+        interface_sentence = (
+            f" {interface_pass_count} docking-valid pose(s) passed interface "
+            "contact validation, but target-level acceptance criteria were not met. "
+            f"Target(s) {target_list_text} should be treated as lower-confidence "
+            "partial-success targets for reuse and redesign, not confirmed "
+            "binding systems."
+        )
+
     elif accepted_target is None and interface_pass_count > 0:
-        if target_status == "partial_success_target" or partial_target_ids:
-            target_list_text = (
-                ", ".join(partial_target_ids)
-                if partial_target_ids
-                else "unknown"
-            )
-            interface_sentence = (
-                f" {interface_pass_count} docking-valid pose(s) passed interface "
-                "validation, but target-level acceptance criteria were not met. "
-                f"Target(s) {target_list_text} should be treated as lower-confidence "
-                "partial-success targets for reuse and redesign, not confirmed "
-                "binding systems."
-            )
-        else:
-            interface_sentence = (
-                f" {interface_pass_count} docking-valid pose(s) passed interface validation, "
-                "but the target-level acceptance criteria were not met, so this should be "
-                "treated as partial interface evidence rather than a confirmed binding system."
-            )
+        interface_sentence = (
+            f" {interface_pass_count} docking-valid pose(s) passed interface validation, "
+            "but the target-level acceptance criteria were not met, so this should be "
+            "treated as partial interface evidence rather than a confirmed binding system."
+        )
 
     else:
         interface_sentence = (
@@ -1574,9 +1867,6 @@ def _extract_final_summary_example(state: dict) -> list:
             "contact validation."
         )
 
-    # ------------------------------------------------------------
-    # Target sentence
-    # ------------------------------------------------------------
     if accepted_target is not None:
         target_sentence = f"Target {accepted_target} produced"
     else:
@@ -1594,9 +1884,17 @@ def _extract_final_summary_example(state: dict) -> list:
         else:
             target_sentence = "No final protein target was accepted. Docking attempts produced"
 
-    # ------------------------------------------------------------
-    # Build summary input
-    # ------------------------------------------------------------
+    if best_clean_sequence:
+        sequence_sentence = (
+            f"The strongest interface-clean sequence was {best_clean_sequence}. "
+        )
+    elif target_sequence:
+        sequence_sentence = (
+            f"The selected target sequence was {target_sequence}. "
+        )
+    else:
+        sequence_sentence = ""
+
     summary = {
         "research_topic": state.get("research_topic"),
         "target_pdb": accepted_target,
@@ -1604,19 +1902,21 @@ def _extract_final_summary_example(state: dict) -> list:
         "target_status_reason": target_status_reason,
         "partial_success_targets": partial_targets,
         "target_sequence": target_sequence,
-        "binding_results": binding_results,
+        "best_interface_clean_sequence": best_clean_sequence,
+        "binding_results": [
+            _sanitize_docking_row_for_training(r)
+            for r in binding_results
+            if isinstance(r, dict)
+        ],
         "conservation_signal": state.get("conservation_signal", {}),
         "md_analysis": state.get("md_analysis"),
         "protein_analysis": state.get("protein_analysis"),
-        "critique": state.get("critique"),
+        "critique": _sanitize_critique_for_training(state.get("critique")),
     }
 
-    # ------------------------------------------------------------
-    # Final output string
-    # ------------------------------------------------------------
     output_text = (
         f"{target_sentence} {dock_valid_count} docking-valid RNA binding results. "
-        f"The best target sequence was {target_sequence}. "
+        f"{sequence_sentence}"
         "HDOCK-relative scores should be interpreted as relative docking scores, "
         "not physical binding free energies."
         f"{interface_sentence}"
@@ -1640,10 +1940,18 @@ def _extract_final_summary_example(state: dict) -> list:
                 "target_status_reason": target_status_reason,
                 "partial_success_targets": partial_target_ids,
                 "partial_success_target_count": len(partial_target_ids),
-                "accepted_target_present": accepted_target is not None,
+                "accepted_target_present": (
+                    accepted_target is not None
+                    and target_status == "accepted_target"
+                ),
+                "partial_success_target_present": (
+                    target_status == "partial_success_target"
+                    or bool(partial_target_ids)
+                ),
                 "dock_valid_count": dock_valid_count,
                 "interface_pass_count": interface_pass_count,
                 "interface_steric_clash_count": clash_count,
+                "best_interface_clean_sequence": best_clean_sequence,
                 "attempted_target_count": len(
                     {
                         r.get("target_pdb")
@@ -1656,116 +1964,7 @@ def _extract_final_summary_example(state: dict) -> list:
     ]
 
 
-def _extract_examples_from_state(state: dict) -> tuple[list[dict], list[dict]]:
-    """
-    Extract all post-run supervised and preference examples.
-    """
-    examples: list[dict] = []
-    preferences: list[dict] = []
-
-    examples.extend(_extract_stage_examples(state))
-    examples.extend(_extract_structural_selection_examples(state))
-    examples.extend(_extract_literature_target_policy_examples(state))
-
-    docking_examples, docking_preferences = _extract_docking_examples(state)
-    examples.extend(docking_examples)
-    preferences.extend(docking_preferences)
-
-    # New: consume preferences emitted by protein_agent.
-    preferences.extend(_extract_explicit_docking_preferences(state))
-
-    # New: post-run fallback clean-interface-over-clash preference generation.
-    preferences.extend(_extract_interface_clean_over_clash_preferences(state))
-
-    examples.extend(_extract_target_filter_examples(state))
-
-    # New: partial-success target supervised examples.
-    examples.extend(_extract_partial_success_target_examples(state))
-
-    # New: inhibitor screening examples and preferences.
-    inhibitor_examples, inhibitor_preferences = _extract_inhibitor_examples(state)
-    examples.extend(inhibitor_examples)
-    preferences.extend(inhibitor_preferences)
-
-    examples.extend(_extract_interface_critique_examples(state))
-    examples.extend(_extract_critique_revision_examples(state))
-    examples.extend(_extract_final_summary_example(state))
-
-    # Remove invalid examples.
-    examples = [
-        ex for ex in examples
-        if isinstance(ex, dict) and ex.get("instruction") and ex.get("output") is not None
-    ]
-
-    preferences = [
-        pref for pref in preferences
-        if isinstance(pref, dict) and pref.get("chosen") and pref.get("rejected")
-    ]
-
-    preferences = _dedupe_preferences(preferences)
-
-    return examples, preferences
-
-
-def _extract_docking_rows(state: dict) -> list:
-    """
-    Save clean docking rows for downstream analysis.
-    """
-    rows: list[dict] = []
-
-    for r in state.get("binding_results", []) or []:
-        if not isinstance(r, dict):
-            continue
-
-        rows.append(
-            {
-                "rank": r.get("rank"),
-                "sequence": r.get("sequence"),
-                "target_pdb": r.get("target_pdb"),
-                "dock_score": r.get("dock_score"),
-                "binding_rank_score": r.get("binding_rank_score"),
-                "dock_valid": r.get("dock_valid"),
-                "binding_mode": r.get("binding_mode"),
-                "binding_units": r.get("binding_units"),
-                "binding_energy_is_physical": r.get(
-                    "binding_energy_is_physical",
-                    False,
-                ),
-                "training_label": r.get("training_label"),
-                "target_status": state.get("target_status"),
-                "target_status_reason": state.get("target_status_reason"),
-                "md_min_energy": (r.get("linked_md") or {}).get("min_energy"),
-                "md_mean_energy": (r.get("linked_md") or {}).get("mean_energy"),
-                "md_energy_fluctuation": (
-                    r.get("linked_md") or {}
-                ).get("energy_fluctuation"),
-                "interface_quality_score": r.get("interface_quality_score"),
-                "interface_passed": r.get("interface_passed"),
-                "interface_steric_clash": r.get("interface_steric_clash"),
-                "interface_residue_contacts": r.get("interface_residue_contacts"),
-                "interface_basic_residue_contacts": r.get(
-                    "interface_basic_residue_contacts"
-                ),
-                "interface_min_distance_A": r.get("interface_min_distance_A"),
-                "interface_contact_csv": r.get("interface_contact_csv"),
-                "interface_contact_json": r.get("interface_contact_json"),
-                "docking_snapshot_png": r.get("docking_snapshot_png"),
-                "interface_contact_entropy": r.get("interface_contact_entropy"),
-                "interface_contact_entropy_normalized": r.get(
-                    "interface_contact_entropy_normalized"
-                ),
-                "interface_rna_span_covered": r.get("interface_rna_span_covered"),
-                "interface_cluster_count": r.get("interface_cluster_count"),
-                "training_preference_score": _training_preference_score(r),
-                "interface_clash_severity": _interface_clash_severity(r),
-                "pose_training_label": _pose_training_label(r),
-            }
-        )
-
-    return rows
-
-
-def _extract_literature_target_policy_examples(state: dict) -> list[dict]:
+def _extract_literature_target_policy_examples(state: dict) -> list:
     """
     Train the model to convert literature evidence into target-selection policy.
     """
@@ -1847,7 +2046,7 @@ def _extract_literature_target_policy_examples(state: dict) -> list[dict]:
     ]
 
 
-def _extract_literature_rows_from_memory_like_parse(state: dict) -> list[dict]:
+def _extract_literature_rows_from_memory_like_parse(state: dict) -> list:
     """
     Extract literature evidence rows without mutating LiteratureMemory.
     """
@@ -1984,6 +2183,193 @@ def _extract_interface_critique_examples(state: dict) -> list:
     return examples
 
 
+def _extract_examples_from_state(state: dict) -> tuple[list[dict], list[dict]]:
+    """
+    Extract all post-run supervised and preference examples.
+    """
+    examples: list[dict] = []
+    preferences: list[dict] = []
+
+    examples.extend(_extract_stage_examples(state))
+    examples.extend(_extract_structural_selection_examples(state))
+    examples.extend(_extract_literature_target_policy_examples(state))
+
+    docking_examples, docking_preferences = _extract_docking_examples(state)
+    examples.extend(docking_examples)
+    preferences.extend(docking_preferences)
+
+    preferences.extend(_extract_explicit_docking_preferences(state))
+    preferences.extend(_extract_interface_clean_over_clash_preferences(state))
+
+    examples.extend(_extract_target_filter_examples(state))
+    examples.extend(_extract_partial_success_target_examples(state))
+
+    inhibitor_examples, inhibitor_preferences = _extract_inhibitor_examples(state)
+    examples.extend(inhibitor_examples)
+    preferences.extend(inhibitor_preferences)
+
+    examples.extend(_extract_interface_critique_examples(state))
+    examples.extend(_extract_critique_revision_examples(state))
+    examples.extend(_extract_final_summary_example(state))
+
+    examples = [
+        ex for ex in examples
+        if isinstance(ex, dict)
+        and ex.get("instruction")
+        and ex.get("output") is not None
+    ]
+
+    preferences = [
+        pref for pref in preferences
+        if isinstance(pref, dict)
+        and pref.get("chosen")
+        and pref.get("rejected")
+    ]
+
+    preferences = _dedupe_preferences(preferences)
+
+    return examples, preferences
+
+
+def _extract_docking_rows(state: dict) -> list:
+    """
+    Save clean docking rows for downstream analysis.
+    """
+    rows: list[dict] = []
+
+    for r in state.get("binding_results", []) or []:
+        if not isinstance(r, dict):
+            continue
+
+        rows.append(
+            {
+                "rank": r.get("rank"),
+                "sequence": r.get("sequence"),
+                "target_pdb": r.get("target_pdb"),
+                "dock_score": r.get("dock_score"),
+                "binding_rank_score": r.get("binding_rank_score"),
+                "dock_valid": r.get("dock_valid"),
+                "binding_mode": r.get("binding_mode"),
+                "binding_units": r.get("binding_units"),
+                "binding_energy_is_physical": r.get(
+                    "binding_energy_is_physical",
+                    False,
+                ),
+                "training_label": r.get("training_label"),
+                "target_status": state.get("target_status"),
+                "target_status_reason": state.get("target_status_reason"),
+                "md_min_energy": (r.get("linked_md") or {}).get("min_energy"),
+                "md_mean_energy": (r.get("linked_md") or {}).get("mean_energy"),
+                "md_energy_fluctuation": (
+                    r.get("linked_md") or {}
+                ).get("energy_fluctuation"),
+                "interface_quality_score": r.get("interface_quality_score"),
+                "interface_passed": r.get("interface_passed"),
+                "interface_steric_clash": r.get("interface_steric_clash"),
+                "interface_residue_contacts": r.get("interface_residue_contacts"),
+                "interface_basic_residue_contacts": r.get(
+                    "interface_basic_residue_contacts"
+                ),
+                "interface_min_distance_A": r.get("interface_min_distance_A"),
+                "interface_contact_csv": r.get("interface_contact_csv"),
+                "interface_contact_json": r.get("interface_contact_json"),
+                "docking_snapshot_png": r.get("docking_snapshot_png"),
+                "interface_contact_entropy": r.get("interface_contact_entropy"),
+                "interface_contact_entropy_normalized": r.get(
+                    "interface_contact_entropy_normalized"
+                ),
+                "interface_rna_span_covered": r.get("interface_rna_span_covered"),
+                "interface_cluster_count": r.get("interface_cluster_count"),
+                "training_preference_score": _training_preference_score(r),
+                "interface_clash_severity": _interface_clash_severity(r),
+                "pose_training_label": _pose_training_label(r),
+            }
+        )
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Automatic LoRA training trigger
+# ---------------------------------------------------------------------------
+
+def _check_training_quality(manifest: dict) -> bool:
+    """
+    Check if collected training data meets quality thresholds for auto-training.
+    """
+    min_rows = int(os.getenv("VLAB_MIN_TRAIN_ROWS", "20"))
+    min_interface_valid = int(os.getenv("VLAB_MIN_INTERFACE_VALID", "5"))
+    min_literature = int(os.getenv("VLAB_MIN_LITERATURE_EVIDENCE", "2"))
+
+    examples_count = (
+        manifest.get("example_count")
+        or manifest.get("counts", {}).get("examples", 0)
+    )
+
+    supervised_count = (
+        manifest.get("supervised_count")
+        or manifest.get("counts", {}).get("supervised", 0)
+    )
+
+    if examples_count < min_rows and supervised_count < min_rows:
+        log.info(
+            "Dataset too small for training: %s examples < %s",
+            examples_count,
+            min_rows,
+        )
+        return False
+
+    interface_clean_count = manifest.get("interface_clean_count", 0)
+
+    if interface_clean_count < min_interface_valid:
+        log.info(
+            "Insufficient interface-valid examples: %s < %s",
+            interface_clean_count,
+            min_interface_valid,
+        )
+        return False
+
+    literature_count = manifest.get("literature_evidence_count", 0)
+
+    if literature_count < min_literature:
+        log.info(
+            "Insufficient literature evidence: %s < %s",
+            literature_count,
+            min_literature,
+        )
+        return False
+
+    log.info("Dataset quality check passed for auto-training")
+    return True
+
+
+def _trigger_auto_training(manifest: dict) -> None:
+    """
+    Trigger automatic LoRA training if enabled and data quality is sufficient.
+    """
+    if os.getenv("VLAB_LORA_TRAIN", "0") != "1":
+        log.info("Auto-training disabled (VLAB_LORA_TRAIN != 1)")
+        return
+
+    if not _check_training_quality(manifest):
+        return
+
+    py = os.getenv("PY", "python")
+
+    log.info("Triggering automatic LoRA training...")
+
+    try:
+        subprocess.Popen(
+            [py, "training/auto_retrain.py"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log.info("Auto-training started in background")
+    except Exception as e:
+        log.warning("Failed to trigger auto-training: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Main post-run pipeline
 # ---------------------------------------------------------------------------
@@ -2001,9 +2387,6 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
 
         literature_rows: list[dict] = []
 
-        # ------------------------------------------------------------
-        # Persistent memories: final-state ingestion
-        # ------------------------------------------------------------
         if state is not None:
             try:
                 fm = FailureMemory()
@@ -2031,7 +2414,7 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
         else:
             examples, preferences = _extract_examples_from_state(state)
 
-        supervised = []
+        supervised: list[dict] = []
 
         target_selection_reason = (state or {}).get("target_pdb_selection_reason")
         target_rankings = (state or {}).get("target_pdb_rankings", []) or []
@@ -2067,6 +2450,11 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
                 supervised.append(converted)
 
         docking_rows = _extract_docking_rows(state or {})
+
+        normalised_pi_training_metadata = _normalise_pi_training_metadata_for_export(
+            state or {},
+            docking_rows=docking_rows,
+        )
 
         dock_valid_count = sum(
             1 for r in docking_rows
@@ -2137,7 +2525,10 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             pref_type = pref.get("type") or "unknown"
             preference_type_counts[pref_type] = preference_type_counts.get(pref_type, 0) + 1
 
-        true_preference_count = preference_type_counts.get("docking_interface_preference", 0)
+        true_preference_count = preference_type_counts.get(
+            "docking_interface_preference",
+            0,
+        )
         partial_interface_preference_count = preference_type_counts.get(
             "partial_interface_evidence_preference",
             0,
@@ -2155,7 +2546,6 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             0,
         )
 
-        # Inhibitor preference counts
         small_molecule_preference_count = preference_type_counts.get(
             "small_molecule_binding_preference",
             0,
@@ -2173,27 +2563,33 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             (state or {}).get("resolved_partial_success_targets", []) or []
         )
 
-        # Inhibitor statistics
         inhibitor_enabled = (state or {}).get("inhibitor_enabled", False)
-        small_mols = (state or {}).get("inhibitor_small_molecules", []) or []
-        peptides = (state or {}).get("inhibitor_peptides", []) or []
+
+        small_mols_raw = (state or {}).get("inhibitor_small_molecules", []) or []
+        peptides_raw = (state or {}).get("inhibitor_peptides", []) or []
+
+        small_mols = _dedupe_inhibitor_records(
+            small_mols_raw,
+            ligand_type="small_molecule",
+        )
+        peptides = _dedupe_inhibitor_records(
+            peptides_raw,
+            ligand_type="peptide",
+        )
+
         inhibitor_overlap = (state or {}).get("inhibitor_binding_site_overlap", 0.0)
 
         manifest = {
-            # ------------------------------------------------------------------
-            # Schema / provenance
-            # ------------------------------------------------------------------
-            "schema_version": "postrun_training_manifest.v4",
+            "schema_version": "postrun_training_manifest.v5",
             "topic_name": topic.get("name") if isinstance(topic, dict) else None,
             "research_topic": (state or {}).get("research_topic"),
             "virus_family": (state or {}).get("virus_family"),
             "virus_genus": (state or {}).get("virus_genus"),
             "virus_name": (state or {}).get("virus_name"),
 
-            # ------------------------------------------------------------------
-            # Target selection
-            # ------------------------------------------------------------------
             "target_pdb": (state or {}).get("target_pdb"),
+            "target_pdb_id": (state or {}).get("target_pdb_id"),
+            "target_pdb_path": (state or {}).get("target_pdb_path"),
             "target_status": (state or {}).get("target_status"),
             "target_status_reason": (state or {}).get("target_status_reason"),
             "partial_success_target_count": len(partial_success_target_ids),
@@ -2201,15 +2597,16 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             "resolved_partial_success_targets": resolved_partial_success_targets,
             "resolved_partial_success_target_count": len(resolved_partial_success_targets),
             "target_sequence": (state or {}).get("target_sequence"),
+            "best_interface_clean_sequence": (state or {}).get(
+                "best_interface_clean_sequence"
+            )
+            or _select_best_interface_clean_sequence_from_state(state or {}),
             "target_selection_mode": (state or {}).get("target_selection_mode"),
             "target_pdb_selection_reason": target_selection_reason,
             "target_selection_quality": target_selection_quality,
             "target_ranked_candidate_count": len(target_rankings),
             "target_failed_count": len((state or {}).get("failed_target_pdbs", []) or []),
 
-            # ------------------------------------------------------------------
-            # Export counts
-            # ------------------------------------------------------------------
             "example_count": len(examples),
             "supervised_count": len(supervised),
             "preference_count": len(preferences),
@@ -2223,9 +2620,6 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             "preference_type_counts": preference_type_counts,
             "docking_row_count": len(docking_rows),
 
-            # ------------------------------------------------------------------
-            # Docking/interface summary
-            # ------------------------------------------------------------------
             "binding_units": (state or {}).get("binding_units"),
             "dock_valid_count": dock_valid_count,
             "interface_pass_count": interface_pass_count,
@@ -2235,34 +2629,40 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             "interface_clash_severity_counts": clash_severity_counts,
             "pose_label_counts": pose_label_counts,
 
-            # ------------------------------------------------------------------
-            # Inhibitor screening summary
-            # ------------------------------------------------------------------
             "inhibitor_enabled": inhibitor_enabled,
             "inhibitor_small_molecule_count": len(small_mols),
-            "inhibitor_small_molecule_valid_count": sum(1 for r in small_mols if isinstance(r, dict) and r.get("valid")),
+            "inhibitor_small_molecule_valid_count": sum(
+                1 for r in small_mols
+                if isinstance(r, dict) and r.get("valid")
+            ),
             "inhibitor_peptide_count": len(peptides),
-            "inhibitor_peptide_valid_count": sum(1 for r in peptides if isinstance(r, dict) and r.get("valid")),
+            "inhibitor_peptide_valid_count": sum(
+                1 for r in peptides
+                if isinstance(r, dict) and r.get("valid")
+            ),
             "inhibitor_binding_site_overlap_percent": inhibitor_overlap,
             "small_molecule_preference_count": small_molecule_preference_count,
             "peptide_preference_count": peptide_preference_count,
 
-            # ------------------------------------------------------------------
-            # Useful final-state summaries
-            # ------------------------------------------------------------------
-            "conservation_valid": ((state or {}).get("conservation_signal") or {}).get("valid"),
-            "conservation_fitness": (
-                ((state or {}).get("conservation_signal") or {}).get("conservation_fitness")
+            "conservation_valid": (
+                ((state or {}).get("conservation_signal") or {}).get("valid")
             ),
-            "designed_sequence_count": len((state or {}).get("designed_sequences", []) or []),
-            "binding_result_count": len((state or {}).get("binding_results", []) or []),
+            "conservation_fitness": (
+                ((state or {}).get("conservation_signal") or {}).get(
+                    "conservation_fitness"
+                )
+            ),
+            "designed_sequence_count": len(
+                (state or {}).get("designed_sequences", []) or []
+            ),
+            "binding_result_count": len(
+                (state or {}).get("binding_results", []) or []
+            ),
             "iteration_count": (state or {}).get("iterations"),
             "max_iterations": (state or {}).get("max_iterations"),
+            "pi_training_metadata": normalised_pi_training_metadata,
             "literature_evidence_count": len(literature_rows),
 
-            # ------------------------------------------------------------------
-            # Output files written by this pipeline
-            # ------------------------------------------------------------------
             "files": {
                 "examples": str(POSTRUN_DIR / "examples.jsonl"),
                 "supervised": str(POSTRUN_DIR / "supervised.jsonl"),
@@ -2273,9 +2673,6 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             },
         }
 
-        # ------------------------------------------------------------
-        # Persistent FailureMemory ingestion after manifest is available
-        # ------------------------------------------------------------
         if state is not None:
             try:
                 fm = FailureMemory()
@@ -2298,7 +2695,6 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
         _write_jsonl(POSTRUN_DIR / "docking_rows.jsonl", docking_rows)
         _write_jsonl(POSTRUN_DIR / "literature_evidence.jsonl", literature_rows)
 
-        # Backwards-compatible output names.
         _write_jsonl(Path("examples.jsonl"), examples)
         _write_jsonl(Path("supervised.jsonl"), supervised)
 
@@ -2310,6 +2706,11 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             len(preferences),
             len(docking_rows),
         )
+
+        try:
+            _trigger_auto_training(manifest)
+        except Exception as e:
+            log.warning("Auto-training trigger failed/non-fatal: %s", e)
 
         postrun_query = _topic_seed_text(topic)
 

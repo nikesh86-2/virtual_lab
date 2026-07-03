@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
-
+from VLAB2.orchestration.utils.text_utils import _safe_file_tag
 # Reuse obabel resolver from rna_prep
 try:
     from VLAB2.core.rna_prep import resolve_obabel
@@ -48,6 +48,133 @@ DEFAULT_OBABEL_BIN = os.getenv(
     "/mnt/scratch/fbsnpat/envs/biophysics-research-agent/bin/obabel",
 )
 
+def _resolve_pymol() -> str | None:
+    return (
+        os.getenv("PYMOL_BIN")
+        or shutil.which("pymol")
+        or shutil.which("pymol-open-source")
+    )
+
+def generate_peptide_pdb_with_pymol(
+    sequence: str,
+    output_dir: Optional[str] = None,
+) -> dict:
+    """
+    Generate a peptide PDB from a one-letter amino acid sequence using PyMOL fab.
+
+    This is preferred over OpenBabel for peptide sequences because OpenBabel
+    treats inline strings as SMILES and does not reliably build peptide PDBs.
+    """
+    seq = _normalise_sequence(sequence)
+
+    if not seq:
+        return {
+            "pdb_path": None,
+            "sequence": sequence,
+            "error": "Empty or invalid sequence",
+        }
+
+    pymol_bin = _resolve_pymol()
+
+    if not pymol_bin:
+        return {
+            "pdb_path": None,
+            "sequence": seq,
+            "error": "PyMOL not found for peptide building",
+        }
+
+    cache_dir = output_dir or DEFAULT_CACHE_DIR
+    os.makedirs(cache_dir, exist_ok=True)
+
+    seq_hash = hashlib.md5(seq.encode()).hexdigest()[:8]
+    output_path = os.path.join(cache_dir, f"peptide_{seq_hash}_{seq}.pdb")
+    pml_path = os.path.join(cache_dir, f"build_peptide_{seq_hash}_{seq}.pml")
+
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
+        log.info("Peptide PDB cache hit: %s", output_path)
+        return {
+            "pdb_path": output_path,
+            "sequence": seq,
+            "error": None,
+        }
+
+    pml = f"""
+reinitialize
+fab {seq}, peptide
+set retain_order, 1
+h_add peptide
+save {Path(output_path).as_posix()}, peptide
+quit
+"""
+
+    with open(pml_path, "w", encoding="utf-8") as fh:
+        fh.write(pml)
+
+    try:
+        proc = subprocess.run(
+            [pymol_bin, "-cq", pml_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+
+        if proc.returncode != 0:
+            return {
+                "pdb_path": None,
+                "sequence": seq,
+                "error": f"PyMOL peptide build failed: {proc.stderr.strip()}",
+            }
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 100:
+            return {
+                "pdb_path": None,
+                "sequence": seq,
+                "error": "PyMOL produced empty/invalid peptide PDB",
+            }
+
+        atom_count = 0
+        with open(output_path, "r", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith(("ATOM", "HETATM")):
+                    atom_count += 1
+
+        if atom_count < 5:
+            return {
+                "pdb_path": None,
+                "sequence": seq,
+                "error": f"PyMOL peptide PDB has too few atoms: {atom_count}",
+            }
+
+        log.info("Peptide PDB generated with PyMOL: %s", output_path)
+
+        return {
+            "pdb_path": output_path,
+            "sequence": seq,
+            "error": None,
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "pdb_path": None,
+            "sequence": seq,
+            "error": "PyMOL peptide build timed out",
+        }
+
+    except Exception as e:
+        return {
+            "pdb_path": None,
+            "sequence": seq,
+            "error": str(e),
+        }
+
+    finally:
+        try:
+            if os.path.exists(pml_path):
+                os.remove(pml_path)
+        except OSError:
+            pass
+
 
 # ── 3D structure generation ───────────────────────────────────────────────────
 
@@ -55,6 +182,7 @@ def generate_peptide_pdb(
     sequence: str,
     output_dir: Optional[str] = None,
     obabel_bin: Optional[str] = None,
+    target_tag: Optional[str] = None,
 ) -> dict:
     """
     Generate a 3D PDB file for a peptide sequence using OpenBabel --gen3d.
@@ -67,6 +195,7 @@ def generate_peptide_pdb(
                    Supports 1-letter or 3-letter codes.
         output_dir: Directory for output PDB. If None, uses DEFAULT_CACHE_DIR.
         obabel_bin: Path to obabel binary. Auto-resolved if None.
+        target_tag: Tag for the target molecule, used to create a safe file name.
 
     Returns:
         dict with keys:
@@ -74,6 +203,21 @@ def generate_peptide_pdb(
             - sequence (str): Normalised sequence.
             - error (str or None): Error message if failed.
     """
+
+    pymol_result = generate_peptide_pdb_with_pymol(
+        sequence=sequence,
+        output_dir=output_dir,
+    )
+
+    if pymol_result.get("pdb_path"):
+        return pymol_result
+
+    log.warning(
+        "PyMOL peptide build failed for %s; falling back to OpenBabel. error=%s",
+        sequence,
+        pymol_result.get("error"),
+    )
+
     obabel_bin = obabel_bin or resolve_obabel()
     if not os.path.isfile(obabel_bin):
         return {
@@ -91,7 +235,8 @@ def generate_peptide_pdb(
     cache_dir = output_dir or DEFAULT_CACHE_DIR
     os.makedirs(cache_dir, exist_ok=True)
     seq_hash = hashlib.md5(seq.encode()).hexdigest()[:8]
-    output_path = os.path.join(cache_dir, f"peptide_{seq_hash}_{seq}.pdb")
+    prefix = f"{_safe_file_tag(target_tag)}_" if target_tag else ""
+    output_path = os.path.join(cache_dir, f"{prefix}peptide_{seq_hash}_{seq}.pdb")
 
     # Check cache
     if os.path.exists(output_path):
@@ -377,6 +522,7 @@ def prepare_peptides(
     peptide_specs: list,
     output_dir: Optional[str] = None,
     obabel_bin: Optional[str] = None,
+    target_tag: Optional[str] = None,
 ) -> list:
     """
     Prepare a list of peptide sequences for docking.
@@ -396,13 +542,21 @@ def prepare_peptides(
             - error (str or None)
     """
     results = []
+
     for spec in peptide_specs:
+        if isinstance(spec, str):
+            spec = {
+                "sequence": spec,
+                "rationale": "",
+                "source": "raw_sequence",
+            }
+
         seq = spec.get("sequence", "")
         if not seq:
             continue
 
         # Generate 3D structure
-        gen_result = generate_peptide_pdb(seq, output_dir, obabel_bin)
+        gen_result = generate_peptide_pdb(seq, output_dir, obabel_bin, target_tag=target_tag)
         pdb_path = gen_result.get("pdb_path")
 
         # Clean for HDOCK

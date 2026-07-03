@@ -518,6 +518,92 @@ def extract_protein_rna_contacts(
     return summary
 
 
+def _build_interface_residues_from_contacts(rows: list[dict]) -> list[dict]:
+    residues: dict[str, dict[str, int | str]] = {}
+
+    for row in rows:
+        pid = row.get("protein_residue_id")
+        if not pid:
+            continue
+
+        residue = residues.setdefault(pid, {
+            "residue_id": pid,
+            "chain": row.get("protein_chain", ""),
+            "residue_number": _safe_int(row.get("protein_resseq")) or 0,
+            "contact_count": 0,
+        })
+
+        contact_count = _safe_int(row.get("atom_contact_count") or 0) or 0
+        residue["contact_count"] += contact_count
+
+    return list(residues.values())
+
+
+def _build_interface_contacts(state: dict) -> dict:
+    """Build a top-level interface_contacts dict from interface contact JSON output."""
+    for row in state.get("binding_results", []) or []:
+        if not isinstance(row, dict):
+            continue
+
+        if not row.get("dock_valid"):
+            continue
+
+        json_path = row.get("interface_contact_json")
+        if not json_path:
+            continue
+
+        try:
+            path = Path(json_path)
+            if not path.exists():
+                continue
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning("Could not read interface contact JSON %s: %s", json_path, e)
+            continue
+
+        summary = data.get("summary") or {}
+        contacts = data.get("contacts") or []
+        interface_residues = _build_interface_residues_from_contacts(contacts)
+
+        if not interface_residues:
+            continue
+
+        return {
+            "interface_contacts_valid": summary.get("valid", False),
+            "interface_contacts_error": summary.get("error"),
+            "interface_contact_csv": row.get("interface_contact_csv"),
+            "interface_contact_json": json_path,
+            "interface_contact_cutoff_A": summary.get("cutoff_A"),
+            "interface_contact_entropy": summary.get("interface_contact_entropy"),
+            "interface_contact_entropy_normalized": summary.get(
+                "interface_contact_entropy_normalized"
+            ),
+            "interface_contact_rna_span_covered": summary.get("interface_rna_span_covered"),
+            "interface_quality_score": summary.get("interface_quality_score"),
+            "interface_passed": summary.get("interface_passed"),
+            "interface_rna_span_covered": summary.get("interface_rna_span_covered"),
+            "interface_residues": interface_residues,
+        }
+
+    # Return explicit None values instead of empty dict to distinguish
+    # between "not analyzed" and "analyzed but no residues found"
+    return {
+        "interface_contacts_valid": None,
+        "interface_contacts_error": "No valid interface residues found in any docking result",
+        "interface_contact_csv": None,
+        "interface_contact_json": None,
+        "interface_contact_cutoff_A": None,
+        "interface_contact_entropy": None,
+        "interface_contact_entropy_normalized": None,
+        "interface_contact_rna_span_covered": None,
+        "interface_quality_score": None,
+        "interface_passed": None,
+        "interface_rna_span_covered": None,
+        "interface_residues": None,
+    }
+
+
 def analyse_interface_contacts_for_results(state: dict) -> dict:
     """
     Add protein/RNA interface contact metrics to each docking-valid binding result.
@@ -624,7 +710,10 @@ def analyse_interface_contacts_for_results(state: dict) -> dict:
         len(contact_files) // 2,
     )
 
+    interface_contacts = _build_interface_contacts({"binding_results": updated_results})
+
     return {
         "binding_results": updated_results,
         "interface_contact_files": contact_files,
+        "interface_contacts": interface_contacts,
     }

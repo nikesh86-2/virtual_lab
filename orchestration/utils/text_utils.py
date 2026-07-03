@@ -1,5 +1,29 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
+def _safe_file_tag(value: str | None, default: str = "target") -> str:
+    """
+    Convert a PDB ID/path/name into a filesystem-safe compact tag.
+    """
+    if not value:
+        return default
+
+    raw = str(value).strip()
+
+    # If a file path was passed, use its stem.
+    if "/" in raw or raw.endswith(".pdb") or raw.endswith(".pdbqt"):
+        raw = Path(raw).stem
+
+    raw = raw.upper()
+
+    # Remove common suffixes so /path/8k75.pdb -> 8K75,
+    # but /path/8k75_receptor.pdbqt -> 8K75_RECEPTOR.
+    raw = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)
+    raw = raw.strip("_")
+
+    return raw or default
 
 def truncate_str(text: str, max_chars: int = 1000) -> str:
     """

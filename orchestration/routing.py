@@ -424,21 +424,40 @@ def _inhibitor_should_run(state: LabState) -> str:
 
     The inhibitor node is skipped when:
       - VLAB_INHIBITOR_ENABLED != "1"
-      - target_pdb is missing
+      - target_pdb is missing AND no partial success target with interface contacts
       - interface_contacts is missing or empty
     """
     if not _env_bool("VLAB_INHIBITOR_ENABLED", default=False):
         log.info("Inhibitor screening disabled (VLAB_INHIBITOR_ENABLED != 1)")
         return "skeptic"
 
-    if not state.get("target_pdb"):
-        log.info("Skipping inhibitor: no target_pdb in state")
-        return "skeptic"
+    # Check for fully accepted target
+    target_pdb = state.get("target_pdb")
+
+    # If no fully accepted target, check for partial success target with interface contacts
+    if not target_pdb:
+        partial_targets = state.get("partial_success_targets", []) or []
+        if partial_targets:
+            # Try to get a PDB from partial success targets
+            if isinstance(partial_targets[0], dict):
+                target_pdb = partial_targets[0].get("target_pdb") or partial_targets[0].get("pdb_id")
+            else:
+                target_pdb = str(partial_targets[0]).strip().upper()
+
+        if not target_pdb:
+            log.info("Skipping inhibitor: no target_pdb in state and no partial success targets")
+            return "skeptic"
+
+        log.info("Using partial success target for inhibitor screening: %s", target_pdb)
 
     interface = state.get("interface_contacts") or {}
     if not interface.get("interface_residues"):
-        log.info("Skipping inhibitor: no interface residues in state")
+        log.info(
+            "Skipping inhibitor: no interface residues in state; "
+            "interface_contacts=%s",
+            {k: interface.get(k) for k in ["interface_contacts_valid", "interface_residues"]},
+        )
         return "skeptic"
 
-    log.info("Inhibitor screening enabled — routing to inhibitor node")
+    log.info("Inhibitor screening enabled — routing to inhibitor node with target %s", target_pdb)
     return "inhibitor"

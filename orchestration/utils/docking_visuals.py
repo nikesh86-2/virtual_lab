@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from VLAB2.orchestration.utils.text_utils import _safe_file_tag
 import logging
 import os
 import shutil
@@ -160,6 +160,136 @@ quit
         }
 
 
+def render_small_molecule_pose_snapshot_pymol(
+    receptor_pdb: str,
+    ligand_pose: str,
+    output_png: str,
+    title: str | None = None,
+    width: int = 1600,
+    height: int = 1200,
+) -> dict:
+    pymol_bin = (
+        os.getenv("PYMOL_BIN")
+        or _find_executable("pymol")
+        or _find_executable("pymol-open-source")
+    )
+
+    if not pymol_bin:
+        return {
+            "valid": False,
+            "image_file": None,
+            "method": "pymol",
+            "error": "PyMOL not found",
+        }
+
+    receptor_path = Path(receptor_pdb)
+    ligand_path = Path(ligand_pose)
+
+    if not receptor_path.exists():
+        return {
+            "valid": False,
+            "image_file": None,
+            "method": "pymol",
+            "error": f"Missing receptor PDB: {receptor_pdb}",
+        }
+
+    if not ligand_path.exists():
+        return {
+            "valid": False,
+            "image_file": None,
+            "method": "pymol",
+            "error": f"Missing ligand pose: {ligand_pose}",
+        }
+
+    output_path = Path(output_png)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pml_path = output_path.with_suffix(".pml")
+    title_text = title or ligand_path.stem
+
+    pml = f"""
+reinitialize
+load {receptor_path.as_posix()}, receptor
+load {ligand_path.as_posix()}, ligand
+
+hide everything
+bg_color white
+
+set ray_opaque_background, off
+set antialias, 2
+set depth_cue, 0
+set orthoscopic, on
+
+select protein_part, receptor and polymer.protein
+show cartoon, protein_part
+color slate, protein_part
+
+select small_mol, ligand
+show sticks, small_mol
+color yellow, small_mol
+
+select interface_protein, protein_part within 5 of small_mol
+show surface, interface_protein
+color marine, interface_protein
+set transparency, 0.4, interface_protein
+
+orient small_mol
+zoom small_mol or interface_protein, 8
+turn x, 20
+turn y, -25
+
+pseudoatom title_label, pos=[0,0,0], label="{title_text}"
+hide spheres, title_label
+set label_color, black
+set label_size, 18
+
+ray {width}, {height}
+png {output_path.as_posix()}, dpi=220
+
+quit
+"""
+
+    pml_path.write_text(pml, encoding="utf-8")
+
+    try:
+        proc = subprocess.run(
+            [pymol_bin, "-cq", str(pml_path)],
+            capture_output=True,
+            text=True,
+            timeout=int(os.getenv("VLAB_RENDER_TIMEOUT", "180")),
+        )
+
+        if proc.returncode != 0:
+            return {
+                "valid": False,
+                "image_file": None,
+                "method": "pymol",
+                "error": proc.stderr[-1000:],
+            }
+
+        if not output_path.exists():
+            return {
+                "valid": False,
+                "image_file": None,
+                "method": "pymol",
+                "error": "PNG not generated",
+            }
+
+        return {
+            "valid": True,
+            "image_file": str(output_path),
+            "method": "pymol",
+            "error": None,
+        }
+
+    except Exception as e:
+        return {
+            "valid": False,
+            "image_file": None,
+            "method": "pymol",
+            "error": str(e),
+        }
+
 # ---------------------------------------------------------------------
 # Batch rendering for pipeline
 # ---------------------------------------------------------------------
@@ -179,6 +309,12 @@ def render_docking_snapshots_for_results(state: dict) -> dict:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    target_tag = _safe_file_tag(
+    state.get("target_pdb")
+    or state.get("target_pdb_id")
+    or state.get("target_pdb_path")
+    or "target"
+    )
     updated_results = []
     image_files = []
 
@@ -198,14 +334,17 @@ def render_docking_snapshots_for_results(state: dict) -> dict:
             updated_results.append(copied)
             continue
 
-        target = copied.get("target_pdb") or "target"
+        target = copied.get("target_pdb") or state.get("target_pdb") or "target"
+        target = _safe_file_tag(target)
+
         seq = copied.get("sequence", "")
         rank = copied.get("rank", idx + 1)
         score = copied.get("dock_score")
 
-        seq_tag = seq[:12] if seq else f"rank{rank}"
+        seq_tag = _safe_file_tag(seq[:12] if seq else f"rank{rank}")
+        score_tag = _safe_file_tag(str(score).replace("-", "neg").replace(".", "p"))
 
-        png = out_dir / f"{target}_rank{rank}_{seq_tag}_score{score}.png"
+        png = out_dir / f"{target_tag}_{target}_rank{rank}_{seq_tag}_score{score_tag}.png"
 
         title = f"{target} | rank {rank} | score {score}"
 
@@ -520,15 +659,18 @@ quit
 # ---------------------------------------------------------------------
 # Batch rendering for inhibitor pipeline
 # ---------------------------------------------------------------------
+
 def render_inhibitor_snapshots_for_results(state: dict) -> dict:
     """
     Generate PyMOL snapshots for all inhibitor docking results.
 
-    Small molecules: yellow sticks
-    Peptides       : magenta cartoon + sticks
+    Small molecules: receptor PDB + docked ligand PDBQT
+    Peptides       : HDOCK receptor-peptide complex PDB
 
-    Returns dict:
-      inhibitor_snapshot_paths : list[str]
+    Returns:
+      inhibitor_snapshot_paths
+      inhibitor_small_molecules
+      inhibitor_peptides
     """
 
     if os.getenv("VLAB_RENDER_DOCKING_SNAPSHOTS", "0").strip() != "1":
@@ -542,51 +684,103 @@ def render_inhibitor_snapshots_for_results(state: dict) -> dict:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    image_files = []
+    target_pdb = (
+    state.get("target_pdb_path")
+    or state.get("target_pdb_file")
+    or state.get("receptor_pdb")
+    )
 
-    # ------------------------------------------------------------
+    if not target_pdb or not Path(str(target_pdb)).exists():
+        log.warning("Skipping inhibitor snapshots: receptor PDB path is missing or invalid: %s", target_pdb)
+        return {}
+
+    image_files = []
+    target_tag = _safe_file_tag(
+        state.get("target_pdb") or state.get("target_pdb_id") or target_pdb
+    )
+
+    updated_small_molecules = []
+    updated_peptides = []
+
     # Small-molecule snapshots
-    # ------------------------------------------------------------
     for idx, r in enumerate(state.get("inhibitor_small_molecules") or []):
         if not isinstance(r, dict):
+            updated_small_molecules.append(r)
             continue
 
-        complex_file = r.get("output_file") or r.get("complex_pdb")
-        if not r.get("valid") or not complex_file:
+        copied = dict(r)
+
+        ligand_pose = (
+            copied.get("output_file")
+            or copied.get("docked_pdbqt")
+            or copied.get("ligand_pose")
+            or copied.get("complex_pdb")
+        )
+
+        if not copied.get("valid") or not ligand_pose or not target_pdb:
+            updated_small_molecules.append(copied)
             continue
 
-        name = r.get("name", r.get("compound_name", f"sm_{idx}")).replace(" ", "_")
-        score = r.get("binding_energy", r.get("score", "na"))
+        name = (
+            copied.get("ligand_name")
+            or copied.get("display_name")
+            or copied.get("name")
+            or copied.get("compound_name")
+            or f"sm_{idx}"
+        )
+        name = str(name).replace(" ", "_").replace("/", "_")
 
-        png = out_dir / f"sm_{name}_score{score}.png"
+        score = copied.get("binding_energy", copied.get("score", "na"))
+        score_tag = str(score).replace("-", "neg").replace(".", "p")
 
-        res = render_small_molecule_snapshot_pymol(
-            complex_pdb=complex_file,
+        png = out_dir / f"{target_tag}_sm_{name}_score{score_tag}.png"
+
+        res = render_small_molecule_pose_snapshot_pymol(
+            receptor_pdb=target_pdb,
+            ligand_pose=ligand_pose,
             output_png=str(png),
             title=f"SM: {name} | score {score}",
         )
 
-        r["snapshot_valid"] = res.get("valid")
-        r["snapshot_png"] = res.get("image_file")
+        copied["snapshot_valid"] = res.get("valid")
+        copied["snapshot_png"] = res.get("image_file")
+        copied["snapshot_error"] = res.get("error")
 
         if res.get("valid"):
             image_files.append(res["image_file"])
 
-    # ------------------------------------------------------------
+        updated_small_molecules.append(copied)
+
     # Peptide snapshots
-    # ------------------------------------------------------------
     for idx, r in enumerate(state.get("inhibitor_peptides") or []):
         if not isinstance(r, dict):
+            updated_peptides.append(r)
             continue
 
-        complex_file = r.get("complex_pdb") or r.get("output_complex")
-        if not r.get("valid") or not complex_file:
+        copied = dict(r)
+
+        complex_file = (
+            copied.get("complex_pdb")
+            or copied.get("output_complex")
+            or copied.get("complex_file")
+            or copied.get("dock_complex_file")
+        )
+
+        if not copied.get("valid") or not complex_file:
+            updated_peptides.append(copied)
             continue
 
-        seq = r.get("sequence", f"pep_{idx}")[:12]
-        score = r.get("score", r.get("hdock_score", "na"))
+        seq = (
+            copied.get("peptide_sequence")
+            or copied.get("sequence")
+            or f"pep_{idx}"
+        )
+        seq = str(seq)[:12].replace("/", "_")
 
-        png = out_dir / f"pep_{seq}_score{score}.png"
+        score = copied.get("hdock_score", copied.get("score", "na"))
+        score_tag = str(score).replace("-", "neg").replace(".", "p")
+
+        png = out_dir / f"pep_{seq}_score{score_tag}.png"
 
         res = render_peptide_snapshot_pymol(
             complex_pdb=complex_file,
@@ -594,12 +788,19 @@ def render_inhibitor_snapshots_for_results(state: dict) -> dict:
             title=f"Peptide: {seq} | score {score}",
         )
 
-        r["snapshot_valid"] = res.get("valid")
-        r["snapshot_png"] = res.get("image_file")
+        copied["snapshot_valid"] = res.get("valid")
+        copied["snapshot_png"] = res.get("image_file")
+        copied["snapshot_error"] = res.get("error")
 
         if res.get("valid"):
             image_files.append(res["image_file"])
 
+        updated_peptides.append(copied)
+
     log.info("Rendered %d inhibitor snapshots", len(image_files))
 
-    return {"inhibitor_snapshot_paths": image_files}
+    return {
+        "inhibitor_snapshot_paths": image_files,
+        "inhibitor_small_molecules": updated_small_molecules,
+        "inhibitor_peptides": updated_peptides,
+    }

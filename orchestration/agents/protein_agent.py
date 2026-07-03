@@ -76,7 +76,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def _normalise_pdb_id(value: Any) -> str:
     return str(value or "").strip().upper()
 
-
 def _failed_target_record(
     pdb_id: str,
     reason: str,
@@ -87,7 +86,6 @@ def _failed_target_record(
         "reason": reason or "unknown",
         "metadata": metadata or {},
     }
-
 
 def _dedupe_failed_targets(records: list[Any]) -> list:
     """
@@ -261,6 +259,7 @@ def _dedupe_partial_success_targets(records: list[Any]) -> list:
             rec = dict(item)
             rec["target_pdb"] = pdb
             rec["pdb_id"] = pdb
+            rec.setdefault("target_pdb_path", item.get("target_pdb_path"))
             rec.setdefault("status", PARTIAL_SUCCESS_TARGET_STATUS)
             rec.setdefault("reason", PARTIAL_REASON_HDOCK_INTERFACE)
             rec.setdefault("binding_units", "hdock_relative_score")
@@ -273,9 +272,17 @@ def _dedupe_partial_success_targets(records: list[Any]) -> list:
             if not pdb:
                 continue
 
+            resolved_path = None
+
+            try:
+                resolved_path = ensure_protein_pdb(pdb)
+            except Exception:
+                resolved_path = None
+
             seen[pdb] = {
                 "target_pdb": pdb,
                 "pdb_id": pdb,
+                "target_pdb_path": resolved_path,
                 "status": PARTIAL_SUCCESS_TARGET_STATUS,
                 "reason": "legacy_partial_success_target",
                 "binding_units": "hdock_relative_score",
@@ -290,6 +297,7 @@ def _build_partial_success_record(
     pdb_id: str,
     docking_results: list[dict],
     reason: str = PARTIAL_REASON_HDOCK_INTERFACE,
+    target_pdb_path: str | None = None,
 ) -> dict:
     """
     Build structured lower-confidence target record.
@@ -325,6 +333,7 @@ def _build_partial_success_record(
     return {
         "target_pdb": pdb_id,
         "pdb_id": pdb_id,
+        "target_pdb_path": target_pdb_path,
         "status": PARTIAL_SUCCESS_TARGET_STATUS,
         "reason": reason,
         "recommendation": "reuse_as_priority_candidate_but_not_final_target",
@@ -456,7 +465,6 @@ def _build_interface_preferences(
 
     return preferences
 
-
 def _dedupe_preferences(preferences: list[dict]) -> list:
     seen: set[tuple] = set()
     out: list[dict] = []
@@ -483,7 +491,6 @@ def _dedupe_preferences(preferences: list[dict]) -> list:
         out.append(pref)
 
     return out
-
 
 # ---------------------------------------------------------------------------
 # Sequence collection / fold gating
@@ -514,7 +521,6 @@ def _collect_sequences_for_protein(state: LabState, eval_top_n: int) -> list:
 
     return sequences
 
-
 def _fold_gate_blocks_protein(state: LabState) -> bool:
     """
     Return True if protein docking should be skipped due to fold failure.
@@ -539,7 +545,6 @@ def _fold_gate_blocks_protein(state: LabState) -> bool:
     )
 
     return not any_passed
-
 
 # ---------------------------------------------------------------------------
 # Target selection
@@ -1326,6 +1331,7 @@ def protein_agent(state: LabState) -> dict:
         # ------------------------------------------------------------
         # Try targets until one yields acceptable docking-valid results
         # ------------------------------------------------------------
+        chosen_pdb_path = None
         for pdb_id in candidate_pdbs:
             log.info("Trying protein target PDB: %s", pdb_id)
 
@@ -1827,8 +1833,10 @@ def protein_agent(state: LabState) -> dict:
 
             if dock_valid:
                 chosen_pdb = pdb_id
+                chosen_pdb_path = ensure_protein_pdb(pdb_id)
+
                 valid_binding_results = [
-                    {**r, "target_pdb": pdb_id}
+                    {**r, "target_pdb": pdb_id, "target_pdb_id": pdb_id, "target_pdb_path": chosen_pdb_path}
                     for r in dock_valid
                 ]
 
@@ -1840,8 +1848,9 @@ def protein_agent(state: LabState) -> dict:
 
             elif enhanced_results and not require_docking:
                 chosen_pdb = pdb_id
+                chosen_pdb_path = ensure_protein_pdb(pdb_id)
                 valid_binding_results = [
-                    {**r, "target_pdb": pdb_id}
+                    {**r, "target_pdb": pdb_id, "target_pdb_id": pdb_id, "target_pdb_path": chosen_pdb_path}
                     for r in enhanced_results
                 ]
 
@@ -1974,6 +1983,8 @@ def protein_agent(state: LabState) -> dict:
             "binding_results": valid_binding_results,
             "failed_sequences": failed_sequences,
             "target_pdb": chosen_pdb,
+            "target_pdb_id": chosen_pdb,
+            "target_pdb_path": chosen_pdb_path,
             "target_pdb_candidates": candidate_pdbs,
             "failed_target_pdbs": failed_targets,
             "partial_success_targets": partial_success_targets,
@@ -2034,6 +2045,16 @@ def protein_agent(state: LabState) -> dict:
             if interface_paths:
                 result.update(interface_paths)
 
+                if result.get("interface_contacts"):
+                    log.info(
+                        "protein_agent: interface_contacts added with %d residues",
+                        len(result["interface_contacts"].get("interface_residues", [])),
+                    )
+                else:
+                    log.warning(
+                        "protein_agent: interface analysis complete but interface_contacts is empty"
+                    )
+
                 require_interface_for_target_acceptance = _env_bool(
                     "VLAB_REQUIRE_INTERFACE_FOR_TARGET_ACCEPTANCE",
                     default=False,
@@ -2088,6 +2109,7 @@ def protein_agent(state: LabState) -> dict:
                                 pdb_id=chosen_pdb,
                                 docking_results=rows,
                                 reason=PARTIAL_REASON_HDOCK_INTERFACE,
+                                target_pdb_path=chosen_pdb_path or ensure_protein_pdb(chosen_pdb),
                             )
 
                             partial_success_targets = _dedupe_partial_success_targets(
@@ -2155,8 +2177,12 @@ def protein_agent(state: LabState) -> dict:
                             result.update(
                                 {
                                     "protein_analysis": summary,
-                                    # Important: not a final accepted target.
-                                    "target_pdb": None,
+
+                                    # Preserve usable target identity even though it is not fully accepted.
+                                    "target_pdb": _normalise_pdb_id(chosen_pdb),
+                                    "target_pdb_id": _normalise_pdb_id(chosen_pdb),
+                                    "target_pdb_path": chosen_pdb_path or ensure_protein_pdb(chosen_pdb),
+
                                     "failed_target_pdbs": failed_targets,
                                     "partial_success_targets": partial_success_targets,
                                     "partial_success_sequences": partial_success_sequences,
@@ -2168,6 +2194,9 @@ def protein_agent(state: LabState) -> dict:
                                     ),
                                     "target_status": PARTIAL_SUCCESS_TARGET_STATUS,
                                     "target_status_reason": PARTIAL_REASON_HDOCK_INTERFACE,
+                                    "interface_contacts": result.get("interface_contacts"),
+                                    "binding_units": "hdock_relative_score",
+                                    "binding_energy_is_physical": False,
                                     "stage_outputs": [
                                         record_stage_output(
                                             state,
@@ -2179,16 +2208,14 @@ def protein_agent(state: LabState) -> dict:
                                             ),
                                             metadata={
                                                 "target_pdb": chosen_pdb,
+                                                "target_pdb_id": _normalise_pdb_id(chosen_pdb),
+                                                "target_pdb_path": chosen_pdb_path or ensure_protein_pdb(chosen_pdb),
                                                 "target_status": PARTIAL_SUCCESS_TARGET_STATUS,
-                                                "target_status_reason": (
-                                                    PARTIAL_REASON_HDOCK_INTERFACE
-                                                ),
+                                                "target_status_reason": PARTIAL_REASON_HDOCK_INTERFACE,
                                                 "dock_valid_count": dock_valid_count,
                                                 "interface_clean_count": len(interface_clean),
                                                 "steric_clash_count": steric_clash_count,
-                                                "required_interface_clean": (
-                                                    min_valid_dockings_per_target
-                                                ),
+                                                "required_interface_clean": min_valid_dockings_per_target,
                                                 "require_interface_for_target_acceptance": True,
                                                 "binding_units": "hdock_relative_score",
                                                 "binding_energy_is_physical": False,
@@ -2271,6 +2298,7 @@ def protein_agent(state: LabState) -> dict:
                                     "target_pdb_selection_reason": selection_reason,
                                     "target_status": FAILED_TARGET_STATUS,
                                     "target_status_reason": FAILED_REASON_INSUFFICIENT_INTERFACE,
+                                    "interface_contacts": result.get("interface_contacts"),
                                     "stage_outputs": [
                                         record_stage_output(
                                             state,
@@ -2319,6 +2347,7 @@ def protein_agent(state: LabState) -> dict:
                         accepted_record = {
                             "target_pdb": _normalise_pdb_id(chosen_pdb),
                             "pdb_id": _normalise_pdb_id(chosen_pdb),
+                            "target_pdb_path": chosen_pdb_path or ensure_protein_pdb(chosen_pdb),
                             "status": ACCEPTED_TARGET_STATUS,
                             "reason": "interface_validated",
                             "dock_valid_count": dock_valid_count,
@@ -2349,7 +2378,11 @@ def protein_agent(state: LabState) -> dict:
                         result.update(
                             {
                                 "protein_analysis": summary,
-                                "target_pdb": chosen_pdb,
+
+                                "target_pdb": _normalise_pdb_id(chosen_pdb),
+                                "target_pdb_id": _normalise_pdb_id(chosen_pdb),
+                                "target_pdb_path": chosen_pdb_path or ensure_protein_pdb(chosen_pdb),
+
                                 "failed_target_pdbs": failed_targets,
                                 "partial_success_targets": partial_success_targets,
                                 "partial_success_sequences": partial_success_sequences,
@@ -2364,6 +2397,7 @@ def protein_agent(state: LabState) -> dict:
                                 "target_status_reason": "interface_validated",
                                 "binding_units": "hdock_relative_score",
                                 "binding_energy_is_physical": False,
+                                "interface_contacts": result.get("interface_contacts"),
                                 "stage_outputs": [
                                     record_stage_output(
                                         state,
