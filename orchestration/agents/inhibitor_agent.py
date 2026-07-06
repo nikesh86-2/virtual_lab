@@ -107,6 +107,64 @@ def _looks_like_pdb_id(value: Any) -> bool:
     raw = value.strip()
     return len(raw) == 4 and raw.isalnum()
 
+def _rna_pose_paths_from_state(state: dict) -> list:
+    """
+    Extract RNA-protein complex PDB paths from state.
+
+    Supports:
+      - binding_results rows
+      - direct path strings
+      - accidental dict records in rna_poses-like fields
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    candidates = []
+
+    # Primary source: protein_agent binding results
+    for r in state.get("binding_results", []) or []:
+        candidates.append(r)
+
+    # Defensive support if some pipeline state already has pose lists
+    for key in (
+        "rna_poses",
+        "rna_pose_files",
+        "rna_complexes",
+        "docking_snapshot_files",
+    ):
+        for item in state.get(key, []) or []:
+            candidates.append(item)
+
+    for item in candidates:
+        path = None
+
+        if isinstance(item, (str, os.PathLike)):
+            path = str(item)
+
+        elif isinstance(item, dict):
+            path = (
+                item.get("dock_complex_file")
+                or item.get("complex_file")
+                or item.get("complex_pdb")
+                or item.get("dock_complex_pdb")
+                or item.get("output_complex")
+            )
+
+        if not path:
+            continue
+
+        path = str(path)
+
+        if path in seen:
+            continue
+
+        if Path(path).exists():
+            seen.add(path)
+            out.append(path)
+        else:
+            log.debug("Skipping missing RNA pose path: %s", path)
+
+    return out
 
 def _resolve_target_pdb_from_state(state: dict) -> tuple[str | None, str | None]:
     """
@@ -174,18 +232,18 @@ def _resolve_target_pdb_from_state(state: dict) -> tuple[str | None, str | None]
 
 def _reset_selected_dir(path: str | Path, suffixes: tuple[str, ...]) -> None:
     """
-    Clear selected per-run input files without touching parent cache artifacts.
+    Fully clear selected per-run input directory.
+
+    This directory should contain only files intentionally selected for the
+    current inhibitor run. Removing the whole directory prevents stale ligand
+    or peptide files from previous runs inflating counts.
     """
     p = Path(path)
+
+    if p.exists():
+        shutil.rmtree(p, ignore_errors=True)
+
     p.mkdir(parents=True, exist_ok=True)
-
-    for child in p.iterdir():
-        if child.is_file() and child.name.endswith(suffixes):
-            try:
-                child.unlink()
-            except Exception as e:
-                log.debug("Could not remove selected input file %s: %s", child, e)
-
 
 def _compound_pdbqt_path(compound: dict) -> str | None:
     """
@@ -339,22 +397,42 @@ def _copy_selected_peptides(
     return copied
 
 
-def _dedupe_compounds(compounds: list[dict], max_count: int) -> list[dict]:
+def _dedupe_compounds(compounds: list[dict], max_count: int) -> list:
     """
-    Deduplicate compounds by SMILES if available, otherwise name/CID.
+    Deduplicate compounds robustly.
+
+    Priority:
+      1. SMILES, if present
+      2. PubChem CID, if present
+      3. normalised compound name
+
+    This prevents the same compound being counted multiple times when
+    metadata differs slightly across curated/PubChem sources.
     """
     out: list[dict] = []
-    seen: set[tuple] = set()
+    seen: set[tuple[str, str]] = set()
 
     for c in compounds or []:
         if not isinstance(c, dict):
             continue
 
-        key = (
-            c.get("smiles") or "",
-            c.get("cid") or c.get("pubchem_cid") or "",
-            c.get("name") or c.get("compound_name") or c.get("display_name") or "",
-        )
+        smiles = str(c.get("smiles") or "").strip()
+        cid = str(c.get("cid") or c.get("pubchem_cid") or "").strip()
+        name = str(
+            c.get("name")
+            or c.get("compound_name")
+            or c.get("display_name")
+            or ""
+        ).strip().lower()
+
+        if smiles:
+            key = ("smiles", smiles)
+        elif cid:
+            key = ("cid", cid)
+        elif name:
+            key = ("name", name)
+        else:
+            continue
 
         if key in seen:
             continue
@@ -366,7 +444,6 @@ def _dedupe_compounds(compounds: list[dict], max_count: int) -> list[dict]:
             break
 
     return out
-
 
 def _dedupe_peptide_specs(peptides: list[dict], max_count: int) -> list[dict]:
     """
@@ -393,24 +470,6 @@ def _dedupe_peptide_specs(peptides: list[dict], max_count: int) -> list[dict]:
             break
 
     return out
-
-
-def _rna_pose_paths_from_state(state: dict) -> list[dict]:
-    """
-    Extract existing RNA-protein complex pose paths from state.
-    """
-    out: list[dict] = []
-
-    for r in state.get("binding_results", []) or []:
-        if not isinstance(r, dict):
-            continue
-
-        path = r.get("dock_complex_file") or r.get("complex_file")
-        if path and Path(str(path)).exists():
-            out.append({"path": str(path)})
-
-    return out
-
 
 def _enrich_inhibitor_rows(
     rows: list[dict],
@@ -653,6 +712,16 @@ def inhibitor_agent(state: dict) -> dict:
             selected_ligand_dir,
         )
 
+        selected_ligand_files = sorted(Path(selected_ligand_dir).glob("*.pdbqt"))
+
+        log.warning(
+            "INHIBITOR_SELECTED_LIGANDS count=%d max=%d dir=%s files=%s",
+            len(selected_ligand_files),
+            max_small_mols,
+            selected_ligand_dir,
+            [p.name for p in selected_ligand_files],
+        )
+
         log.info(
             "inhibitor_agent: %d small molecules selected for docking",
             len(selected_small_mols),
@@ -766,6 +835,7 @@ def inhibitor_agent(state: dict) -> dict:
             peptide_pdb_dir=str(selected_peptide_dir),
             docking_box=docking_box,
             rna_poses=rna_poses,
+            max_small_molecules=max_small_mols,
         )
 
         small_mol_results = screen_result.get("small_molecules", []) or []

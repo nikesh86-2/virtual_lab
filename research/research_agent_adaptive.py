@@ -1,20 +1,10 @@
-"""
-research_agent_adaptive.py (FINAL – FULL INTEGRATION, HDOCK COMPATIBLE)
-
-Includes:
-- SFold + SimRNA multi-scale scoring
-- Binding proxy integration
-- ✅ HDOCK-aware docking scoring
-- Over-stability penalty
-- Conservation-aware scoring ✅
-- Adaptive NSGA-II compatibility
-"""
-
 from __future__ import annotations
-import time
+
 import logging
 import os
 import statistics
+import threading
+import time
 from typing import Dict, List
 
 import requests
@@ -35,41 +25,43 @@ _session = requests.Session()
 
 headers = {
     "x-api-key": SEMANTIC_SCHOLAR_API_KEY,
-    "User-Agent": "VirtualLab/1.0"
+    "User-Agent": "VirtualLab/1.0",
 }
 
-# ----------------------------------------------------------------------
-# CACHE
-# ----------------------------------------------------------------------
 _semantic_cache = {}
 
+
 def cached_semantic_search(query, limit):
-    if query in _semantic_cache:
-        return _semantic_cache[query]
+    cache_key = (str(query or "").strip().lower(), int(limit or 25))
+
+    if cache_key in _semantic_cache:
+        return _semantic_cache[cache_key]
 
     result = search_semantic_scholar(query, limit=limit)
 
     if result:
-        _semantic_cache[query] = result
+        _semantic_cache[cache_key] = result
 
     return result
 
-# ----------------------------------------------------------------------
-# EMBEDDINGS
-# ----------------------------------------------------------------------
+
 _model = None
+
 
 def get_embedding_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
+
         _model = SentenceTransformer(
             "sentence-transformers/all-MiniLM-L6-v2",
-            device="cpu"
+            device="cpu",
         )
     return _model
 
+
 from langchain_core.embeddings import Embeddings
+
 
 class CachedSentenceTransformerEmbeddings(Embeddings):
     def __init__(self):
@@ -81,26 +73,22 @@ class CachedSentenceTransformerEmbeddings(Embeddings):
     def embed_query(self, text):
         return self.model.encode([text], convert_to_numpy=True)[0].tolist()
 
-# ----------------------------------------------------------------------
-# OBJECTIVES
-# ----------------------------------------------------------------------
+
 OBJECTIVES = ["thermo", "structure", "motif", "binding", "kinetic", "conservation"]
 
-def fitness_vector(score: Dict) -> List[float]:
+
+def fitness_vector(score: Dict) -> List:
     return [score.get(k, 0.0) for k in OBJECTIVES]
 
-# ----------------------------------------------------------------------
-# MOTIF SCORE
-# ----------------------------------------------------------------------
+
 def _motif_score(seq: str) -> float:
     import re
+
     patterns = ["[AG]GAG", "[AG]AAG"]
     hits = sum(bool(re.search(p, seq)) for p in patterns)
     return hits / len(patterns)
 
-# ----------------------------------------------------------------------
-# CONSERVATION SCORE ✅
-# ----------------------------------------------------------------------
+
 def _conservation_score(seq: str, conservation_signal: Dict) -> float:
     if not conservation_signal:
         return 0.0
@@ -118,15 +106,11 @@ def _conservation_score(seq: str, conservation_signal: Dict) -> float:
 
     return score / max(1, length)
 
-# ----------------------------------------------------------------------
-# ✅ UPDATED SCORING FUNCTION (HDOCK SAFE)
-# ----------------------------------------------------------------------
-def score_sequence(seq, sf, md, weights, dock=None, conservation_signal=None):
 
+def score_sequence(seq, sf, md, weights, dock=None, conservation_signal=None):
     mfe = sf.get("mfe")
     sim_e = md.get("min_energy")
 
-    # ---------------- THERMO ----------------
     if sim_e is not None:
         thermo_raw = -sim_e
     elif mfe is not None:
@@ -134,39 +118,28 @@ def score_sequence(seq, sf, md, weights, dock=None, conservation_signal=None):
     else:
         thermo_raw = sf.get("pair_density", 0)
 
-    # ---------------- STRUCTURE ----------------
     pd = sf.get("pair_density") or 0.0
     bpp = sf.get("bpp_mean") or 0.0
     bp = md.get("base_pairs") or 0.0
 
     structure = 0.4 * pd + 0.4 * bpp + 0.2 * (bp / max(1, len(seq)))
 
-    # ---------------- KINETIC ----------------
     entropy = sf.get("ensemble_entropy") or 0.0
     fluct = md.get("energy_fluctuation") or 0.0
     kinetic = 0.5 * entropy + 0.5 * (1 / (1 + fluct))
 
-    # ---------------- MOTIF ----------------
     motif = _motif_score(seq)
 
-    # ---------------- ✅ BINDING (HDOCK AWARE) ----------------
     binding = 0.0
 
     if dock:
-        # ✅ NEW: HDOCK support
         if dock.get("dock_score") is not None:
             raw = float(dock["dock_score"])
-
-            # HDOCK ~ -200 to -400 typical range
-            # Map to smooth bounded signal
             binding = float(__import__("numpy").tanh(-raw / 100.0))
-
-        # ✅ fallback legacy Vina
         elif dock.get("binding_energy") is not None:
             raw = float(dock["binding_energy"])
             binding = float(__import__("numpy").tanh(-raw / 10.0))
 
-    # ---------------- CONSERVATION ----------------
     conservation = _conservation_score(seq, conservation_signal or {})
 
     return {
@@ -178,9 +151,7 @@ def score_sequence(seq, sf, md, weights, dock=None, conservation_signal=None):
         "conservation": conservation * weights.get("conservation", 1.0),
     }
 
-# ----------------------------------------------------------------------
-# ADAPTIVE WEIGHTS
-# ----------------------------------------------------------------------
+
 def update_weights(population_scores: List[Dict], current_weights: Dict, lr: float = 0.2) -> Dict:
     if not population_scores:
         return current_weights
@@ -188,10 +159,10 @@ def update_weights(population_scores: List[Dict], current_weights: Dict, lr: flo
     sorted_pop = sorted(
         population_scores,
         key=lambda x: sum(x.get(k, 0) for k in OBJECTIVES),
-        reverse=True
+        reverse=True,
     )
 
-    top = sorted_pop[: max(1, len(sorted_pop)//3)]
+    top = sorted_pop[: max(1, len(sorted_pop) // 3)]
 
     avg = {
         k: statistics.mean(p.get(k, 0) for p in top)
@@ -206,18 +177,17 @@ def update_weights(population_scores: List[Dict], current_weights: Dict, lr: flo
         for k in OBJECTIVES
     }
 
-    MIN_WEIGHT = 0.05
+    min_weight = 0.05
     for k in new_weights:
-        new_weights[k] = max(new_weights[k], MIN_WEIGHT)
+        new_weights[k] = max(new_weights[k], min_weight)
 
     total = sum(new_weights.values())
     return {k: v / total for k, v in new_weights.items()}
 
-# ----------------------------------------------------------------------
-# INITIALISATION
-# ----------------------------------------------------------------------
+
 def build_initial_weights() -> Dict:
     return {k: 1.0 for k in OBJECTIVES}
+
 
 def initialise_system(topic: str) -> Dict:
     return {
@@ -225,13 +195,11 @@ def initialise_system(topic: str) -> Dict:
         "weights": build_initial_weights(),
     }
 
-# ----------------------------------------------------------------------
-# RATE LIMIT
-# ----------------------------------------------------------------------
-import threading
+
 _last_call_time = 0
 _lock = threading.Lock()
 MIN_INTERVAL = 1.0
+
 
 def rate_limited_get(url, **kwargs):
     global _last_call_time
@@ -247,34 +215,47 @@ def rate_limited_get(url, **kwargs):
 
     return resp
 
-# ----------------------------------------------------------------------
-# SEARCH FUNCTIONS (UNCHANGED)
-# ----------------------------------------------------------------------
+
+def _faiss_index_path() -> str:
+    try:
+        from VLAB2.research.streaming_literature_agent import get_faiss_index_path
+
+        return get_faiss_index_path()
+    except Exception:
+        return (
+            os.getenv("VLAB_FAISS_INDEX_PATH")
+            or os.getenv("FAISS_INDEX_PATH")
+            or os.path.join(os.path.dirname(__file__), "..", "cache", "faiss_index")
+        )
+
+
 def search_local_db(query: str) -> List:
     try:
         from langchain_community.vectorstores import FAISS
-        import os
 
-        index_path = os.path.join(
-            os.path.dirname(__file__), "..", "cache", "faiss_index"
-        )
+        index_path = _faiss_index_path()
 
         if not os.path.exists(index_path):
             return []
 
         embeddings = CachedSentenceTransformerEmbeddings()
-        db = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+        db = FAISS.load_local(
+            index_path,
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
         return db.similarity_search(query, k=10)
 
     except Exception as e:
         log.warning("Local DB error: %s", e)
         return []
 
-def search_semantic_scholar(query: str, limit: int = 25) -> List[Dict]:
+
+def search_semantic_scholar(query: str, limit: int = 25) -> List:
     params = {
         "query": query,
         "limit": min(limit, 100),
-        "fields": "title,abstract,year",
+        "fields": "title,abstract,year,url,externalIds",
     }
 
     for attempt in range(5):
@@ -283,7 +264,7 @@ def search_semantic_scholar(query: str, limit: int = 25) -> List[Dict]:
                 SEMANTIC_SCHOLAR_API_URL,
                 params=params,
                 headers=headers,
-                timeout=10
+                timeout=10,
             )
 
             if resp.status_code == 429:
@@ -295,7 +276,23 @@ def search_semantic_scholar(query: str, limit: int = 25) -> List[Dict]:
                 continue
 
             resp.raise_for_status()
-            return resp.json().get("data", [])
+            data = resp.json().get("data", []) or []
+
+            out = []
+            for p in data:
+                ext = p.get("externalIds") or {}
+                row = {
+                    "title": p.get("title"),
+                    "abstract": p.get("abstract"),
+                    "year": p.get("year"),
+                    "url": p.get("url"),
+                    "doi": ext.get("DOI"),
+                    "pmid": ext.get("PubMed"),
+                    "source": "semantic_scholar",
+                }
+                out.append(row)
+
+            return out
 
         except Exception as e:
             log.warning("Semantic Scholar error: %s", e)
@@ -303,41 +300,49 @@ def search_semantic_scholar(query: str, limit: int = 25) -> List[Dict]:
 
     return []
 
-# ----------------------------------------------------------------------
-# EXPAND KNOWLEDGE ✅
-# ----------------------------------------------------------------------
+
 def expand_knowledge(topic: str, build_db: bool = False) -> List:
     papers = cached_semantic_search(topic, limit=25)
 
     if build_db and papers:
         try:
-            from langchain_community.vectorstores import FAISS
             from langchain_core.documents import Document
+            from VLAB2.research.streaming_literature_agent import append_to_faiss
 
-            docs = [
-                Document(
-                    page_content=p.get("abstract") or p.get("title") or "",
-                    metadata={
-                        "title": p.get("title", ""),
-                        "year": p.get("year")
-                    }
+            docs = []
+
+            for p in papers:
+                title = p.get("title") or ""
+                abstract = p.get("abstract") or ""
+                text = f"{title}\n\n{abstract}".strip()
+
+                if not text:
+                    continue
+
+                doi = p.get("doi") or p.get("DOI")
+                year = p.get("year")
+
+                docs.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "title": title,
+                            "abstract": abstract,
+                            "year": year,
+                            "doi": doi,
+                            "url": p.get("url"),
+                            "source": p.get("source", "semantic_scholar"),
+                            "query": topic,
+                            "search_query": topic,
+                        },
+                    )
                 )
-                for p in papers
-                if p.get("abstract") or p.get("title")
-            ]
 
             if docs:
-                embeddings = CachedSentenceTransformerEmbeddings()
-                db = FAISS.from_documents(docs, embeddings)
-
-                index_path = os.path.join(
-                    os.path.dirname(__file__), "..", "cache", "faiss_index"
-                )
-
-                db.save_local(index_path)
-                log.info("FAISS rebuilt with %d docs", len(docs))
+                added = append_to_faiss(docs)
+                log.info("FAISS appended with %d docs for topic '%s'", added, topic)
 
         except Exception as e:
-            log.warning("FAISS rebuild failed: %s", e)
+            log.warning("FAISS append failed: %s", e)
 
     return papers
