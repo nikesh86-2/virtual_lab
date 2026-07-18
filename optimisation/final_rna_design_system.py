@@ -25,7 +25,7 @@ import random
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
-
+from pathlib import Path
 import numpy as np
 
 from pymoo.core.problem import Problem
@@ -77,6 +77,7 @@ OBJECTIVES = [
     "kinetic",
     "conservation",
     "diversity",
+    "interface"
 ]
 
 DEFAULT_SEQ_LEN = int(os.getenv("VLAB_RNA_SEQ_LEN", "40"))
@@ -264,21 +265,48 @@ def _norm_lookup_key(seq: str) -> Optional[str]:
     s = _clean_rna(seq)
     return s or None
 
+def _normalise_target_key(value: Any) -> str:
+    """
+    Convert:
 
-def _sequence_match_lookup(seq: str, lookup: dict) -> Any:
+        6M71
+        6m71
+        /tmp/proteins/6M71.pdb
+        C:\\data\\6M71.pdb
+
+    into:
+
+        6M71
+    """
+
+    text = str(value or "").strip()
+
+    if not text:
+        return ""
+
+    try:
+        text = Path(text).stem
+    except Exception:
+        pass
+
+    return text.upper()
+
+def _sequence_match_lookup(
+    seq: str,
+    lookup: dict,
+) -> Any:
+    """
+    Exact sequence lookup only.
+
+    Docking, interface and MD results should only be reused when the
+    sequence was actually evaluated.
+    """
     key = _norm_lookup_key(seq)
 
     if not key:
         return None
 
-    if key in lookup:
-        return lookup[key]
-
-    for k, v in lookup.items():
-        if key.startswith(k) or k.startswith(key):
-            return v
-
-    return None
+    return lookup.get(key)
 
 
 def build_md_lookup(state: dict) -> dict:
@@ -890,6 +918,262 @@ def run_hdock_once(seq: str, rna_pdb: str, target_pdb: str) -> Optional[float]:
         return None
 
 
+# ==============================================================================
+# Module-Level Interface Helpers
+# ==============================================================================
+
+CLASH_SEVERITY_PENALTIES = {
+    "none": 0.0,
+    "unknown": 0.10,
+    "borderline": 0.25,
+    "moderate": 0.60,
+    "severe": 1.00,
+}
+
+
+def _normalise_fraction(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+    """
+    Normalise a fraction- or percentage-like value into [0,1].
+    """
+    parsed = _safe_float(value, default)
+
+    if parsed is None:
+        return default
+
+    if parsed > 1.0:
+        parsed /= 100.0
+
+    return max(0.0, min(1.0, parsed))
+
+
+def interface_row_score(row: dict) -> Tuple[float, dict]:
+    """
+    Convert measured interface evidence into a signed NSGA objective.
+
+    Returns (score, details). The details dict includes "known": True only
+    when the evidence is from current-state measurements (not a prior).
+    """
+
+    if not isinstance(row, dict):
+        return 0.0, {
+            "known": False,
+            "reason": "invalid_row",
+        }
+
+    dock_valid = (
+        row.get("dock_valid") is True
+        or row.get("vina_valid") is True
+    )
+
+    if not dock_valid:
+        return 0.0, {
+            "known": False,
+            "reason": "dock_not_valid",
+        }
+
+    passed = row.get("interface_passed")
+    clash_raw = row.get("interface_steric_clash")
+
+    has_interface_evidence = any(
+        row.get(key) is not None
+        for key in (
+            "interface_passed",
+            "interface_steric_clash",
+            "interface_quality_score",
+            "interface_min_distance_A",
+            "interface_rna_span_covered",
+            "interface_clash_severity",
+        )
+    )
+
+    if not has_interface_evidence:
+        return 0.0, {
+            "known": False,
+            "reason": "interface_not_analysed",
+            "dock_valid": True,
+        }
+
+    clash = clash_raw is True
+    clean = passed is True and not clash
+
+    severity = str(
+        row.get("interface_clash_severity")
+        or ("moderate" if clash else "none")
+    ).strip().lower()
+
+    severity_penalty = CLASH_SEVERITY_PENALTIES.get(
+        severity,
+        CLASH_SEVERITY_PENALTIES["unknown"],
+    )
+
+    quality = _normalise_fraction(
+        row.get("interface_quality_score"),
+        0.0,
+    )
+
+    span = _normalise_fraction(
+        row.get("interface_rna_span_covered"),
+        0.0,
+    )
+
+    score = (
+        0.55 * quality
+        + 0.20 * span
+        + (0.35 if passed is True else 0.0)
+        + (0.25 if clean else 0.0)
+    )
+
+    if passed is False:
+        score -= 0.35
+
+    if clash:
+        score -= 0.55
+
+    score -= 0.75 * severity_penalty
+    score = max(-1.5, min(1.5, score))
+
+    return score, {
+        "known": True,
+        "clean": clean,
+        "dock_valid": True,
+        "interface_passed": passed,
+        "steric_clash": clash,
+        "clash_severity": severity,
+        "clash_severity_penalty": severity_penalty,
+        "quality": quality,
+        "rna_span_covered": span,
+        "score": score,
+    }
+
+
+def build_interface_lookup(
+    state: dict,
+    target_pdb: str | None = None,
+) -> dict:
+    """
+    Build an exact current-state interface lookup by RNA sequence.
+
+    Filters to only known (measured) interface evidence, not priors.
+    """
+
+    lookup: dict[str, dict] = {}
+    requested_target = _normalise_target_key(target_pdb)
+
+    for row in state.get("binding_results", []) or []:
+        if not isinstance(row, dict):
+            continue
+
+        seq = _norm_lookup_key(row.get("sequence"))
+
+        if not seq:
+            continue
+
+        row_target = _normalise_target_key(
+            row.get("target_pdb")
+            or row.get("target_pdb_id")
+        )
+
+        if (
+            requested_target
+            and row_target
+            and row_target != requested_target
+        ):
+            continue
+
+        value, details = interface_row_score(row)
+
+        if not details.get("known"):
+            continue
+
+        candidate = {
+            "score": value,
+            "details": details,
+            "row": row,
+            "source": "current_state",
+            "target_pdb": row_target,
+        }
+
+        existing = lookup.get(seq)
+
+        if existing is None:
+            lookup[seq] = candidate
+            continue
+
+        candidate_rank = (
+            bool(details.get("clean")),
+            float(value),
+            float(details.get("quality") or 0.0),
+        )
+
+        existing_details = existing.get("details") or {}
+
+        existing_rank = (
+            bool(existing_details.get("clean")),
+            float(existing.get("score") or 0.0),
+            float(existing_details.get("quality") or 0.0),
+        )
+
+        if candidate_rank > existing_rank:
+            lookup[seq] = candidate
+
+    return lookup
+
+
+def mutate_sequence_locally(
+    seq: str,
+    n_mutations: int = 1,
+) -> str:
+    """
+    Create a mutant of seq with n_mutations random point mutations.
+    """
+    seq = _clean_rna(seq)
+    if not seq:
+        return ""
+
+    seq_list = list(seq)
+    mutation_positions = random.sample(
+        range(len(seq_list)),
+        min(n_mutations, len(seq_list))
+    )
+
+    for pos in mutation_positions:
+        current = seq_list[pos]
+        choices = [n for n in NUCLEOTIDES if n != current]
+        if choices:
+            seq_list[pos] = random.choice(choices)
+
+    return "".join(seq_list)
+
+
+def sequence_composition_entropy(seq: str) -> float:
+    """
+    Compute Shannon entropy of nucleotide composition.
+
+    Low entropy = repetitive/homogeneous.
+    High entropy = diverse bases.
+    """
+    seq = _clean_rna(seq)
+    if not seq:
+        return 0.0
+
+    n = len(seq)
+    counts = {}
+
+    for nt in seq:
+        counts[nt] = counts.get(nt, 0) + 1
+
+    entropy = 0.0
+    for count in counts.values():
+        p = count / n
+        if p > 0:
+            entropy -= p * math.log2(p)
+
+    return entropy / math.log2(4)  # Normalize to [0, 1]
+
+
 def run_system(
     topic: str,
     target_pdb: Optional[str] = None,
@@ -911,22 +1195,65 @@ def run_system(
         or state.get("bioinfo_conservation")
         or {}
     )
-    conservation_signal = _normalise_conservation_signal(raw_conservation)
 
-    mutation_bias = state.get("mutation_bias") or build_initial_weights()
+    conservation_signal = _normalise_conservation_signal(
+        raw_conservation
+    )
+
+    mutation_bias = (
+        state.get("mutation_bias")
+        or build_initial_weights()
+    )
+
     dock_cache = state.setdefault("_dock_cache", {})
 
     binding_lookup = build_binding_lookup(state)
     md_lookup = build_md_lookup(state)
 
+    interface_lookup = build_interface_lookup(
+        state,
+        target_pdb=target_pdb,
+    )
+
+    failure_memory = FailureMemory()
+    failure_memory.merge_state_memory(state)
+    failure_memory.save()
+    failure_weights = (
+        failure_memory.compute_failure_weights()
+    )
+
+    state["_run_system_interface_objective_enabled"] = True
+    state["_run_system_interface_lookup_count"] = len(interface_lookup)
+
+    state["_run_system_interface_failure_weights"] = {
+        "interface_pressure": failure_weights.get(
+            "interface_pressure",
+            0.0,
+        ),
+        "clash_avoidance_pressure": failure_weights.get(
+            "clash_avoidance_pressure",
+            0.0,
+        ),
+        "target_specific_exploitation": failure_weights.get(
+            "target_specific_exploitation",
+            0.0,
+        ),
+    }
+
     log.info(
-        "[NSGA] seq_len=%s conservation_valid=%s target_pdb=%s min_pd=%.3f min_mfe_nt=%.3f motifs=%s",
+        "[NSGA] seq_len=%s conservation_valid=%s target_pdb=%s "
+        "min_pd=%.3f min_mfe_nt=%.3f motifs=%s "
+        "interface_rows=%d interface_pressure=%.3f "
+        "clash_pressure=%.3f",
         seq_len,
         conservation_signal.get("valid"),
         target_pdb,
         MIN_ACCEPT_PAIR_DENSITY,
         MIN_ACCEPT_MFE_PER_NT,
         parse_target_motifs(),
+        len(interface_lookup),
+        float(failure_weights.get("interface_pressure", 0.0)),
+        float(failure_weights.get("clash_avoidance_pressure", 0.0)),
     )
 
     def random_seq() -> str:
@@ -955,6 +1282,77 @@ def run_system(
         if s_norm:
             initial_sequences.append(s_norm)
 
+    # Collect clean interface seeds separately.
+    clean_interface_seeds = []
+    clash_interface_seeds = []
+
+    # Target-specific interface exploitation seeds.
+    for row in state.get("binding_results", []) or []:
+        if not isinstance(row, dict):
+            continue
+
+        row_target = _normalise_target_key(
+            row.get("target_pdb")
+            or row.get("target_pdb_id")
+        )
+
+        requested_target = _normalise_target_key(target_pdb)
+
+        if requested_target and row_target and row_target != requested_target:
+            continue
+
+        if row.get("dock_valid") is not True:
+            continue
+
+        interface_passed = row.get("interface_passed") is True
+        clash = row.get("interface_steric_clash") is True
+
+        if interface_passed and not clash:
+            # Clean pose
+            s_norm = normalise_sequence(
+                row.get("sequence", ""),
+                seq_len,
+            )
+            if s_norm:
+                clean_interface_seeds.append(s_norm)
+        elif interface_passed or clash:
+            # Clash pose
+            s_norm = normalise_sequence(
+                row.get("sequence", ""),
+                seq_len,
+            )
+            if s_norm:
+                clash_interface_seeds.append(s_norm)
+
+    # Add all clean seeds
+    initial_sequences.extend(clean_interface_seeds)
+
+    # Add at most one clash seed
+    if clash_interface_seeds:
+        initial_sequences.append(clash_interface_seeds[0])
+
+    # Add local mutations around clean seeds
+    for clean_seq in clean_interface_seeds:
+        for n_mutations in (1, 1, 2):
+            mutant = mutate_sequence_locally(
+                clean_seq,
+                n_mutations=n_mutations,
+            )
+
+            mutant = normalise_sequence(
+                mutant,
+                seq_len,
+            )
+
+            if mutant:
+                initial_sequences.append(mutant)
+
+    for seq in failure_memory.get_partial_success_sequences():
+        s_norm = normalise_sequence(seq, seq_len)
+
+        if s_norm:
+            initial_sequences.append(s_norm)
+
     consensus = conservation_signal.get("consensus")
     if consensus:
         s_norm = normalise_sequence(consensus, seq_len)
@@ -974,19 +1372,57 @@ def run_system(
                 if seeded:
                     initial_sequences.append(seeded)
 
-    initial_sequences = deduplicate_sequences(initial_sequences, seq_len)
+    # Preserve one- and two-base interface-neighbour mutants here. Near-
+    # duplicate pruning is intentionally deferred until final output selection.
+    initial_sequences = deduplicate_sequences(
+        initial_sequences,
+        seq_len,
+        near_duplicates=False,
+    )
 
-    while len(initial_sequences) < POP_SIZE:
+    attempts = 0
+    max_seed_attempts = max(1000, POP_SIZE * 100)
+
+    while len(initial_sequences) < POP_SIZE and attempts < max_seed_attempts:
         initial_sequences.append(random_seq())
-        initial_sequences = deduplicate_sequences(initial_sequences, seq_len)
+        initial_sequences = deduplicate_sequences(
+            initial_sequences,
+            seq_len,
+            near_duplicates=False,
+        )
+        attempts += 1
+
+    if len(initial_sequences) < POP_SIZE:
+        raise RuntimeError(
+            f"Could not generate {POP_SIZE} exact-unique RNA seeds; "
+            f"generated {len(initial_sequences)}"
+        )
 
     class SeededSampling(Sampling):
         def _do(self, problem, n_samples, **kwargs):
-            unique = deduplicate_sequences(initial_sequences, seq_len)
+            unique = deduplicate_sequences(
+                initial_sequences,
+                seq_len,
+                near_duplicates=False,
+            )
 
-            while len(unique) < n_samples:
+            attempts = 0
+            max_attempts = max(1000, n_samples * 100)
+
+            while len(unique) < n_samples and attempts < max_attempts:
                 unique.append(random_seq())
-                unique = deduplicate_sequences(unique, seq_len)
+                unique = deduplicate_sequences(
+                    unique,
+                    seq_len,
+                    near_duplicates=False,
+                )
+                attempts += 1
+
+            if len(unique) < n_samples:
+                raise RuntimeError(
+                    f"Could not generate {n_samples} exact-unique RNA seeds; "
+                    f"generated {len(unique)}"
+                )
 
             encoded = [encode_sequence(s, seq_len) for s in unique[:n_samples]]
             return np.stack(encoded)
@@ -1001,7 +1437,7 @@ def run_system(
                 type_var=int,
             )
             self.last_scores = {}
-            self.fm = FailureMemory()
+            self.fm = failure_memory
 
         def _evaluate(self, X, out, *args, **kwargs):
             penalty = 1e3
@@ -1078,13 +1514,70 @@ def run_system(
                     binding_signal = _sequence_match_lookup(seq, binding_lookup)
                     if binding_signal is not None:
                         score["binding"] = (
-                            np.tanh(float(binding_signal) / 10.0)
+                            np.log1p(max(0.0, binding_signal)) / np.log1p(400.0)
                             * mutation_bias.get("binding", 1.0)
                         )
 
+                    # ------------------------------------------------------------
+                    # Interface / clash objective
+                    # ------------------------------------------------------------
+                    interface_key = _norm_lookup_key(seq)
+
+                    exact_interface = (
+                        interface_lookup.get(interface_key)
+                        if interface_key
+                        else None
+                    )
+
+                    interface_value = 0.0
+                    interface_details = {
+                        "known": False,
+                        "reason": "no_interface_evidence",
+                        "target_pdb": target_pdb,
+                    }
+
+                    if isinstance(exact_interface, dict):
+                        interface_value = float(
+                            exact_interface.get("score") or 0.0
+                        )
+                        interface_details = dict(
+                            exact_interface.get("details") or {}
+                        )
+                        interface_details["source"] = exact_interface.get(
+                            "source",
+                            "current_state",
+                        )
+                        interface_details["target_pdb"] = exact_interface.get(
+                            "target_pdb",
+                            target_pdb,
+                        )
+
+                    else:
+                        prior = self.fm.get_interface_prior(
+                            seq,
+                            target_pdb=target_pdb,
+                        )
+
+                        if prior.get("known"):
+                            interface_value = float(
+                                prior.get("score") or 0.0
+                            )
+                            interface_details = {
+                                **prior,
+                                "source": "failure_memory_prior",
+                            }
+
+                    score["interface"] = interface_value
+                    score["interface_evidence_known"] = bool(
+                        interface_details.get("known", False)
+                    )
+                    score["interface_evidence"] = interface_details
+                    score["interface_raw"] = interface_value
+
                     score["diversity"] = (
-                        len(set(seq)) / max(1, len(seq))
-                    ) * mutation_bias.get("diversity", 1.0)
+                        sequence_composition_entropy(seq)
+                        * mutation_bias.get("diversity", 1.0)
+                    )
 
                     score["rna_stability"] = stability_signal
                     score["rna_stability_details"] = stability_details
@@ -1101,7 +1594,12 @@ def run_system(
 
                         for k, v in extra_objectives.items():
                             if k in OBJECTIVES:
-                                score[k] = score.get(k, 0.0) + scale * float(v)
+                                score[k] = float(score.get(k, 0.0)) + scale * float(v)
+
+                    # Keep the signed interface objective interpretable and
+                    # comparable across runs after memory-pressure amplification.
+                    score["interface_unbounded"] = float(score.get("interface", 0.0))
+                    score["interface"] = math.tanh(score["interface_unbounded"])
 
                     self.last_scores[seq] = score
 
@@ -1121,6 +1619,8 @@ def run_system(
                     + item[1].get("motif", 0.0)
                     + item[1].get("conservation", 0.0)
                     + item[1].get("rna_stability", 0.0)
+                    + 0.60 * item[1].get("interface", 0.0)
+                    + 0.60 * item[1].get("binding", 0.0)
                 ),
                 reverse=True,
             )[:SELECTIVE_DOCK_TOP_K]
@@ -1158,7 +1658,7 @@ def run_system(
                     binding_lookup[_norm_lookup_key(seq)] = binding_signal
 
                     self.last_scores[seq]["binding"] = (
-                        np.tanh(binding_signal / 10.0)
+                        np.log1p(max(0.0, binding_signal)) / np.log1p(400.0)
                         * mutation_bias.get("binding", 1.0)
                     )
                     self.last_scores[seq]["dock_score"] = dock_score
@@ -1243,6 +1743,53 @@ def run_system(
     else:
         new_weights = mutation_bias
 
+    sequence_scores: dict[str, dict] = {}
+
+    for ind in final_population:
+        seq = decode_sequence(ind.X)
+        score = problem.last_scores.get(seq) or {}
+        sequence_scores[seq] = {
+            "thermo": float(score.get("thermo", 0.0)),
+            "structure": float(score.get("structure", 0.0)),
+            "motif": float(score.get("motif", 0.0)),
+            "binding": float(score.get("binding", 0.0)),
+            "kinetic": float(score.get("kinetic", 0.0)),
+            "conservation": float(score.get("conservation", 0.0)),
+            "diversity": float(score.get("diversity", 0.0)),
+            "interface": float(score.get("interface", 0.0)),
+            "interface_raw": float(score.get("interface_raw", 0.0)),
+            "interface_unbounded": float(score.get("interface_unbounded", 0.0)),
+            "interface_evidence_known": bool(
+                score.get("interface_evidence_known", False)
+            ),
+            "interface_evidence": score.get("interface_evidence") or {},
+            "fold_thresholds_passed": bool(
+                score.get("fold_thresholds_passed", False)
+            ),
+            "dock_score": score.get("dock_score"),
+        }
+
+    best_interface_sequence = None
+    interface_candidates = [
+        (seq, data)
+        for seq, data in sequence_scores.items()
+        if data.get("interface_evidence_known")
+        and float(data.get("interface", 0.0)) > 0.0
+        and data.get("fold_thresholds_passed")
+    ]
+
+    if interface_candidates:
+        best_interface_sequence = max(
+            interface_candidates,
+            key=lambda item: (
+                float(item[1].get("interface", 0.0)),
+                float(item[1].get("binding", 0.0)),
+                float(item[1].get("structure", 0.0)),
+            ),
+        )[0]
+
+    state["_run_system_sequence_scores"] = sequence_scores
+    state["_run_system_best_interface_sequence"] = best_interface_sequence
     state["_run_system_final_weights"] = new_weights
     state["_run_system_seq_len"] = seq_len
     state["_run_system_conservation_valid"] = conservation_signal.get("valid", False)

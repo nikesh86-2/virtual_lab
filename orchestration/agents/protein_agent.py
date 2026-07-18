@@ -178,6 +178,84 @@ def _has_steric_clash(row: dict) -> bool:
     return isinstance(row, dict) and row.get("interface_steric_clash") is True
 
 
+def _signed_interface_score(row: dict) -> float:
+    """Return a bounded signed interface score for optimisation feedback."""
+    if not isinstance(row, dict) or row.get("dock_valid") is not True:
+        return 0.0
+
+    has_evidence = any(
+        row.get(key) is not None
+        for key in (
+            "interface_passed",
+            "interface_steric_clash",
+            "interface_quality_score",
+            "interface_rna_span_covered",
+            "interface_clash_severity",
+        )
+    )
+    if not has_evidence:
+        return 0.0
+
+    def _fraction(value: Any) -> float:
+        try:
+            value = float(value or 0.0)
+        except Exception:
+            value = 0.0
+        if value > 1.0:
+            value /= 100.0
+        return max(0.0, min(1.0, value))
+
+    quality = _fraction(row.get("interface_quality_score"))
+    span = _fraction(row.get("interface_rna_span_covered"))
+    passed = row.get("interface_passed") is True
+    clash = row.get("interface_steric_clash") is True
+    clean = passed and not clash
+    severity = str(
+        row.get("interface_clash_severity")
+        or ("moderate" if clash else "none")
+    ).strip().lower()
+    severity_penalty = {
+        "none": 0.0,
+        "unknown": 0.10,
+        "borderline": 0.25,
+        "moderate": 0.60,
+        "severe": 1.00,
+    }.get(severity, 0.10)
+
+    score = (
+        0.55 * quality
+        + 0.20 * span
+        + (0.35 if passed else 0.0)
+        + (0.25 if clean else 0.0)
+    )
+    if row.get("interface_passed") is False:
+        score -= 0.35
+    if clash:
+        score -= 0.55
+    score -= 0.75 * severity_penalty
+    return max(-1.5, min(1.5, score))
+
+
+def _best_interface_clean_row(rows: list[dict]) -> dict | None:
+    """Choose the best measured clean pose using rank then HDOCK score."""
+    clean_rows = [row for row in rows if _has_clean_interface(row)]
+    if not clean_rows:
+        return None
+
+    def _key(row: dict) -> tuple[float, float]:
+        try:
+            rank = float(safe_binding_rank(row))
+        except Exception:
+            rank = 1e9
+        try:
+            hdock = float(row.get("dock_score", row.get("hdock_score", 1e9)))
+        except Exception:
+            hdock = 1e9
+        return rank, hdock
+
+    return min(clean_rows, key=_key)
+
+
 def _get_hdock_relative_score(row: dict) -> float | None:
     if not isinstance(row, dict):
         return None
@@ -501,25 +579,25 @@ def _collect_sequences_for_protein(state: LabState, eval_top_n: int) -> list:
     Collect RNA sequences for protein/docking evaluation.
 
     Priority:
-      1. target_sequence
-      2. designed_sequences
-      3. structural_candidates
+      1. NSGA-promoted positive-interface sequence
+      2. best previously measured clean-interface sequence
+      3. current target_sequence
+      4. designed_sequences
+      5. structural_candidates
     """
-    sequences = []
-
-    if state.get("target_sequence"):
-        sequences.append(state["target_sequence"])
-
+    sequences = [
+        state.get("_run_system_best_interface_sequence"),
+        state.get("best_interface_clean_sequence"),
+        state.get("target_sequence"),
+    ]
     sequences.extend(state.get("designed_sequences", []) or [])
 
     for candidate in state.get("structural_candidates", []) or []:
         if isinstance(candidate, dict) and candidate.get("sequence"):
             sequences.append(candidate["sequence"])
 
-    sequences = dedupe_rna_sequences(sequences)[:eval_top_n]
-    sequences = [s for s in sequences if s]
-
-    return sequences
+    sequences = dedupe_rna_sequences([seq for seq in sequences if seq])
+    return sequences[:eval_top_n]
 
 def _fold_gate_blocks_protein(state: LabState) -> bool:
     """
@@ -1093,7 +1171,10 @@ def protein_agent(state: LabState) -> dict:
     try:
         require_docking = os.getenv("VLAB_REQUIRE_DOCKING", "1").strip() == "1"
         docking_backend = os.getenv("VLAB_DOCKING_BACKEND", "hdock").strip().lower()
-        eval_top_n = getenv_int("VLAB_AGENT_EVAL_TOP_N", 3, min_value=1)
+        # Evaluate three RNAs by default. Operators may set 2 for a faster run;
+        # values outside 2-3 are bounded to keep interface validation predictable.
+        eval_top_n = getenv_int("VLAB_AGENT_EVAL_TOP_N", 3, min_value=2)
+        eval_top_n = min(3, max(2, eval_top_n))
 
         max_dockings_per_target = getenv_int(
             "VLAB_MAX_DOCKINGS_PER_TARGET",
@@ -2065,15 +2146,32 @@ def protein_agent(state: LabState) -> dict:
                     if isinstance(r, dict)
                 ]
 
-                # Add explicit row-level training labels after interface metrics exist.
+                # Add authoritative row-level interface fields after metrics exist.
                 for row in rows:
                     row["training_label"] = _classify_docking_training_label(row)
                     row["binding_units"] = "hdock_relative_score"
                     row["binding_energy_is_physical"] = False
+                    row["interface_clean"] = _has_clean_interface(row)
+                    row["interface_evidence_known"] = any(
+                        row.get(key) is not None
+                        for key in (
+                            "interface_passed",
+                            "interface_steric_clash",
+                            "interface_quality_score",
+                            "interface_rna_span_covered",
+                            "interface_clash_severity",
+                        )
+                    )
+                    row["interface_signed_score"] = _signed_interface_score(row)
 
                 dock_valid_count = sum(1 for r in rows if _is_dock_valid_row(r))
                 interface_clean = [r for r in rows if _has_clean_interface(r)]
                 steric_clash_count = sum(1 for r in rows if _has_steric_clash(r))
+                best_clean_row = _best_interface_clean_row(rows)
+                best_interface_clean_sequence = (
+                    best_clean_row.get("sequence") if best_clean_row else None
+                )
+                result["best_interface_clean_sequence"] = best_interface_clean_sequence
 
                 # Build preference data regardless of final target acceptance.
                 new_preferences = _build_interface_preferences(
@@ -2128,25 +2226,9 @@ def protein_agent(state: LabState) -> dict:
                                 )
                             )
 
-                            failure_record = _failed_target_record(
-                                chosen_pdb,
-                                PARTIAL_REASON_HDOCK_INTERFACE,
-                                {
-                                    "status": PARTIAL_SUCCESS_TARGET_STATUS,
-                                    "dock_valid_count": dock_valid_count,
-                                    "interface_clean_count": len(interface_clean),
-                                    "steric_clash_count": steric_clash_count,
-                                    "required_interface_clean": min_valid_dockings_per_target,
-                                    "recommendation": (
-                                        "reuse_as_priority_candidate_but_not_final_target"
-                                    ),
-                                },
-                            )
-
-                            failed_targets = _dedupe_failed_targets(
-                                failed_targets + [failure_record]
-                            )
-
+                            # A partial-success target is retained as a soft,
+                            # reusable outcome and is not simultaneously inserted
+                            # into failed_target_pdbs.
                             target_failure_records = list(target_failure_records) + [
                                 partial_record
                             ]
@@ -2195,6 +2277,7 @@ def protein_agent(state: LabState) -> dict:
                                     "target_status": PARTIAL_SUCCESS_TARGET_STATUS,
                                     "target_status_reason": PARTIAL_REASON_HDOCK_INTERFACE,
                                     "interface_contacts": result.get("interface_contacts"),
+                                    "best_interface_clean_sequence": best_interface_clean_sequence,
                                     "binding_units": "hdock_relative_score",
                                     "binding_energy_is_physical": False,
                                     "stage_outputs": [
@@ -2299,6 +2382,7 @@ def protein_agent(state: LabState) -> dict:
                                     "target_status": FAILED_TARGET_STATUS,
                                     "target_status_reason": FAILED_REASON_INSUFFICIENT_INTERFACE,
                                     "interface_contacts": result.get("interface_contacts"),
+                                    "best_interface_clean_sequence": best_interface_clean_sequence,
                                     "stage_outputs": [
                                         record_stage_output(
                                             state,
@@ -2398,6 +2482,7 @@ def protein_agent(state: LabState) -> dict:
                                 "binding_units": "hdock_relative_score",
                                 "binding_energy_is_physical": False,
                                 "interface_contacts": result.get("interface_contacts"),
+                                "best_interface_clean_sequence": best_interface_clean_sequence,
                                 "stage_outputs": [
                                     record_stage_output(
                                         state,

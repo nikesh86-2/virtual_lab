@@ -41,6 +41,19 @@ from typing import Any, Dict, List, Optional
 # Basic helpers
 # ---------------------------------------------------------------------------
 
+def get_successful_target_records(self) -> list:
+    """
+    Returning the ranked records.
+    """
+    return sorted(
+        rows,
+    key=lambda r: (
+        -(int(r.get("best_clean_pose_count") or 0)),
+        -(int(r.get("success_count") or 0)),
+        -(int(r.get("best_binding_result_count") or 0)),
+    ),
+)
+
 def _now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
@@ -56,8 +69,20 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
-def _pdb_id(x: Any) -> str:
-    return str(x or "").strip().upper()
+from pathlib import Path
+
+def _pdb_id(x):
+    text = str(x or "").strip()
+
+    if not text:
+        return ""
+
+    try:
+        text = Path(text).stem
+    except Exception:
+        pass
+
+    return text.upper()
 
 
 def _clean_rna(seq: Any) -> str:
@@ -97,6 +122,152 @@ def _is_dock_valid(row: dict) -> bool:
         and row.get("binding_mode") != "rejected_docking"
     )
 
+CLASH_SEVERITY_PENALTIES = {
+    "none": 0.0,
+    "unknown": 0.10,
+    "borderline": 0.25,
+    "moderate": 0.60,
+    "severe": 1.00,
+}
+
+INTERFACE_SIMILARITY_THRESHOLD = float(
+    os.getenv("VLAB_INTERFACE_MEMORY_MIN_SIMILARITY", "0.72")
+)
+
+INTERFACE_SIMILARITY_POWER = float(
+    os.getenv("VLAB_INTERFACE_MEMORY_SIMILARITY_POWER", "3.0")
+)
+
+def _normalise_fraction(value: Any, default: float = 0.0) -> float:
+    """
+    Normalise a possibly percentage-like value to [0, 1].
+
+    Examples:
+      0.72 -> 0.72
+      72.0 -> 0.72
+    """
+    parsed = _safe_float(value, default)
+
+    if parsed is None:
+        return default
+
+    if parsed > 1.0:
+        parsed /= 100.0
+
+    return max(0.0, min(1.0, parsed))
+
+
+def _sequence_similarity(a: Any, b: Any) -> float:
+    """
+    Positional similarity for equal or near-equal length RNA sequences.
+
+    A length mismatch is explicitly penalised.
+    """
+    a = _clean_rna(a)
+    b = _clean_rna(b)
+
+    if not a or not b:
+        return 0.0
+
+    overlap = min(len(a), len(b))
+
+    if overlap <= 0:
+        return 0.0
+
+    matches = sum(
+        1 for x, y in zip(a[:overlap], b[:overlap])
+        if x == y
+    )
+
+    positional_similarity = matches / overlap
+    length_similarity = overlap / max(len(a), len(b))
+
+    return positional_similarity * length_similarity
+
+
+def _interface_evidence_score(row: dict) -> tuple[float, dict]:
+    """
+    Convert one measured interface row into a signed optimisation score.
+
+    Positive:
+      clean, interface-valid, good quality, useful RNA-span coverage.
+
+    Negative:
+      steric clash, moderate/severe clash, interface rejection.
+
+    Missing interface evidence is neutral rather than assumed clean.
+    """
+    if not isinstance(row, dict):
+        return 0.0, {
+            "known": False,
+            "reason": "invalid_row",
+        }
+
+    dock_valid = _is_dock_valid(row)
+
+    if not dock_valid:
+        return 0.0, {
+            "known": False,
+            "reason": "dock_not_valid",
+        }
+
+    interface_passed = row.get("interface_passed")
+    steric_clash = row.get("interface_steric_clash") is True
+
+    severity = str(
+        row.get("interface_clash_severity")
+        or ("moderate" if steric_clash else "none")
+    ).strip().lower()
+
+    severity_penalty = CLASH_SEVERITY_PENALTIES.get(
+        severity,
+        CLASH_SEVERITY_PENALTIES["unknown"],
+    )
+
+    quality = _normalise_fraction(
+        row.get("interface_quality_score"),
+        default=0.0,
+    )
+
+    span = _normalise_fraction(
+        row.get("interface_rna_span_covered"),
+        default=0.0,
+    )
+
+    clean = _has_clean_interface(row)
+
+    # Positive evidence.
+    score = (
+        0.55 * quality
+        + 0.20 * span
+        + (0.35 if interface_passed is True else 0.0)
+        + (0.25 if clean else 0.0)
+    )
+
+    # Negative evidence.
+    if interface_passed is False:
+        score -= 0.35
+
+    if steric_clash:
+        score -= 0.55
+
+    score -= 0.75 * severity_penalty
+
+    # Keep objective in a controlled signed range.
+    score = max(-1.5, min(1.5, score))
+
+    return score, {
+        "known": True,
+        "clean": clean,
+        "dock_valid": dock_valid,
+        "interface_passed": interface_passed,
+        "steric_clash": steric_clash,
+        "clash_severity": severity,
+        "clash_severity_penalty": severity_penalty,
+        "quality": quality,
+        "rna_span_covered": span,
+        "raw_interface_score": score,
+    }
 
 # ---------------------------------------------------------------------------
 # FailureMemory
@@ -187,9 +358,36 @@ class FailureMemory:
             "successful_pose_features": [],
             "run_summaries": [],
         }
-
         for key, value in defaults.items():
             self.memory.setdefault(key, value)
+
+        for row in self.memory.get("successful_targets", []):
+            if not isinstance(row, dict):
+                continue
+
+            row.setdefault(
+                "best_clean_pose_count",
+                int(row.get("clean_pose_count", 0) or 0),
+            )
+
+            row.setdefault(
+                "best_binding_result_count",
+                int(row.get("binding_result_count", 0) or 0),
+            )
+
+            row.setdefault(
+                "latest_clean_pose_count",
+                int(row.get("clean_pose_count", 0) or 0),
+            )
+
+            row.setdefault(
+                "latest_binding_result_count",
+                int(row.get("binding_result_count", 0) or 0),
+            )
+
+            row.setdefault("success_count", 1)
+
+
 
     def _load(self) -> None:
         if not os.path.exists(self.path):
@@ -287,10 +485,15 @@ class FailureMemory:
             "successful_pose_features",
             ["target_pdb", "sequence"],
         )
-        self._dedupe_by_field("target_failures", "pdb_id")
-        self._dedupe_by_field("partial_success_targets", "pdb_id")
-        self._dedupe_by_field("partial_success_sequences", "sequence")
-        self._dedupe_by_field("successful_targets", "pdb_id")
+        self._dedupe_by_composite_key(
+            "target_failures",
+            ["pdb_id", "reason"],
+        )
+        self._dedupe_by_composite_key(
+            "partial_success_targets",
+            ["pdb_id", "sequence"],
+        )
+        self._dedupe_by_composite_key("partial_success_sequences", ["sequence", "target_pdb"])
 
         self._cap_collection("sequence_failures", 500)
         self._cap_collection("motif_failures", 300)
@@ -387,24 +590,52 @@ class FailureMemory:
         )
 
     def record_interface_failure(
-        self,
-        row: dict,
-        reason: str | None = None,
-    ) -> None:
+    self,
+    row: dict,
+    reason: str | None = None,
+) -> None:
         if not isinstance(row, dict):
             return
+
+        interface_score, interface_details = _interface_evidence_score(row)
 
         self.memory["interface_failures"].append(
             {
                 "sequence": _clean_rna(row.get("sequence")),
-                "target_pdb": _pdb_id(row.get("target_pdb")),
-                "reason": reason or row.get("pose_training_label") or "interface_failure",
+                "target_pdb": _pdb_id(
+                    row.get("target_pdb")
+                    or row.get("target_pdb_id")
+                ),
+                "reason": (
+                    reason
+                    or row.get("pose_training_label")
+                    or "interface_failure"
+                ),
+                "dock_valid": row.get("dock_valid"),
                 "interface_passed": row.get("interface_passed"),
-                "interface_steric_clash": row.get("interface_steric_clash"),
-                "interface_clash_severity": row.get("interface_clash_severity"),
-                "interface_quality_score": row.get("interface_quality_score"),
-                "interface_min_distance_A": row.get("interface_min_distance_A"),
+                "interface_steric_clash": row.get(
+                    "interface_steric_clash"
+                ),
+                "interface_clash_severity": row.get(
+                    "interface_clash_severity"
+                ),
+                "interface_quality_score": row.get(
+                    "interface_quality_score"
+                ),
+                "interface_min_distance_A": row.get(
+                    "interface_min_distance_A"
+                ),
+                "interface_basic_residue_contacts": row.get(
+                    "interface_basic_residue_contacts"
+                ),
+                "interface_rna_span_covered": row.get(
+                    "interface_rna_span_covered"
+                ),
+                "interface_residues": row.get("interface_residues"),
+                "pose_training_label": row.get("pose_training_label"),
                 "dock_score": row.get("dock_score"),
+                "memory_interface_score": interface_score,
+                "memory_interface_details": interface_details,
                 "timestamp": _now_iso(),
             }
         )
@@ -429,7 +660,7 @@ class FailureMemory:
             }
         )
 
-        self._dedupe_by_field("target_failures", "pdb_id")
+        self._dedupe_by_composite_key("target_failures", ["pdb_id", "reason"])
 
     def record_partial_success_target(
         self,
@@ -459,7 +690,7 @@ class FailureMemory:
             }
         )
 
-        self._dedupe_by_field("partial_success_targets", "pdb_id")
+        self._dedupe_by_composite_key("partial_success_targets", ["pdb_id", "sequence"])
 
         if seq:
             self.memory["partial_success_sequences"].append(
@@ -470,7 +701,7 @@ class FailureMemory:
                 }
             )
 
-            self._dedupe_by_field("partial_success_sequences", "sequence")
+            self._dedupe_by_composite_key("partial_success_sequences", ["sequence", "target_pdb"])
 
     def record_successful_target(
         self,
@@ -479,23 +710,96 @@ class FailureMemory:
         binding_result_count: int,
         metadata: Optional[dict] = None,
     ) -> None:
+
         pdb_id = _pdb_id(pdb_id)
 
         if not pdb_id:
             return
 
-        self.memory["successful_targets"].append(
-            {
-                "pdb_id": pdb_id,
-                "clean_pose_count": int(clean_pose_count or 0),
-                "binding_result_count": int(binding_result_count or 0),
-                "metadata": metadata or {},
-                "timestamp": _now_iso(),
-            }
+        rows = self.memory.setdefault(
+            "successful_targets",
+            [],
         )
 
-        self._dedupe_by_field("successful_targets", "pdb_id")
+        existing = None
 
+        for row in rows:
+            if (
+                isinstance(row, dict)
+                and _pdb_id(row.get("pdb_id")) == pdb_id
+            ):
+                existing = row
+                break
+
+        clean_pose_count = int(clean_pose_count or 0)
+        binding_result_count = int(binding_result_count or 0)
+
+        if existing is None:
+
+            rows.append(
+                {
+                    "pdb_id": pdb_id,
+
+                    # best-ever observations
+                    "best_clean_pose_count": clean_pose_count,
+                    "best_binding_result_count": binding_result_count,
+
+                    # latest run
+                    "latest_clean_pose_count": clean_pose_count,
+                    "latest_binding_result_count": binding_result_count,
+
+                    # reproducibility
+                    "success_count": 1,
+
+                    "metadata": metadata or {},
+                    "timestamp": _now_iso(),
+                }
+            )
+
+            return
+
+        # Upgrade old records automatically.
+
+        if "best_clean_pose_count" not in existing:
+            existing["best_clean_pose_count"] = int(
+                existing.get("clean_pose_count", 0)
+            )
+
+        if "best_binding_result_count" not in existing:
+            existing["best_binding_result_count"] = int(
+                existing.get("binding_result_count", 0)
+            )
+
+        if "success_count" not in existing:
+            existing["success_count"] = 1
+
+        # Update statistics.
+
+        existing["best_clean_pose_count"] = max(
+            int(existing.get("best_clean_pose_count", 0)),
+            clean_pose_count,
+        )
+
+        existing["best_binding_result_count"] = max(
+            int(existing.get("best_binding_result_count", 0)),
+            binding_result_count,
+        )
+
+        existing["latest_clean_pose_count"] = clean_pose_count
+
+        existing["latest_binding_result_count"] = (
+            binding_result_count
+        )
+
+        existing["success_count"] = (
+            int(existing.get("success_count", 0))
+            + 1
+        )
+
+        if metadata:
+            existing["metadata"] = metadata
+
+        existing["timestamp"] = _now_iso()
     # ------------------------------------------------------------------
     # Ingest methods
     # ------------------------------------------------------------------
@@ -581,17 +885,46 @@ class FailureMemory:
 
             if _has_clean_interface(row):
                 clean_rows.append(row)
+                interface_score, interface_details = _interface_evidence_score(row)
 
                 self.memory["successful_pose_features"].append(
                     {
                         "sequence": _clean_rna(row.get("sequence")),
                         "target_pdb": row_target,
+                        "dock_valid": row.get("dock_valid"),
                         "dock_score": row.get("dock_score"),
-                        "binding_rank_score": row.get("binding_rank_score"),
-                        "interface_quality_score": row.get("interface_quality_score"),
-                        "interface_min_distance_A": row.get("interface_min_distance_A"),
-                        "interface_basic_residue_contacts": row.get("interface_basic_residue_contacts"),
-                        "interface_rna_span_covered": row.get("interface_rna_span_covered"),
+                        "binding_rank_score": row.get(
+                            "binding_rank_score"
+                        ),
+                        "interface_passed": row.get(
+                            "interface_passed"
+                        ),
+                        "interface_steric_clash": row.get(
+                            "interface_steric_clash"
+                        ),
+                        "interface_clash_severity": row.get(
+                            "interface_clash_severity"
+                        ),
+                        "interface_quality_score": row.get(
+                            "interface_quality_score"
+                        ),
+                        "interface_min_distance_A": row.get(
+                            "interface_min_distance_A"
+                        ),
+                        "interface_basic_residue_contacts": row.get(
+                            "interface_basic_residue_contacts"
+                        ),
+                        "interface_rna_span_covered": row.get(
+                            "interface_rna_span_covered"
+                        ),
+                        "interface_residues": row.get(
+                            "interface_residues"
+                        ),
+                        "pose_training_label": row.get(
+                            "pose_training_label"
+                        ),
+                        "memory_interface_score": interface_score,
+                        "memory_interface_details": interface_details,
                         "timestamp": _now_iso(),
                     }
                 )
@@ -604,11 +937,20 @@ class FailureMemory:
                         sequence=row.get("sequence"),
                         row=row,
                     )
+            else:
+                if _is_dock_valid(row):
+                    if row.get("interface_steric_clash") is True:
+                        clash_rows.append(row)
+                        reason = "steric_clash"
+                    elif row.get("interface_passed") is False:
+                        reason = "interface_failed"
+                    else:
+                        reason = "interface_not_clean"
 
-            elif _is_dock_valid(row):
-                if row.get("interface_steric_clash"):
-                    clash_rows.append(row)
-                    self.record_interface_failure(row, reason="steric_clash")
+                    self.record_interface_failure(
+                        row,
+                        reason=reason,
+                    )
 
         # ------------------------------------------------------------
         # Explicit failed targets from state
@@ -778,17 +1120,15 @@ class FailureMemory:
         rows = self.memory.get("successful_targets", []) or []
 
         rows = sorted(
-            [
-                r for r in rows
-                if isinstance(r, dict) and _pdb_id(r.get("pdb_id")) not in hard_failed
-            ],
+            rows,
             key=lambda r: (
-                -(int(r.get("clean_pose_count") or 0)),
-                -(int(r.get("binding_result_count") or 0)),
+                -(int(r.get("best_clean_pose_count") or 0)),
+                -(int(r.get("success_count") or 0)),
+                -(int(r.get("best_binding_result_count") or 0)),
             ),
         )
 
-        out = [_pdb_id(r.get("pdb_id")) for r in rows if _pdb_id(r.get("pdb_id"))]
+        out = [_pdb_id(r.get("pdb_id")) for r in rows if (_pdb_id(r.get("pdb_id")) and _pdb_id(r.get("pdb_id")) not in hard_failed)]
 
         return list(dict.fromkeys(out))
 
@@ -937,6 +1277,217 @@ class FailureMemory:
 
         self.save()
 
+    def get_interface_evidence(
+    self,
+    target_pdb: str | None = None,
+    ) -> list:
+        """
+        Return persistent pose-level interface evidence.
+
+        If target_pdb is supplied, prefer evidence specific to that target.
+        """
+        target = _pdb_id(target_pdb)
+
+        rows: list[dict] = []
+
+        for collection in (
+            "successful_pose_features",
+            "interface_failures",
+        ):
+            for row in self.memory.get(collection, []) or []:
+                if not isinstance(row, dict):
+                    continue
+
+                seq = _clean_rna(row.get("sequence"))
+                row_target = _pdb_id(
+                    row.get("target_pdb")
+                    or row.get("pdb_id")
+                )
+
+                if not seq:
+                    continue
+
+                if target and row_target != target:
+                    continue
+
+                score, details = _interface_evidence_score(row)
+
+                enriched = dict(row)
+                enriched["sequence"] = seq
+                enriched["target_pdb"] = row_target
+                enriched["memory_interface_score"] = score
+                enriched["memory_interface_details"] = details
+                enriched["memory_source"] = collection
+
+                rows.append(enriched)
+
+        return rows
+
+    def merge_state_memory(self, state: dict) -> None:
+        """
+        Merge in-memory LabState information into the persistent model.
+        """
+
+        if not isinstance(state, dict):
+            return
+
+        for item in state.get("partial_success_sequences", []) or []:
+            seq = _clean_rna(item)
+
+            if seq:
+                self.memory["partial_success_sequences"].append(
+                    {
+                        "sequence": seq,
+                        "target_pdb": "",
+                        "timestamp": _now_iso(),
+                    }
+                )
+
+        for item in state.get("target_failure_records", []) or []:
+            if (
+                isinstance(item, dict)
+                and item.get("pdb_id")
+            ):
+                self.memory["target_failures"].append(dict(item))
+
+        self._compact_memory()
+
+    def merge_from_state(self, state: dict) -> None:
+        """
+        New higher-level state ingestion entrypoint.
+
+        Consolidates:
+        - partial success sequences
+        - target failures
+        - binding/interface evidence
+        - accepted target outcomes
+
+        Safe to call repeatedly.
+        """
+        if not isinstance(state, dict):
+            return
+
+        self.merge_state_memory(state)
+
+        try:
+            self.ingest_run_state(state)
+        except Exception:
+            pass
+
+        self.save()
+
+    def get_interface_prior(
+        self,
+        seq: str,
+        target_pdb: str | None = None,
+        min_similarity: float = INTERFACE_SIMILARITY_THRESHOLD,
+    ) -> dict:
+        """
+        Obtain a target-specific interface prior for a sequence.
+
+        Exact measured evidence is preferred. For unseen mutants, nearby sequence
+        evidence is similarity-discounted. Unknown candidates remain neutral.
+        """
+        seq = _clean_rna(seq)
+
+        if not seq:
+            return {
+                "known": False,
+                "score": 0.0,
+                "reason": "empty_sequence",
+            }
+
+        evidence = self.get_interface_evidence(target_pdb)
+
+        if not evidence:
+            return {
+                "known": False,
+                "score": 0.0,
+                "reason": "no_target_interface_evidence",
+            }
+
+        weighted_score = 0.0
+        total_weight = 0.0
+        matches: list[dict] = []
+
+        for row in evidence:
+            observed_seq = _clean_rna(row.get("sequence"))
+
+            if not observed_seq:
+                continue
+
+            similarity = _sequence_similarity(seq, observed_seq)
+
+            if similarity < min_similarity:
+                continue
+
+            raw_score = _safe_float(
+                row.get("memory_interface_score"),
+                0.0,
+            ) or 0.0
+
+            weight = similarity ** INTERFACE_SIMILARITY_POWER
+
+            # Exact observations should dominate inferred neighbours.
+            if similarity >= 0.999999:
+                weight *= 4.0
+
+            weighted_score += weight * raw_score
+            total_weight += weight
+
+            matches.append(
+                {
+                    "observed_sequence": observed_seq,
+                    "similarity": similarity,
+                    "weight": weight,
+                    "interface_score": raw_score,
+                    "source": row.get("memory_source"),
+                    "target_pdb": row.get("target_pdb"),
+                    "steric_clash": row.get(
+                        "interface_steric_clash"
+                    ),
+                    "clash_severity": row.get(
+                        "interface_clash_severity"
+                    ),
+                    "interface_quality_score": row.get(
+                        "interface_quality_score"
+                    ),
+                }
+            )
+
+        if total_weight <= 0.0:
+            return {
+                "known": False,
+                "score": 0.0,
+                "reason": "no_similar_interface_evidence",
+            }
+
+        prior_score = weighted_score / total_weight
+        best_similarity = max(
+            m["similarity"]
+            for m in matches
+        )
+
+        # Additional confidence discount for inferred—not exact—candidates.
+        confidence = best_similarity ** INTERFACE_SIMILARITY_POWER
+
+        if best_similarity < 0.999999:
+            prior_score *= confidence
+
+        return {
+            "known": True,
+            "score": max(-1.5, min(1.5, prior_score)),
+            "confidence": confidence,
+            "best_similarity": best_similarity,
+            "exact": best_similarity >= 0.999999,
+            "target_pdb": _pdb_id(target_pdb),
+            "matches": sorted(
+                matches,
+                key=lambda x: x["weight"],
+                reverse=True,
+            )[:5],
+        }
+
     # ------------------------------------------------------------------
     # Objective weights
     # ------------------------------------------------------------------
@@ -963,9 +1514,40 @@ class FailureMemory:
         if len(motif_failures) > 5:
             weights["diversity_pressure"] = 0.2
 
-        if len(interface_failures) > 2:
-            weights["interface_pressure"] = 0.35
-            weights["clash_avoidance_pressure"] = 0.30
+        clash_failures = [
+            row
+            for row in interface_failures
+            if isinstance(row, dict)
+            and row.get("interface_steric_clash") is True
+        ]
+
+        severe_or_moderate = [
+            row
+            for row in clash_failures
+            if str(
+                row.get("interface_clash_severity") or ""
+            ).lower() in {"moderate", "severe"}
+        ]
+
+        if interface_failures:
+            weights["interface_pressure"] = min(
+                0.75,
+                0.25 + 0.05 * len(interface_failures),
+            )
+
+        if clash_failures:
+            weights["clash_avoidance_pressure"] = min(
+                0.85,
+                0.30 + 0.08 * len(clash_failures),
+            )
+
+        if severe_or_moderate:
+            weights["clash_avoidance_pressure"] = max(
+                weights.get("clash_avoidance_pressure", 0.0),
+                0.65,
+            )
+
+        if interface_failures:
             weights["structure_pressure"] = max(
                 weights.get("structure_pressure", 0.0),
                 0.2,
@@ -974,9 +1556,23 @@ class FailureMemory:
         if partial_success:
             weights["interface_pressure"] = max(
                 weights.get("interface_pressure", 0.0),
-                0.35,
+                0.55,
             )
-            weights["target_specific_exploitation"] = 1.0
+            weights["clash_avoidance_pressure"] = max(
+                weights.get("clash_avoidance_pressure", 0.0),
+                0.50,
+            )
+            partial_targets = {
+                _pdb_id(row.get("pdb_id"))
+                for row in partial_success
+                if isinstance(row, dict)
+                and _pdb_id(row.get("pdb_id"))
+            }
+
+            weights["target_specific_exploitation"] = min(
+                1.0,
+                0.2 + 0.1 * len(partial_targets),
+            )
 
         if successful_targets:
             weights["target_reuse_pressure"] = 0.25
@@ -1045,9 +1641,36 @@ class FailureMemory:
             )
 
         if "interface" in score:
-            score["interface"] = float(score.get("interface", 0.0)) + weights.get(
-                "interface_pressure",
-                0.0,
+            interface_value = float(
+                score.get("interface", 0.0)
             )
+
+            interface_known = bool(
+                score.get("interface_evidence_known")
+                or (
+                    isinstance(score.get("interface_evidence"), dict)
+                    and score["interface_evidence"].get("known")
+                )
+            )
+
+            if interface_known:
+                interface_pressure = weights.get(
+                    "interface_pressure",
+                    0.0,
+                )
+                clash_pressure = weights.get(
+                    "clash_avoidance_pressure",
+                    0.0,
+                )
+
+                if interface_value >= 0.0:
+                    # Amplify genuinely favourable measured/prior evidence.
+                    interface_value *= 1.0 + interface_pressure
+                else:
+                    # Make negative clash evidence more costly.
+                    interface_value *= 1.0 + clash_pressure
+
+            # Unknown candidates stay neutral instead of receiving a free bonus.
+            score["interface"] = interface_value
 
         return score

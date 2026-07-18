@@ -101,7 +101,7 @@ dependencies:
       - langsmith
 
       # vLLM stack
-      - vllm==0.7.2
+      - vllm>=0.7.2
       - transformers==4.48.3
       - tokenizers
       - accelerate

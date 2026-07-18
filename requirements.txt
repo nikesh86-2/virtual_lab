@@ -3,15 +3,30 @@
 # CPU example:
 #   python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-sentence-transformers>=2.2.2
-faiss-cpu>=1.7.2
+sentence-transformers>=4.0.0
+faiss-cpu>=1.8.0
 numpy>=1.24
-transformers>=4.30.0
-datasets>=2.12.0
-accelerate>=0.20.3
-peft>=0.6.0
+transformers>=4.48.0
+datasets>=3.0.0
+accelerate>=1.0.0
+peft>=0.13.0
 tqdm>=4.65.0
 
 # Inhibitor screening dependencies
 requests>=2.28.0
 biopython>=1.81
+
+# Core VLAB2 dependencies (also in biophysics-research-agent.yml)
+# For quick prototyping without full conda environment
+langchain-core>=0.3.0
+langchain-openai>=0.3.0
+langgraph>=0.2.0
+vllm>=0.7.0
+openai>=1.0.0
+xformers>=0.0.28
+safetensors>=0.4.0
+hf-xet>=1.0.0
+
+# FAISS GPU (install faiss-gpu via conda instead)
+# faiss-gpu (conda-only dependency)
+

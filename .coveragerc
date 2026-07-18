@@ -1,0 +1,19 @@
+[run]
+data_file = /scratch/fbsnpat/bot/VLAB2/output_data/coverage/6679216/.coverage
+parallel = True
+branch = True
+source = /scratch/fbsnpat/bot/VLAB2
+omit =
+    */output_data/*
+    */hf_cache/*
+    */conda_pkgs/*
+    */tmp/*
+    */.venv/*
+    */site-packages/*
+    */HDOCKlite*/*
+    /scratch/fbsnpat/bot/VLAB2/.coveragerc
+
+[report]
+show_missing = True
+skip_covered = False
+precision = 1

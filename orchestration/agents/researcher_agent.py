@@ -406,7 +406,8 @@ def researcher_agent(state: LabState) -> dict:
 
         log.info("--- RESEARCHER AGENT: Querying Knowledge Base ---")
 
-        streamed = set(state.get("streamed_queries", []))
+        streamed_keys = set(state.get("streamed_query_keys", []))
+        streamed_queries = set(state.get("streamed_queries", []))
         streaming_started = bool(state.get("streaming_started", False))
 
         seed_questions = state.get("seed_questions", [])
@@ -431,13 +432,18 @@ def researcher_agent(state: LabState) -> dict:
         started_any_stream = False
 
         for q in query_bundle:
-            stream_key = f"{q}::{profile.get('topic_name')}::{profile.get('virus_family')}::{profile.get('task_type')}"
-            if stream_key in streamed:
+            stream_key = (
+                f"{q}::{profile.get('topic_name')}::"
+                f"{profile.get('virus_family')}::{profile.get('task_type')}"
+            )
+
+            if stream_key in streamed_keys:
                 log.info("Streaming already started for query/topic: %s", q)
                 continue
 
             started = start_streaming(q, topic_profile=profile)
-            streamed.add(stream_key)
+            streamed_keys.add(stream_key)
+            streamed_queries.add(q)
 
             if started:
                 streaming_started = True
@@ -464,13 +470,18 @@ def researcher_agent(state: LabState) -> dict:
                 log.info("Skipping broad/refined query: %s", q)
                 continue
 
-            stream_key = f"{q}::{profile.get('topic_name')}::{profile.get('virus_family')}::{profile.get('task_type')}"
-            if stream_key in streamed:
-                log.info("Refined query already streamed: %s", q)
+            stream_key = (
+                f"{q}::{profile.get('topic_name')}::"
+                f"{profile.get('virus_family')}::{profile.get('task_type')}"
+            )
+
+            if stream_key in streamed_keys:
+                log.info("Streaming already started for query/topic: %s", q)
                 continue
 
             started = start_streaming(q, topic_profile=profile)
-            streamed.add(stream_key)
+            streamed_keys.add(stream_key)
+            streamed_queries.add(q)
 
             if started:
                 streaming_started = True
@@ -615,7 +626,8 @@ def researcher_agent(state: LabState) -> dict:
         result = {
             "evidence": evidence_out,
             "streaming_started": streaming_started,
-            "streamed_queries": list(streamed),
+            "streamed_queries": sorted(streamed_queries),
+            "streamed_query_keys": sorted(streamed_keys),
             "research_query": query,
             "literature_query_bundle": query_bundle,
             "literature_topic_profile": profile,
@@ -631,7 +643,8 @@ def researcher_agent(state: LabState) -> dict:
                         "topic_profile": profile,
                         "new_evidence_count": len(deduped_new),
                         "total_evidence_count": len(evidence_out),
-                        "streamed_queries": list(streamed),
+                        "streamed_queries": sorted(streamed_queries),
+                        "streamed_query_keys": sorted(streamed_keys),
                         "accepted_refined_queries": accepted_refined,
                     },
                 )
@@ -668,5 +681,8 @@ def researcher_agent(state: LabState) -> dict:
             "evidence": [f"Researcher failed: {e}"],
             "streaming_started": state.get("streaming_started", False),
             "streamed_queries": list(state.get("streamed_queries", [])),
-            "research_query": "",
+            "streamed_query_keys": list(state.get("streamed_query_keys", [])),
+            "research_query": state.get("research_query"),
+            "literature_query_bundle": state.get("literature_query_bundle", []),
+            "literature_topic_profile": state.get("literature_topic_profile", {}),
         }

@@ -33,6 +33,7 @@ def _now_iso() -> str:
 
 
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+
     try:
         if x is None:
             return default

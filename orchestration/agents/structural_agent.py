@@ -178,18 +178,47 @@ def _parse_sequences_from_design_output(text: str) -> list[str]:
     return dedupe_rna_sequences(raw_sequences)
 
 
-def _build_locked_positions(conserved_regions) -> set[int]:
+def _build_locked_positions(
+    conserved_regions,
+    sequence_length: int | None = None,
+) -> set[int]:
     """
-    Convert conserved region intervals into locked nucleotide positions.
+    Convert conserved-region intervals to valid zero-based positions.
+
+    Bioinformatics output is treated as zero-based, end-exclusive when a
+    region starts at 0. Otherwise one-based inclusive coordinates are
+    converted conservatively.
     """
-    locked_positions = set()
+    locked_positions: set[int] = set()
 
     for item in conserved_regions or []:
         try:
             start, end = item
-            locked_positions.update(range(int(start), int(end)))
+            start = int(start)
+            end = int(end)
         except Exception:
             continue
+
+        if end <= start:
+            continue
+
+        if start == 0:
+            start_zero = start
+            end_exclusive = end
+        else:
+            start_zero = start - 1
+            end_exclusive = end
+
+        if sequence_length is not None:
+            start_zero = max(0, min(start_zero, sequence_length))
+            end_exclusive = max(
+                start_zero,
+                min(end_exclusive, sequence_length),
+            )
+
+        locked_positions.update(
+            range(start_zero, end_exclusive)
+        )
 
     return locked_positions
 
@@ -322,6 +351,223 @@ def _normalise_candidate_sequences(
     return final_sequences[:5]
 
 
+def _interface_evidence_for_sequence(state: LabState, seq: str) -> dict:
+    seq = clean_rna(seq)
+    score_map = state.get("_run_system_sequence_scores", {}) or {}
+    score_data = score_map.get(seq, {}) or {}
+    evidence = dict(score_data.get("interface_evidence") or {})
+    if score_data:
+        evidence.setdefault("known", score_data.get("interface_evidence_known", False))
+        evidence.setdefault("score", score_data.get("interface", 0.0))
+        evidence.setdefault("source", evidence.get("source") or "run_system")
+
+    for row in state.get("binding_results", []) or []:
+        if not isinstance(row, dict) or clean_rna(row.get("sequence", "")) != seq:
+            continue
+        if any(
+            row.get(key) is not None
+            for key in (
+                "interface_passed",
+                "interface_steric_clash",
+                "interface_signed_score",
+            )
+        ):
+            evidence.update(
+                {
+                    "known": True,
+                    "clean": (
+                        row.get("interface_passed") is True
+                        and row.get("interface_steric_clash") is not True
+                    ),
+                    "steric_clash": row.get("interface_steric_clash") is True,
+                    "score": row.get("interface_signed_score", evidence.get("score", 0.0)),
+                    "source": "protein_agent",
+                }
+            )
+    return evidence
+
+
+def _known_interface_clash(state: LabState, seq: str) -> bool:
+    evidence = _interface_evidence_for_sequence(state, seq)
+    return bool(evidence.get("known") and evidence.get("steric_clash"))
+
+
+def _clean_interface_anchor(state: LabState) -> str:
+    candidates = [
+        state.get("best_interface_clean_sequence"),
+        state.get("_run_system_best_interface_sequence"),
+    ]
+    for seq in candidates:
+        seq = clean_rna(seq or "")
+        if seq and not _known_interface_clash(state, seq):
+            return seq
+    return ""
+
+
+def _local_interface_variants(
+    anchor: str,
+    locked_positions: set[int],
+    count: int = 3,
+) -> list[str]:
+    anchor = clean_rna(anchor)
+
+    if not anchor:
+        log.info(
+            "[STRUCTURAL LOCAL DEBUG] no clean anchor available"
+        )
+        return []
+
+    mutable_positions = [
+        index
+        for index in range(len(anchor))
+        if index not in locked_positions
+    ]
+
+    log.info(
+        "[STRUCTURAL LOCAL DEBUG] "
+        "anchor=%s length=%d "
+        "locked=%d mutable=%d requested=%d",
+        anchor,
+        len(anchor),
+        len(locked_positions),
+        len(mutable_positions),
+        count,
+    )
+
+    if not mutable_positions:
+        log.warning(
+            "[STRUCTURAL LOCAL DEBUG] "
+            "all anchor positions are locked; "
+            "local mutation is impossible"
+        )
+        return []
+
+    variants: list[str] = []
+    attempts = 0
+
+    while len(variants) < count and attempts < 50:
+        attempts += 1
+
+        n_mutations = 1 if len(variants) < 2 else 2
+
+        raw_variant = mutate_sequence(
+            anchor,
+            num_mutations=n_mutations,
+            locked_positions=locked_positions,
+        )
+
+        variant = clean_rna(raw_variant)
+
+        distance = (
+            hamming_distance(anchor, variant)
+            if variant and len(variant) == len(anchor)
+            else None
+        )
+
+        valid, reason = validate_sequence(variant)
+
+        duplicate = (
+            not variant
+            or variant == anchor
+            or variant in variants
+        )
+
+        log.info(
+            "[STRUCTURAL LOCAL DEBUG] "
+            "attempt=%d "
+            "requested_mutations=%d "
+            "raw=%s "
+            "cleaned=%s "
+            "distance=%s "
+            "valid=%s "
+            "reason=%s "
+            "duplicate=%s",
+            attempts,
+            n_mutations,
+            raw_variant,
+            variant,
+            distance,
+            valid,
+            reason,
+            duplicate,
+        )
+
+        if not valid or duplicate:
+            continue
+
+        if distance is None or distance < 1 or distance > 2:
+            log.warning(
+                "[STRUCTURAL LOCAL DEBUG] "
+                "rejecting unexpected "
+                "Hamming distance=%s",
+                distance,
+            )
+            continue
+
+        variants.append(variant)
+
+        log.info(
+            "[STRUCTURAL LOCAL DEBUG] "
+            "retained=%d variants=%s",
+            len(variants),
+            variants,
+        )
+
+    return variants
+
+
+def _structural_selection_order(
+    state: LabState,
+    candidate_records: list[dict],
+    clean_anchor: str,
+) -> list[dict]:
+    safe_records = [
+        rec for rec in candidate_records
+        if not _known_interface_clash(state, rec.get("sequence", ""))
+    ]
+    if not safe_records:
+        safe_records = list(candidate_records)
+
+    anchor_record = next(
+        (rec for rec in safe_records if rec.get("sequence") == clean_anchor),
+        None,
+    )
+    local_records = sorted(
+        [
+            rec for rec in safe_records
+            if clean_anchor
+            and rec.get("sequence") != clean_anchor
+            and len(rec.get("sequence", "")) == len(clean_anchor)
+            and hamming_distance(rec["sequence"], clean_anchor) <= 2
+        ],
+        key=lambda rec: (
+            bool(rec["fold_quality"].get("passed")),
+            float(rec.get("rank_score", 0.0)),
+        ),
+        reverse=True,
+    )
+    exploratory = sorted(
+        [rec for rec in safe_records if rec is not anchor_record and rec not in local_records],
+        key=lambda rec: (
+            bool(rec["fold_quality"].get("passed")),
+            float(rec.get("rank_score", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    ordered = []
+    if anchor_record and anchor_record["fold_quality"].get("passed"):
+        ordered.append(anchor_record)
+    if local_records:
+        ordered.append(local_records[0])
+    if exploratory:
+        ordered.append(exploratory[0])
+    for rec in safe_records:
+        if rec not in ordered:
+            ordered.append(rec)
+    return ordered
+
+
 def _run_alifold_if_available(state: LabState, vienna) -> dict | str:
     """
     Run RNAalifold where MSA data is available.
@@ -437,6 +683,18 @@ def structural_agent(state: LabState) -> dict:
         prior_seqs = dedupe_rna_sequences(state.get("designed_sequences", []))
         critique = state.get("critique", "") or ""
 
+        clean_anchor = _clean_interface_anchor(state)
+        log.info(
+            "[STRUCTURAL INTERFACE STATE] "
+            "best_clean=%s run_system_best=%s clean_anchor=%s "
+            "score_count=%d binding_rows=%d",
+            state.get("best_interface_clean_sequence"),
+            state.get("_run_system_best_interface_sequence"),
+            clean_anchor or None,
+            len(state.get("_run_system_sequence_scores", {}) or {}),
+            len(state.get("binding_results", []) or []),
+        )
+
         motifs = _parse_motif_names_from_env()
         motif_text = ", ".join(motifs[:12]) if motifs else "GAG, AAG, CAG, GUC, AGU"
 
@@ -504,16 +762,72 @@ def structural_agent(state: LabState) -> dict:
         raw_sequences = _parse_sequences_from_design_output(design_msg.content)
 
         conserved_regions = state.get("conserved_regions", [])
-        locked_positions = _build_locked_positions(conserved_regions)
+        locked_positions = _build_locked_positions(
+            conserved_regions,
+            sequence_length=(
+                len(clean_anchor)
+                if clean_anchor
+                else None
+            ),
+        )
 
-        final_sequences = _normalise_candidate_sequences(
+        log.info(
+            "[STRUCTURAL LOCAL DEBUG] "
+            "anchor=%s anchor_len=%d "
+            "conserved_regions=%s "
+            "locked_count=%d "
+            "locked_positions=%s",
+            clean_anchor or None,
+            len(clean_anchor) if clean_anchor else 0,
+            conserved_regions,
+            len(locked_positions),
+            sorted(locked_positions),
+        )
+
+        exploratory_sequences = _normalise_candidate_sequences(
             raw_sequences=raw_sequences,
             prior_seqs=prior_seqs,
             locked_positions=locked_positions,
         )
-
+        if clean_anchor:
+            interface_variants = _local_interface_variants(
+                anchor=clean_anchor,
+                locked_positions=locked_positions,
+                count=3,
+            )
+        else:
+            interface_variants = []
+            log.info(
+                "[STRUCTURAL LOCAL DEBUG] No clean interface anchor available; "
+                "using exploratory candidates only."
+            )
+        pre_dedupe_sequences = [
+            *([clean_anchor] if clean_anchor else []),
+            *interface_variants,
+            *exploratory_sequences,
+        ]
+        log.info("[STRUCTURAL LOCAL DEBUG] pre_dedupe=%s", pre_dedupe_sequences)
+        final_sequences = []
+        seen_sequences = set()
+        for raw_sequence in pre_dedupe_sequences:
+            cleaned_sequence = clean_rna(raw_sequence)
+            if not cleaned_sequence or cleaned_sequence in seen_sequences:
+                continue
+            if _known_interface_clash(state, cleaned_sequence):
+                log.info(
+                    "[STRUCTURAL FILTER] excluding known interface clash: %s",
+                    cleaned_sequence,
+                )
+                continue
+            seen_sequences.add(cleaned_sequence)
+            final_sequences.append(cleaned_sequence)
+            if len(final_sequences) >= 7:
+                break
+        log.info("[STRUCTURAL LOCAL DEBUG] post_dedupe=%s", final_sequences)
         if not final_sequences:
-            raise RuntimeError("No valid RNA sequences generated by structural agent.")
+            raise RuntimeError(
+                "No valid non-clashing RNA sequences generated by structural agent."
+            )
 
         log.info(
             "    Generated %d candidate RNA sequences: %s",
@@ -529,6 +843,14 @@ def structural_agent(state: LabState) -> dict:
         candidate_records = []
 
         for seq in final_sequences:
+            seq = clean_rna(seq)
+            is_valid, validation_reason = validate_sequence(seq)
+            if not seq or not is_valid:
+                log.warning(
+                    "Skipping invalid structural candidate seq=%s reason=%s",
+                    seq, validation_reason,
+                )
+                continue
             try:
                 sfold_output = sfold.run_sfold(seq)
             except Exception as e:
@@ -580,9 +902,18 @@ def structural_agent(state: LabState) -> dict:
                     "vienna_output": vienna_output,
                     "fold_quality": fold_quality,
                     "rank_score": _rank_fold_quality(fold_quality),
+                    "interface_evidence": _interface_evidence_for_sequence(state, seq),
+                    "interface_anchor": bool(clean_anchor and seq == clean_anchor),
+                    "interface_local_variant": bool(
+                        clean_anchor
+                        and len(seq) == len(clean_anchor)
+                        and 0 < hamming_distance(seq, clean_anchor) <= 2
+                    ),
                 }
             )
 
+        if not candidate_records:
+            raise RuntimeError("All structural candidates failed validation or folding.")
         candidate_records.sort(
             key=lambda r: (
                 bool(r["fold_quality"].get("passed")),
@@ -590,16 +921,24 @@ def structural_agent(state: LabState) -> dict:
             ),
             reverse=True,
         )
+        candidate_records = _structural_selection_order(
+            state,
+            candidate_records,
+            clean_anchor,
+        )
 
         for rec in candidate_records[:5]:
             fq = rec["fold_quality"]
             log.info(
-                "    Candidate fold rank: seq=%s score=%.3f pass=%s pd=%s mfe_nt=%s",
+                "    Candidate fold rank: seq=%s score=%.3f pass=%s pd=%s mfe_nt=%s anchor=%s local=%s interface=%s",
                 rec["sequence"][:20],
                 float(rec.get("rank_score", 0.0)),
                 fq.get("passed"),
                 fq.get("best_pair_density"),
                 fq.get("best_mfe_per_nt"),
+                rec.get("interface_anchor", False),
+                rec.get("interface_local_variant", False),
+                (rec.get("interface_evidence") or {}).get("score"),
             )
 
         selected = candidate_records[0]
@@ -634,7 +973,10 @@ def structural_agent(state: LabState) -> dict:
                     f"rank_score={rec.get('rank_score')} | "
                     f"pair_density={fq.get('best_pair_density')} | "
                     f"mfe_per_nt={fq.get('best_mfe_per_nt')} | "
-                    f"reasons={fq.get('reasons', [])}"
+                    f"reasons={fq.get('reasons', [])} | "
+                    f"interface_anchor={rec.get('interface_anchor', False)} | "
+                    f"interface_local={rec.get('interface_local_variant', False)} | "
+                    f"interface_evidence={rec.get('interface_evidence', {})}"
                 )
             )
 
@@ -700,9 +1042,11 @@ def structural_agent(state: LabState) -> dict:
 
         result = {
             "structural_analysis": analysis,
+            "structural_status": "complete",
+            "structural_error": None,
 
             # Return 3–5 candidates to seed PI/NSGA-II.
-            "designed_sequences": final_sequences,
+            "designed_sequences": [rec["sequence"] for rec in candidate_records[:5]],
 
             # Selected best-folding candidate for MD/protein path.
             "target_sequence": sequence,
@@ -716,6 +1060,9 @@ def structural_agent(state: LabState) -> dict:
                     "sequence": rec["sequence"],
                     "fold_quality": rec["fold_quality"],
                     "rank_score": rec["rank_score"],
+                    "interface_evidence": rec.get("interface_evidence", {}),
+                    "interface_anchor": rec.get("interface_anchor", False),
+                    "interface_local_variant": rec.get("interface_local_variant", False),
                 }
                 for rec in candidate_records
             ],
@@ -738,6 +1085,9 @@ def structural_agent(state: LabState) -> dict:
                         "fold_thresholds_passed": fold_quality.get("passed", False),
                         "pair_density": fold_quality.get("best_pair_density"),
                         "mfe_per_nt": fold_quality.get("best_mfe_per_nt"),
+                        "selection_policy": "clean_interface_then_local_variant_then_exploration",
+                        "clean_interface_anchor": clean_anchor or None,
+                        "selected_interface_evidence": selected.get("interface_evidence", {}),
                     },
                 )
             ],
@@ -763,4 +1113,34 @@ def structural_agent(state: LabState) -> dict:
 
     except Exception as e:
         log.exception("STRUCTURAL AGENT ERROR")
-        return {"structural_analysis": f"Structural analysis failed: {e}"}
+        error_text = f"Structural analysis failed: {type(e).__name__}: {e}"
+        result = {
+            "structural_analysis": error_text,
+            "structural_status": "failed",
+            "structural_error": str(e),
+            "designed_sequences": [],
+            "structural_candidates": [],
+            "target_sequence": state.get("target_sequence"),
+            "fold_quality": {},
+            "fold_thresholds_passed": False,
+            "fold_threshold_reasons": [f"structural_agent_error:{type(e).__name__}"],
+            "stage_outputs": [
+                record_stage_output(
+                    state, "structural", error_text,
+                    summary="Structural agent failed",
+                    metadata={
+                        "status": "failed",
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    },
+                )
+            ],
+            "conversation_history": [
+                add_conversation_entry(state, "assistant", error_text, "structural")
+            ],
+        }
+        try:
+            save_checkpoint({**state, **result})
+        except Exception as checkpoint_error:
+            log.warning("Failed to checkpoint structural error state: %s", checkpoint_error)
+        return result

@@ -90,6 +90,155 @@ def _state_with_topic_defaults(state: dict | None, topic: dict | None) -> dict |
 
     return out
 
+def _repair_literature_state_from_topic(
+    state: dict | None,
+    topic: dict | None,
+) -> dict | None:
+    """
+    Repair final checkpoint state if LangGraph dropped researcher literature fields.
+
+    The researcher logs may show a valid literature query bundle, but the final
+    checkpoint sometimes loses:
+      - research_query
+      - literature_query_bundle
+      - literature_topic_profile
+      - streamed_queries
+      - streaming_started
+
+    This repair prevents empty postrun manifests and LiteratureMemory records.
+    """
+    if not isinstance(state, dict):
+        return state
+
+    topic = topic or {}
+    out = dict(state)
+
+    if not out.get("literature_query_bundle"):
+        repaired_queries = _topic_literature_queries_from_topic_and_state(topic, out)
+        out["literature_query_bundle"] = repaired_queries
+
+    if not out.get("research_query") and out.get("literature_query_bundle"):
+        out["research_query"] = out["literature_query_bundle"][0]
+
+    if not out.get("literature_topic_profile"):
+        research_topic = (
+            out.get("research_topic")
+            or topic.get("research_topic")
+            or topic.get("name")
+            or topic.get("topic_name")
+        )
+
+        topic_name = (
+            out.get("topic_name")
+            or topic.get("topic_name")
+            or topic.get("name")
+            or research_topic
+        )
+
+        task_text = " ".join(
+            str(x or "")
+            for x in [
+                research_topic,
+                topic_name,
+                out.get("research_query"),
+                " ".join(out.get("literature_query_bundle", []) or []),
+            ]
+        ).lower()
+
+        out["literature_topic_profile"] = {
+            "topic_name": topic_name,
+            "research_topic": research_topic,
+            "virus_family": out.get("virus_family") or topic.get("virus_family"),
+            "virus_genus": out.get("virus_genus") or topic.get("virus_genus"),
+            "virus_name": out.get("virus_name") or topic.get("virus_name"),
+            "task_type": (
+                "inhibitor_screening"
+                if (
+                    "inhibitor" in task_text
+                    or "small molecule" in task_text
+                    or "small-molecule" in task_text
+                    or "peptide" in task_text
+                )
+                else "rna_docking"
+            ),
+        }
+
+    if not out.get("streamed_queries") and out.get("literature_query_bundle"):
+        out["streamed_queries"] = list(out.get("literature_query_bundle") or [])
+
+    if out.get("streamed_queries"):
+        out["streaming_started"] = True
+
+    return out
+
+
+def _overlap_score_from_comparison(comparison: Any) -> float:
+    """
+    Return inhibitor/RNA overlap as 0-1 score.
+    """
+    if not isinstance(comparison, dict):
+        return 0.0
+
+    if comparison.get("overlap_score") is not None:
+        try:
+            return float(comparison.get("overlap_score") or 0.0)
+        except Exception:
+            return 0.0
+
+    if comparison.get("overlap_percent") is not None:
+        try:
+            return float(comparison.get("overlap_percent") or 0.0) / 100.0
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
+def _overlap_percent_from_comparison(comparison: Any) -> float:
+    """
+    Return inhibitor/RNA overlap as percent.
+    """
+    if not isinstance(comparison, dict):
+        return 0.0
+
+    if comparison.get("overlap_percent") is not None:
+        try:
+            return float(comparison.get("overlap_percent") or 0.0)
+        except Exception:
+            return 0.0
+
+    if comparison.get("overlap_score") is not None:
+        try:
+            return float(comparison.get("overlap_score") or 0.0) * 100.0
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
+def _comparison_from_stage_metadata(state: dict, key: str) -> Any:
+    """
+    Recover inhibitor comparison dictionaries from inhibitor stage metadata if
+    top-level checkpoint fields were dropped.
+    """
+    if not isinstance(state, dict):
+        return None
+
+    for stage in reversed(state.get("stage_outputs", []) or []):
+        if not isinstance(stage, dict):
+            continue
+
+        stage_name = stage.get("stage") or stage.get("agent")
+
+        if stage_name != "inhibitor":
+            continue
+
+        metadata = stage.get("metadata") or {}
+
+        if isinstance(metadata, dict) and metadata.get(key) is not None:
+            return metadata.get(key)
+
+    return None
 
 # ---------------------------------------------------------------------------
 # Docking/interface scoring helpers
@@ -231,12 +380,13 @@ def _normalise_partial_success_target_ids(records: list[Any]) -> list[str]:
 
 def _effective_partial_success_target_ids(state: dict) -> list[str]:
     """
-    Partial-success target IDs after removing any final accepted target.
+    Partial-success target IDs after resolving stale accepted/resolved records.
 
-    This fixes stale state such as:
-      target_status=accepted_target
-      target_pdb=8K75
-      partial_success_targets=[8K75]
+    Rules:
+      - If final target_status is accepted_target, accepted target is not partial.
+      - If a target is explicitly resolved, it is not exported as still partial.
+      - If final target_status is partial_success_target, final state wins and
+        target remains partial, not resolved.
     """
     if not isinstance(state, dict):
         return []
@@ -247,6 +397,12 @@ def _effective_partial_success_target_ids(state: dict) -> list[str]:
         )
     )
 
+    resolved = set(
+        str(x).strip().upper()
+        for x in (state.get("resolved_partial_success_targets", []) or [])
+        if x
+    )
+
     target_status = state.get("target_status")
     accepted = str(
         state.get("target_pdb")
@@ -254,13 +410,27 @@ def _effective_partial_success_target_ids(state: dict) -> list[str]:
         or ""
     ).strip().upper()
 
-    if accepted and target_status == "accepted_target":
+    if target_status == "accepted_target" and accepted:
         partial.discard(accepted)
+
+    partial -= resolved
+
+    if target_status == "partial_success_target" and accepted:
+        partial.add(accepted)
 
     return sorted(partial)
 
 
-def _effective_resolved_partial_success_target_ids(state: dict) -> list[str]:
+def _effective_resolved_partial_success_target_ids(state: dict) -> list:
+    """
+    Resolved partial-success targets.
+
+    Rules:
+      - If final target_status is partial_success_target, do not also mark the
+        same target as resolved.
+      - If final target_status is accepted_target, mark accepted target as
+        resolved partial-success if it appeared in previous memory/state.
+    """
     if not isinstance(state, dict):
         return []
 
@@ -277,8 +447,11 @@ def _effective_resolved_partial_success_target_ids(state: dict) -> list[str]:
         or ""
     ).strip().upper()
 
-    if accepted and target_status == "accepted_target":
+    if target_status == "partial_success_target" and accepted:
         resolved.discard(accepted)
+
+    if target_status == "accepted_target" and accepted:
+        resolved.add(accepted)
 
     return sorted(resolved)
 
@@ -911,12 +1084,18 @@ def _topic_literature_queries_from_topic_and_state(
 
     return queries[: _env_int("VLAB_POSTRUN_LIT_QUERY_LIMIT", 5)]
 
-
 # ---------------------------------------------------------------------------
 # JSON/example helpers
 # ---------------------------------------------------------------------------
 
 def _jsonable(obj: Any) -> Any:
+    """
+    Convert common Python / NumPy / Pydantic / Path objects into JSON-safe
+    builtins before json.dumps.
+
+    Important: this must be safe for nested state dicts containing np.float32,
+    np.float64, np.int64, np.bool_, arrays, sets, paths, and model objects.
+    """
     if obj is None:
         return None
 
@@ -926,8 +1105,22 @@ def _jsonable(obj: Any) -> Any:
     if isinstance(obj, Path):
         return str(obj)
 
+    # NumPy scalar support without hard importing numpy everywhere.
+    if hasattr(obj, "item") and not isinstance(obj, (dict, list, tuple, set, str, bytes)):
+        try:
+            return _jsonable(obj.item())
+        except Exception:
+            pass
+
+    # NumPy array / pandas-like object support.
+    if hasattr(obj, "tolist"):
+        try:
+            return _jsonable(obj.tolist())
+        except Exception:
+            pass
+
     if isinstance(obj, Mapping):
-        return {str(k): _jsonable(v) for k, v in obj.items()}
+        return {str(_jsonable(k)): _jsonable(v) for k, v in obj.items()}
 
     if isinstance(obj, (list, tuple, set)):
         return [_jsonable(v) for v in obj]
@@ -944,14 +1137,15 @@ def _jsonable(obj: Any) -> Any:
         except Exception:
             pass
 
-    if hasattr(obj, "item"):
-        try:
-            return obj.item()
-        except Exception:
-            pass
-
     return repr(obj)
 
+def _json_dumps(payload: Any, **kwargs: Any) -> str:
+    """
+    JSON dump wrapper that always sanitizes NumPy/Pydantic/Path objects first.
+    Use this for all embedded JSON strings inside training examples.
+    """
+    kwargs.setdefault("ensure_ascii", False)
+    return json.dumps(_jsonable(payload), **kwargs)
 
 def _truncate(text: Any, limit: int = 4000) -> str:
     text = "" if text is None else str(text)
@@ -961,7 +1155,7 @@ def _truncate(text: Any, limit: int = 4000) -> str:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(_jsonable(payload), indent=2, ensure_ascii=False) + "\n",
+        _json_dumps(payload, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -974,7 +1168,7 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             if not isinstance(row, dict):
                 continue
 
-            handle.write(json.dumps(_jsonable(row), ensure_ascii=False) + "\n")
+            handle.write(_json_dumps(row) + "\n")
 
 
 def _as_supervised(example: dict) -> dict | None:
@@ -1154,7 +1348,7 @@ def _extract_stage_examples(state: dict) -> list[dict]:
                     f"Given the current Virtual Lab context, produce the {agent} "
                     "agent output and concise summary."
                 ),
-                "input": json.dumps(
+                "input": _json_dumps(
                     {
                         "research_topic": state.get("research_topic"),
                         "hypothesis": state.get("hypothesis"),
@@ -1165,8 +1359,8 @@ def _extract_stage_examples(state: dict) -> list[dict]:
                         "metadata": metadata,
                     },
                     indent=2,
-                    ensure_ascii=False,
                 ),
+
                 "output": _truncate(output, 5000),
                 "metadata": {
                     "agent": agent,
@@ -1194,14 +1388,13 @@ def _extract_structural_selection_examples(state: dict) -> list[dict]:
                 "Prioritise candidates passing fold thresholds, with adequate pair "
                 "density and favourable MFE per nucleotide."
             ),
-            "input": json.dumps(
+            "input": _json_dumps(
                 {
                     "candidates": candidates,
                     "fold_thresholds_passed": state.get("fold_thresholds_passed"),
                     "fold_threshold_reasons": state.get("fold_threshold_reasons", []),
                 },
                 indent=2,
-                ensure_ascii=False,
             ),
             "output": target_sequence,
             "metadata": {
@@ -1254,8 +1447,8 @@ def _extract_docking_examples(state: dict) -> tuple[list[dict], list[dict]]:
                 "them as physical kcal/mol binding energies. Consider interface "
                 "contact topology and steric clash flags when interpreting pose quality."
             ),
-            "input": json.dumps(sanitized_valid, indent=2, ensure_ascii=False),
-            "output": json.dumps(
+            "input": _json_dumps(sanitized_valid, indent=2),
+            "output": _json_dumps(
                 [
                     {
                         "rank": i + 1,
@@ -1293,7 +1486,6 @@ def _extract_docking_examples(state: dict) -> tuple[list[dict], list[dict]]:
                     for i, r in enumerate(valid)
                 ],
                 indent=2,
-                ensure_ascii=False,
             ),
             "metadata": {
                 "source": "binding_results",
@@ -1488,7 +1680,7 @@ def _extract_target_filter_examples(state: dict) -> list[dict]:
                 "targets as lower-confidence priority candidates, but do not treat "
                 "them as final accepted targets unless interface validation passes."
             ),
-            "input": json.dumps(
+            "input": _json_dumps(
                 {
                     "target_pdb_rankings": rankings,
                     "failed_target_pdbs": failed,
@@ -1499,9 +1691,8 @@ def _extract_target_filter_examples(state: dict) -> list[dict]:
                     "target_status_reason": state.get("target_status_reason"),
                 },
                 indent=2,
-                ensure_ascii=False,
             ),
-            "output": json.dumps(
+            "output": _json_dumps(
                 {
                     "selected_target_pdb": accepted,
                     "partial_success_targets": partial_ids,
@@ -1516,7 +1707,6 @@ def _extract_target_filter_examples(state: dict) -> list[dict]:
                     ),
                 },
                 indent=2,
-                ensure_ascii=False,
             ),
             "metadata": {
                 "source": "target_selection",
@@ -1587,7 +1777,7 @@ def _extract_partial_success_target_examples(state: dict) -> list[dict]:
                     "a final accepted target. HDOCK scores are relative docking "
                     "scores only, not physical binding free energies."
                 ),
-                "input": json.dumps(
+                "input": _json_dumps(
                     {
                         "target_pdb": pdb,
                         "status": rec.get("status"),
@@ -1603,7 +1793,6 @@ def _extract_partial_success_target_examples(state: dict) -> list[dict]:
                         "target_pdb_selection_reason": state.get("target_pdb_selection_reason"),
                     },
                     indent=2,
-                    ensure_ascii=False,
                 ),
                 "output": (
                     "TARGET_STATUS: partial_success_target\n"
@@ -1698,7 +1887,7 @@ def _extract_literature_target_policy_examples(state: dict) -> list[dict]:
                 "Given literature evidence for an RNA docking topic, derive a "
                 "target-selection policy for RCSB/PDB protein target selection."
             ),
-            "input": json.dumps(
+            "input": _json_dumps(
                 {
                     "research_topic": state.get("research_topic"),
                     "topic_name": state.get("topic_name"),
@@ -1711,7 +1900,6 @@ def _extract_literature_target_policy_examples(state: dict) -> list[dict]:
                     "partial_success_targets": _effective_partial_success_target_ids(state),
                 },
                 indent=2,
-                ensure_ascii=False,
             ),
             "output": output,
             "metadata": {
@@ -1753,7 +1941,7 @@ def _extract_critique_revision_examples(state: dict) -> list[dict]:
                 "action for the PI agent. Use qualitative language and avoid copying "
                 "exact thresholds into the hypothesis."
             ),
-            "input": json.dumps(
+            "input": _json_dumps(
                 {
                     "hypothesis": hypothesis,
                     "critique": critique_for_training,
@@ -1767,7 +1955,6 @@ def _extract_critique_revision_examples(state: dict) -> list[dict]:
                     "best_interface_clean_sequence": state.get("best_interface_clean_sequence"),
                 },
                 indent=2,
-                ensure_ascii=False,
             ),
             "output": output_text,
             "metadata": {
@@ -1819,7 +2006,7 @@ def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
                     "binding energies are approximate kcal/mol estimates, not exact "
                     "experimental values."
                 ),
-                "input": json.dumps(
+                "input": _json_dumps(
                     {
                         "target_pdb": state.get("target_pdb"),
                         "n_screened": len(small_mols),
@@ -1839,9 +2026,8 @@ def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
                         ],
                     },
                     indent=2,
-                    ensure_ascii=False,
                 ),
-                "output": json.dumps(
+                "output": _json_dumps(
                     [
                         {
                             "rank": i + 1,
@@ -1932,7 +2118,7 @@ def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
                     "indicates better predicted relative rank. HDOCK scores are relative "
                     "docking scores, not physical binding free energies."
                 ),
-                "input": json.dumps(
+                "input": _json_dumps(
                     {
                         "target_pdb": state.get("target_pdb"),
                         "n_screened": len(peptides),
@@ -1950,9 +2136,8 @@ def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
                         ],
                     },
                     indent=2,
-                    ensure_ascii=False,
                 ),
-                "output": json.dumps(
+                "output": _json_dumps(
                     [
                         {
                             "rank": i + 1,
@@ -1970,7 +2155,6 @@ def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
                         for i, r in enumerate(valid_pep)
                     ],
                     indent=2,
-                    ensure_ascii=False,
                 ),
                 "metadata": {
                     "source": "inhibitor_peptides",
@@ -2030,7 +2214,7 @@ def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
                     "binding poses. Higher overlap indicates the inhibitor competes with "
                     "RNA for the same pocket, suggesting competitive inhibition potential."
                 ),
-                "input": json.dumps(
+                "input": _json_dumps(
                     {
                         "target_pdb": state.get("target_pdb"),
                         "overlap_percent": overlap,
@@ -2039,7 +2223,6 @@ def _extract_inhibitor_examples(state: dict) -> tuple[list[dict], list[dict]]:
                         "best_peptide": valid_pep[0] if valid_pep else None,
                     },
                     indent=2,
-                    ensure_ascii=False,
                 ),
                 "output": (
                     f"Binding-site overlap with RNA interface: {overlap:.1f}%. "
@@ -2094,7 +2277,7 @@ def _extract_interface_critique_examples(state: dict) -> list[dict]:
                     "score and interface contact metrics. Do not treat HDOCK as "
                     "a physical binding free energy."
                 ),
-                "input": json.dumps(
+                "input": _json_dumps(
                     {
                         "sequence": r.get("sequence"),
                         "target_pdb": r.get("target_pdb"),
@@ -2114,7 +2297,6 @@ def _extract_interface_critique_examples(state: dict) -> list[dict]:
                         "interface_cluster_count": r.get("interface_cluster_count"),
                     },
                     indent=2,
-                    ensure_ascii=False,
                 ),
                 "output": (
                     f"VERDICT: {verdict}\n"
@@ -2274,7 +2456,7 @@ def _extract_final_summary_example(state: dict) -> list[dict]:
                 "from physical binding energies, and report whether interface "
                 "validation passed."
             ),
-            "input": json.dumps(summary, indent=2, ensure_ascii=False),
+            "input": _json_dumps(summary, indent=2),
             "output": output_text,
             "metadata": {
                 "source": "final_state",
@@ -2481,7 +2663,7 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
     try:
         state = _load_checkpoint_or_state(final_state)
         state = _state_with_topic_defaults(state, topic)
-
+        state = _repair_literature_state_from_topic(state, topic)
         literature_rows: list[dict] = []
 
         if state is not None:
@@ -2641,13 +2823,46 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             ligand_type="peptide",
         )
 
-        inhibitor_overlap = (state or {}).get("inhibitor_binding_site_overlap", 0.0)
-        inhibitor_pose_comparison = (state or {}).get("inhibitor_pose_comparison") or {}
-        inhibitor_sm_comparison = (state or {}).get("inhibitor_small_molecule_comparison")
-        inhibitor_pep_comparison = (state or {}).get("inhibitor_peptide_comparison")
+        inhibitor_pose_comparison = (
+            (state or {}).get("inhibitor_pose_comparison")
+            or _comparison_from_stage_metadata(state or {}, "inhibitor_pose_comparison")
+            or {}
+        )
+
+        inhibitor_sm_comparison = (
+            (state or {}).get("inhibitor_small_molecule_comparison")
+            or _comparison_from_stage_metadata(state or {}, "inhibitor_small_molecule_comparison")
+        )
+
+        inhibitor_pep_comparison = (
+            (state or {}).get("inhibitor_peptide_comparison")
+            or _comparison_from_stage_metadata(state or {}, "inhibitor_peptide_comparison")
+        )
+
+        inhibitor_overlap_score = (
+            (state or {}).get("inhibitor_binding_site_overlap_score")
+        )
+
+        if inhibitor_overlap_score is None:
+            inhibitor_overlap_score = _overlap_score_from_comparison(inhibitor_pose_comparison)
+
+        try:
+            inhibitor_overlap_score = float(inhibitor_overlap_score or 0.0)
+        except Exception:
+            inhibitor_overlap_score = 0.0
+
+        inhibitor_overlap = (state or {}).get("inhibitor_binding_site_overlap")
+
+        if inhibitor_overlap is None:
+            inhibitor_overlap = _overlap_percent_from_comparison(inhibitor_pose_comparison)
+
+        try:
+            inhibitor_overlap = float(inhibitor_overlap or 0.0)
+        except Exception:
+            inhibitor_overlap = 0.0
 
         manifest = {
-            "schema_version": "postrun_training_manifest.v7",
+            "schema_version": "postrun_training_manifest.v8",
             "topic_name": _topic_name(topic, state or {}),
             "research_topic": _research_topic(topic, state or {}),
             "virus_family": (state or {}).get("virus_family"),
@@ -2709,13 +2924,35 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             ),
             "inhibitor_peptide_raw_count": len(peptides_raw),
             "inhibitor_binding_site_overlap_percent": inhibitor_overlap,
+            "inhibitor_binding_site_overlap_score": inhibitor_overlap_score,
             "inhibitor_pose_comparison": inhibitor_pose_comparison,
             "inhibitor_small_molecule_comparison": inhibitor_sm_comparison,
             "inhibitor_peptide_comparison": inhibitor_pep_comparison,
-            "inhibitor_pose_comparison_method": inhibitor_pose_comparison.get("method"),
-            "inhibitor_pose_comparison_ligand_type": inhibitor_pose_comparison.get("ligand_type"),
-            "inhibitor_pose_overlap_percent": inhibitor_pose_comparison.get("overlap_percent"),
-            "inhibitor_pose_min_distance_A": inhibitor_pose_comparison.get("min_distance_A"),
+            "inhibitor_pose_comparison_method": (
+                inhibitor_pose_comparison.get("method")
+                if isinstance(inhibitor_pose_comparison, dict)
+                else None
+            ),
+            "inhibitor_pose_comparison_ligand_type": (
+                inhibitor_pose_comparison.get("ligand_type")
+                if isinstance(inhibitor_pose_comparison, dict)
+                else None
+            ),
+            "inhibitor_pose_overlap_percent": (
+                inhibitor_pose_comparison.get("overlap_percent")
+                if isinstance(inhibitor_pose_comparison, dict)
+                else None
+            ),
+            "inhibitor_pose_overlap_score": (
+                inhibitor_pose_comparison.get("overlap_score")
+                if isinstance(inhibitor_pose_comparison, dict)
+                else None
+            ),
+            "inhibitor_pose_min_distance_A": (
+                inhibitor_pose_comparison.get("min_distance_A")
+                if isinstance(inhibitor_pose_comparison, dict)
+                else None
+            ),
             "small_molecule_preference_count": small_molecule_preference_count,
             "peptide_preference_count": peptide_preference_count,
 
@@ -2812,4 +3049,4 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             log.warning("Post-run knowledge refresh failed/non-fatal: %s", e)
 
     except Exception as e:
-        log.warning("Post-run training pipeline failed/non-fatal: %s", e)
+        log.exception("Post-run training pipeline failed/non-fatal")

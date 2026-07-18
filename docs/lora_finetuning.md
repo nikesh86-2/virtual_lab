@@ -1,7 +1,7 @@
 # LoRA Fine‑tuning Documentation
 
 ## Overview
-Low‑Rank Adaptation (LoRA) is used to fine‑tune the large language model that powers the VLAB2 agents without retraining the entire model. The pipeline is located under `bot/VLAB2/training/` and can be invoked automatically when the environment variable `VLAB_LORA_TRAIN=1` is set.
+Low‑Rank Adaptation (LoRA) is used to fine‑tune the large language model that powers the VLAB2 agents without retraining the entire model. The pipeline is located under `training/` and can be invoked automatically when the environment variable `VLAB_LORA_TRAIN=1` is set.
 
 ## Workflow
 1. **Data preparation**
@@ -49,7 +49,7 @@ Low‑Rank Adaptation (LoRA) is used to fine‑tune the large language model tha
 
 ### Training Config (`training/training_config.yaml`)
 ```yaml
-model_name: /path/to/base/model
+model_name: /scratch/fbsnpat/bot/VLAB2/hf_cache/hub/models--Qwen--Qwen2.5-32B-Instruct/snapshots/5ede1c97bbab6ce5cda5812749b4c0bdf79b18dd
 output_dir: training/output_model
 max_length: 4096
 
@@ -142,4 +142,4 @@ python training/model_version_tracker.py cleanup [max_versions]
 - **Model replacement failing**: Check `VLAB_AUTO_MODEL_REPLACE=1` and vLLM configuration
 
 ---
-*Last updated: 2026‑07‑01*
+*Last updated: 2026-07-15*

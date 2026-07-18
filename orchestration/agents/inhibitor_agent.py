@@ -6,7 +6,7 @@ the protein_agent's interface contacts. Coordinates:
   1. Pocket definition (RNA-binding site centroid + box dimensions)
   2. Small-molecule fetching from PubChem + AutoDock Vina docking
   3. Peptide design/fetching + HDOCK protein-protein docking
-  4. Pose comparison with RNA-protein complex (CA-RMSD proxy)
+  4. Pose comparison with RNA-protein complex
   5. Snapshot rendering via PyMOL
 
 State inputs
@@ -20,15 +20,19 @@ State inputs
 
 State outputs
 -------------
-  inhibitor_small_molecules     : list[dict]
-  inhibitor_peptides            : list[dict]
-  inhibitor_analysis            : str
-  inhibitor_summary             : str
-  inhibitor_binding_site_overlap: float
-  inhibitor_docking_box         : dict
-  inhibitor_snapshot_paths      : list[str]
-  stage_outputs                 : list[dict]
-  conversation_history          : list[dict]
+  inhibitor_small_molecules                 : list[dict]
+  inhibitor_peptides                        : list[dict]
+  inhibitor_analysis                        : str
+  inhibitor_summary                         : str
+  inhibitor_binding_site_overlap            : float  # percent, legacy-compatible
+  inhibitor_binding_site_overlap_score      : float  # 0-1
+  inhibitor_pose_comparison                 : dict
+  inhibitor_small_molecule_comparison       : dict | None
+  inhibitor_peptide_comparison              : dict | None
+  inhibitor_docking_box                     : dict
+  inhibitor_snapshot_paths                  : list[str]
+  stage_outputs                             : list[dict]
+  conversation_history                      : list[dict]
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from VLAB2.core.gpu_manager import clear_gpu
 from VLAB2.core.inhibitor_docking import run_inhibitor_screen
 from VLAB2.core.peptide_prep import (
     design_inhibitor_peptides,
@@ -57,8 +62,8 @@ from VLAB2.orchestration.utils.checkpointing import save_checkpoint
 from VLAB2.orchestration.utils.docking_visuals import (
     render_inhibitor_snapshots_for_results,
 )
-from VLAB2.core.gpu_manager import clear_gpu
 from VLAB2.orchestration.utils.text_utils import _safe_file_tag
+
 
 log = logging.getLogger("virtual_lab")
 
@@ -69,10 +74,13 @@ log = logging.getLogger("virtual_lab")
 
 def _env_bool(key: str, default: bool = False) -> bool:
     val = os.getenv(key, "").strip().lower()
+
     if val in ("1", "true", "yes", "on"):
         return True
+
     if val in ("0", "false", "no", "off"):
         return False
+
     return default
 
 
@@ -97,6 +105,7 @@ def _env_str(key: str, default: str) -> str:
 def _is_valid_pdb(path: str | None) -> bool:
     if not path:
         return False
+
     p = Path(path)
     return p.exists() and p.stat().st_size > 100
 
@@ -104,10 +113,41 @@ def _is_valid_pdb(path: str | None) -> bool:
 def _looks_like_pdb_id(value: Any) -> bool:
     if not isinstance(value, str):
         return False
+
     raw = value.strip()
     return len(raw) == 4 and raw.isalnum()
 
-def _rna_pose_paths_from_state(state: dict) -> list:
+
+def _empty_inhibitor_update(
+    analysis: str,
+    summary: str | None = None,
+    enabled: bool = True,
+) -> dict:
+    """
+    Return a complete inhibitor-update payload for disabled/skipped/error paths.
+    Keeps downstream manifest/export code from seeing missing keys.
+    """
+    summary = summary or analysis
+
+    return {
+        "inhibitor_enabled": enabled,
+        "inhibitor_small_molecules": [],
+        "inhibitor_peptides": [],
+        "inhibitor_analysis": analysis,
+        "inhibitor_summary": summary,
+        "inhibitor_binding_site_overlap": 0.0,
+        "inhibitor_binding_site_overlap_score": 0.0,
+        "inhibitor_pose_comparison": {},
+        "inhibitor_small_molecule_comparison": None,
+        "inhibitor_peptide_comparison": None,
+        "inhibitor_docking_box": {},
+        "inhibitor_snapshot_paths": [],
+        "stage_outputs": [],
+        "conversation_history": [],
+    }
+
+
+def _rna_pose_paths_from_state(state: dict) -> list[str]:
     """
     Extract RNA-protein complex PDB paths from state.
 
@@ -119,13 +159,11 @@ def _rna_pose_paths_from_state(state: dict) -> list:
     out: list[str] = []
     seen: set[str] = set()
 
-    candidates = []
+    candidates: list[Any] = []
 
-    # Primary source: protein_agent binding results
     for r in state.get("binding_results", []) or []:
         candidates.append(r)
 
-    # Defensive support if some pipeline state already has pose lists
     for key in (
         "rna_poses",
         "rna_pose_files",
@@ -166,6 +204,7 @@ def _rna_pose_paths_from_state(state: dict) -> list:
 
     return out
 
+
 def _resolve_target_pdb_from_state(state: dict) -> tuple[str | None, str | None]:
     """
     Resolve target PDB path and PDB ID from state.
@@ -190,12 +229,14 @@ def _resolve_target_pdb_from_state(state: dict) -> tuple[str | None, str | None]
     if _is_valid_pdb(target_pdb):
         if _looks_like_pdb_id(str(target_pdb_id)):
             return str(target_pdb), str(target_pdb_id).strip().upper()
+
         return str(target_pdb), None
 
     pdb_id = None
 
     if _looks_like_pdb_id(raw_target):
         pdb_id = str(raw_target).strip().upper()
+
     elif _looks_like_pdb_id(target_pdb_id):
         pdb_id = str(target_pdb_id).strip().upper()
 
@@ -207,6 +248,7 @@ def _resolve_target_pdb_from_state(state: dict) -> tuple[str | None, str | None]
 
         if candidates:
             first = candidates[0]
+
             if isinstance(first, dict):
                 candidate = first.get("target_pdb") or first.get("pdb_id")
             else:
@@ -220,6 +262,7 @@ def _resolve_target_pdb_from_state(state: dict) -> tuple[str | None, str | None]
             log.info("inhibitor_agent: resolving PDB ID to file: %s", pdb_id)
             target_pdb = ensure_protein_pdb(pdb_id)
             log.info("inhibitor_agent: resolved target_pdb=%s", target_pdb)
+
         except Exception as e:
             log.warning("inhibitor_agent: failed to resolve PDB ID %s: %s", pdb_id, e)
             target_pdb = None
@@ -245,6 +288,7 @@ def _reset_selected_dir(path: str | Path, suffixes: tuple[str, ...]) -> None:
 
     p.mkdir(parents=True, exist_ok=True)
 
+
 def _compound_pdbqt_path(compound: dict) -> str | None:
     """
     Recover prepared ligand PDBQT path from compound metadata.
@@ -262,6 +306,7 @@ def _compound_pdbqt_path(compound: dict) -> str | None:
         "ligand_path",
     ):
         value = compound.get(key)
+
         if value and Path(str(value)).exists():
             return str(value)
 
@@ -271,7 +316,7 @@ def _compound_pdbqt_path(compound: dict) -> str | None:
 def _copy_selected_ligands(
     compounds: list[dict],
     selected_dir: str | Path,
-) -> list[dict]:
+) -> list[str]:
     """
     Copy only this run's selected ligand PDBQT files into an isolated directory.
 
@@ -289,6 +334,7 @@ def _copy_selected_ligands(
             continue
 
         src = _compound_pdbqt_path(compound)
+
         if not src:
             log.warning(
                 "Skipping selected ligand with no PDBQT path: name=%s cid=%s",
@@ -298,6 +344,7 @@ def _copy_selected_ligands(
             continue
 
         src_path = Path(src)
+
         if not src_path.exists():
             continue
 
@@ -308,10 +355,10 @@ def _copy_selected_ligands(
             or src_path.stem
             or f"ligand_{idx}"
         )
+
         safe_name = _safe_file_tag(str(name))
         dest = selected_path / f"{safe_name}.pdbqt"
 
-        # Avoid overwriting two different compounds with the same display name.
         if str(dest) in seen_dest:
             dest = selected_path / f"{safe_name}_{idx}.pdbqt"
 
@@ -320,8 +367,10 @@ def _copy_selected_ligands(
         try:
             if src_path.resolve() != dest.resolve():
                 shutil.copy2(src_path, dest)
+
         except FileNotFoundError:
             continue
+
         except Exception as e:
             log.warning("Could not copy selected ligand %s -> %s: %s", src_path, dest, e)
             continue
@@ -329,6 +378,7 @@ def _copy_selected_ligands(
         row = dict(compound)
         row["selected_pdbqt"] = str(dest)
         row["pdbqt_path"] = str(dest)
+
         copied.append(row)
 
     return copied
@@ -337,7 +387,7 @@ def _copy_selected_ligands(
 def _copy_selected_peptides(
     prepared_peptides: list[dict],
     selected_dir: str | Path,
-) -> list[dict]:
+) -> list[str]:
     """
     Copy only this run's selected clean peptide PDB files into an isolated directory.
 
@@ -363,6 +413,7 @@ def _copy_selected_peptides(
 
         if seq in seen_seq:
             continue
+
         seen_seq.add(seq)
 
         if not clean_pdb or not Path(str(clean_pdb)).exists():
@@ -377,7 +428,6 @@ def _copy_selected_peptides(
         src_path = Path(str(clean_pdb))
         dest = selected_path / src_path.name
 
-        # The docking module expects clean_peptide_<hash>_<seq>.pdb.
         if not dest.name.startswith("clean_peptide_"):
             safe_seq = _safe_file_tag(seq)
             dest = selected_path / f"clean_peptide_selected_{idx}_{safe_seq}.pdb"
@@ -385,6 +435,7 @@ def _copy_selected_peptides(
         try:
             if src_path.resolve() != dest.resolve():
                 shutil.copy2(src_path, dest)
+
         except Exception as e:
             log.warning("Could not copy selected peptide %s -> %s: %s", src_path, dest, e)
             continue
@@ -392,12 +443,13 @@ def _copy_selected_peptides(
         row = dict(pep)
         row["selected_clean_pdb"] = str(dest)
         row["clean_pdb"] = str(dest)
+
         copied.append(row)
 
     return copied
 
 
-def _dedupe_compounds(compounds: list[dict], max_count: int) -> list:
+def _dedupe_compounds(compounds: list[dict], max_count: int) -> list[str]:
     """
     Deduplicate compounds robustly.
 
@@ -405,9 +457,6 @@ def _dedupe_compounds(compounds: list[dict], max_count: int) -> list:
       1. SMILES, if present
       2. PubChem CID, if present
       3. normalised compound name
-
-    This prevents the same compound being counted multiple times when
-    metadata differs slightly across curated/PubChem sources.
     """
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -427,10 +476,13 @@ def _dedupe_compounds(compounds: list[dict], max_count: int) -> list:
 
         if smiles:
             key = ("smiles", smiles)
+
         elif cid:
             key = ("cid", cid)
+
         elif name:
             key = ("name", name)
+
         else:
             continue
 
@@ -445,7 +497,8 @@ def _dedupe_compounds(compounds: list[dict], max_count: int) -> list:
 
     return out
 
-def _dedupe_peptide_specs(peptides: list[dict], max_count: int) -> list[dict]:
+
+def _dedupe_peptide_specs(peptides: list[dict], max_count: int) -> list[str]:
     """
     Deduplicate peptide specs by uppercase sequence.
     """
@@ -462,6 +515,7 @@ def _dedupe_peptide_specs(peptides: list[dict], max_count: int) -> list[dict]:
             continue
 
         seen.add(seq)
+
         row = dict(p)
         row["sequence"] = seq
         out.append(row)
@@ -471,13 +525,14 @@ def _dedupe_peptide_specs(peptides: list[dict], max_count: int) -> list[dict]:
 
     return out
 
+
 def _enrich_inhibitor_rows(
     rows: list[dict],
     target_pdb_id: str | None,
     target_pdb_path: str | None,
     target_tag: str,
     ligand_type: str,
-) -> list[dict]:
+) -> list[str]:
     """
     Add consistent target and ligand-type metadata to inhibitor result rows.
     """
@@ -489,6 +544,7 @@ def _enrich_inhibitor_rows(
             continue
 
         row = dict(r)
+
         row["target_pdb"] = target_pdb_id or target_tag
         row["target_pdb_id"] = target_pdb_id or target_tag
         row["target_pdb_path"] = target_pdb_path
@@ -500,6 +556,7 @@ def _enrich_inhibitor_rows(
             row["binding_energy_is_physical"] = bool(
                 row.get("binding_energy_is_physical", True)
             )
+
         elif ligand_type == "peptide":
             row["binding_units"] = row.get("binding_units") or "hdock_relative_score"
             row["binding_energy_is_physical"] = False
@@ -512,6 +569,50 @@ def _enrich_inhibitor_rows(
     return enriched
 
 
+def _comparison_overlap_score(comparison: Any) -> float:
+    """
+    Extract overlap score in 0-1 scale from a comparison dict.
+    """
+    if not isinstance(comparison, dict):
+        return 0.0
+
+    if comparison.get("overlap_score") is not None:
+        try:
+            return float(comparison.get("overlap_score") or 0.0)
+        except Exception:
+            return 0.0
+
+    if comparison.get("overlap_percent") is not None:
+        try:
+            return float(comparison.get("overlap_percent") or 0.0) / 100.0
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
+def _comparison_overlap_percent(comparison: Any) -> float:
+    """
+    Extract overlap in percent from a comparison dict.
+    """
+    if not isinstance(comparison, dict):
+        return 0.0
+
+    if comparison.get("overlap_percent") is not None:
+        try:
+            return float(comparison.get("overlap_percent") or 0.0)
+        except Exception:
+            return 0.0
+
+    if comparison.get("overlap_score") is not None:
+        try:
+            return float(comparison.get("overlap_score") or 0.0) * 100.0
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
 def record_stage_output(
     state: dict,
     stage: str,
@@ -519,11 +620,23 @@ def record_stage_output(
     summary: str | None = None,
     metadata: dict | None = None,
 ) -> dict:
-    """Build a stage-output record matching protein_agent's format."""
+    """
+    Build a stage-output record matching the canonical LabState shape.
+
+    Includes both:
+      - agent/stage
+      - output/content
+
+    This prevents final reports from labelling the inhibitor agent as UNKNOWN.
+    """
+    content = "" if content is None else str(content)
+
     return {
+        "agent": stage,
         "stage": stage,
-        "content": content,
         "summary": summary or content[:200],
+        "output": content,
+        "content": content,
         "metadata": metadata or {},
     }
 
@@ -534,7 +647,9 @@ def add_conversation_entry(
     content: str,
     agent: str,
 ) -> dict:
-    """Build a conversation-history entry matching protein_agent's format."""
+    """
+    Build a conversation-history entry matching protein_agent's format.
+    """
     return {
         "role": role,
         "content": content,
@@ -555,24 +670,16 @@ def inhibitor_agent(state: dict) -> dict:
 
     if not _env_bool("VLAB_INHIBITOR_ENABLED", default=True):
         log.info("Inhibitor screening disabled (VLAB_INHIBITOR_ENABLED != 1)")
-        return {
-            "inhibitor_enabled": False,
-            "inhibitor_small_molecules": [],
-            "inhibitor_peptides": [],
-            "inhibitor_analysis": "Inhibitor screening disabled.",
-            "inhibitor_summary": "Inhibitor screening disabled.",
-            "inhibitor_binding_site_overlap": 0.0,
-            "inhibitor_docking_box": {},
-            "inhibitor_snapshot_paths": [],
-            "stage_outputs": [],
-            "conversation_history": [],
-        }
+        return _empty_inhibitor_update(
+            analysis="Inhibitor screening disabled.",
+            summary="Inhibitor screening disabled.",
+            enabled=False,
+        )
 
     result: dict[str, Any] = {}
 
     try:
         interface_contacts = state.get("interface_contacts")
-
         raw_target = state.get("target_pdb_path") or state.get("target_pdb")
 
         log.warning(
@@ -598,33 +705,19 @@ def inhibitor_agent(state: dict) -> dict:
                 target_pdb,
             )
 
-            return {
-                "inhibitor_enabled": True,
-                "inhibitor_small_molecules": [],
-                "inhibitor_peptides": [],
-                "inhibitor_analysis": "Skipped: no validated protein target.",
-                "inhibitor_summary": "Skipped: no validated protein target.",
-                "inhibitor_binding_site_overlap": 0.0,
-                "inhibitor_docking_box": {},
-                "inhibitor_snapshot_paths": [],
-                "stage_outputs": [],
-                "conversation_history": [],
-            }
+            return _empty_inhibitor_update(
+                analysis="Skipped: no validated protein target.",
+                summary="Skipped: no validated protein target.",
+                enabled=True,
+            )
 
         if not interface_contacts:
             log.warning("inhibitor_agent: interface_contacts not available, skipping")
-            return {
-                "inhibitor_enabled": True,
-                "inhibitor_small_molecules": [],
-                "inhibitor_peptides": [],
-                "inhibitor_analysis": "Skipped: no RNA-protein interface contacts.",
-                "inhibitor_summary": "Skipped: no RNA-protein interface contacts.",
-                "inhibitor_binding_site_overlap": 0.0,
-                "inhibitor_docking_box": {},
-                "inhibitor_snapshot_paths": [],
-                "stage_outputs": [],
-                "conversation_history": [],
-            }
+            return _empty_inhibitor_update(
+                analysis="Skipped: no RNA-protein interface contacts.",
+                summary="Skipped: no RNA-protein interface contacts.",
+                enabled=True,
+            )
 
         log.info("inhibitor_agent: starting inhibitor screening for %s", target_pdb)
 
@@ -695,10 +788,12 @@ def inhibitor_agent(state: dict) -> dict:
                     output_dir=str(run_ligand_dir),
                     target_tag=target_tag,
                 )
+
                 log.info(
                     "inhibitor_agent: fetched %d PubChem compounds",
                     len(pubchem_compounds or []),
                 )
+
             except Exception as e:
                 log.warning("inhibitor_agent: PubChem fetch failed: %s", e)
 
@@ -754,6 +849,7 @@ def inhibitor_agent(state: dict) -> dict:
                 "inhibitor_agent: LLM designed %d peptide candidates",
                 len(llm_designed_peptides or []),
             )
+
         except Exception as e:
             log.warning("inhibitor_agent: peptide design failed: %s", e)
 
@@ -762,7 +858,7 @@ def inhibitor_agent(state: dict) -> dict:
             max_count=max_peptides,
         )
 
-        peptide_list = []
+        peptide_list: list[dict] = []
 
         if peptide_specs:
             try:
@@ -836,6 +932,8 @@ def inhibitor_agent(state: dict) -> dict:
             docking_box=docking_box,
             rna_poses=rna_poses,
             max_small_molecules=max_small_mols,
+            vina_seed=_env_int("VLAB_VINA_SEED", 1),
+            force_vina_redock=_env_bool("VLAB_VINA_FORCE_REDOCK", False),
         )
 
         small_mol_results = screen_result.get("small_molecules", []) or []
@@ -858,14 +956,30 @@ def inhibitor_agent(state: dict) -> dict:
         )
 
         comparison = screen_result.get("comparison") or {}
-        binding_site_overlap = float(comparison.get("overlap_score", 0.0) or 0.0) * 100.0
+        small_molecule_comparison = screen_result.get("small_molecule_comparison")
+        peptide_comparison = screen_result.get("peptide_comparison")
+
+        binding_site_overlap_score = _comparison_overlap_score(comparison)
+        binding_site_overlap_percent = _comparison_overlap_percent(comparison)
 
         analysis_text = screen_result.get("summary", "")
 
         result["inhibitor_small_molecules"] = small_mol_results
         result["inhibitor_peptides"] = peptide_results
-        result["inhibitor_binding_site_overlap"] = binding_site_overlap
+        result["inhibitor_best_small_molecule"] = screen_result.get("best_small_molecule")
+        result["inhibitor_best_peptide"] = screen_result.get("best_peptide")
+        result["inhibitor_pose_comparison"] = comparison
+        result["inhibitor_small_molecule_comparison"] = small_molecule_comparison
+        result["inhibitor_peptide_comparison"] = peptide_comparison
+        result["inhibitor_binding_site_overlap"] = binding_site_overlap_percent
+        result["inhibitor_binding_site_overlap_score"] = binding_site_overlap_score
         result["inhibitor_analysis"] = analysis_text
+        result["inhibitor_vina_seed"] = screen_result.get("vina_seed")
+        result["inhibitor_vina_cache_hits"] = screen_result.get("vina_cache_hits", 0)
+        result["inhibitor_vina_cache_misses"] = screen_result.get("vina_cache_misses", 0)
+        result["inhibitor_vina_cache_enabled"] = screen_result.get(
+            "vina_cache_enabled", False
+        )
 
         # ------------------------------------------------------------
         # Step 5: Build summary
@@ -879,7 +993,7 @@ def inhibitor_agent(state: dict) -> dict:
             if isinstance(r, dict) and r.get("valid")
         )
 
-        summary_parts = []
+        summary_parts: list[str] = []
 
         if selected_small_mols or small_mol_results:
             summary_parts.append(
@@ -891,9 +1005,9 @@ def inhibitor_agent(state: dict) -> dict:
                 f"{n_valid_pep}/{len(peptide_results)} peptides docked successfully."
             )
 
-        if binding_site_overlap > 0:
+        if binding_site_overlap_percent > 0:
             summary_parts.append(
-                f"Binding-site overlap with RNA interface: {binding_site_overlap:.1f}%."
+                f"Binding-site overlap with RNA interface: {binding_site_overlap_percent:.1f}%."
             )
 
         if peptide_results:
@@ -904,6 +1018,13 @@ def inhibitor_agent(state: dict) -> dict:
 
         if not summary_parts:
             summary_parts.append("No inhibitors docked successfully.")
+
+        if small_mol_results:
+            summary_parts.append(
+                f"Vina cache: {screen_result.get('vina_cache_hits', 0)} hit(s), "
+                f"{screen_result.get('vina_cache_misses', 0)} miss(es), "
+                f"seed={screen_result.get('vina_seed')}."
+            )
 
         inhibitor_summary = " ".join(summary_parts)
         result["inhibitor_summary"] = inhibitor_summary
@@ -917,6 +1038,10 @@ def inhibitor_agent(state: dict) -> dict:
                 **result,
                 "target_pdb": target_pdb_id or target_tag,
                 "target_pdb_path": target_pdb,
+                "vina_seed": screen_result.get("vina_seed"),
+                "vina_cache_hits": screen_result.get("vina_cache_hits", 0),
+                "vina_cache_misses": screen_result.get("vina_cache_misses", 0),
+                "vina_cache_enabled": screen_result.get("vina_cache_enabled", False),
                 "target_pdb_id": target_pdb_id or target_tag,
             }
 
@@ -948,7 +1073,11 @@ def inhibitor_agent(state: dict) -> dict:
                 "n_selected_peptides": len(peptide_list),
                 "n_valid_small_molecules": n_valid_sm,
                 "n_valid_peptides": n_valid_pep,
-                "binding_site_overlap": binding_site_overlap,
+                "binding_site_overlap": binding_site_overlap_percent,
+                "binding_site_overlap_score": binding_site_overlap_score,
+                "inhibitor_pose_comparison": comparison,
+                "inhibitor_small_molecule_comparison": small_molecule_comparison,
+                "inhibitor_peptide_comparison": peptide_comparison,
                 "docking_box": docking_box,
                 "small_molecule_binding_units": "vina_kcal_mol",
                 "peptide_binding_units": "hdock_relative_score",
@@ -976,21 +1105,15 @@ def inhibitor_agent(state: dict) -> dict:
         # ------------------------------------------------------------
         save_checkpoint({**state, **result})
         clear_gpu()
+
         return result
 
     except Exception as e:
         log.exception("INHIBITOR AGENT ERROR")
         clear_gpu()
 
-        return {
-            "inhibitor_enabled": True,
-            "inhibitor_small_molecules": [],
-            "inhibitor_peptides": [],
-            "inhibitor_analysis": f"Inhibitor agent error: {e}",
-            "inhibitor_summary": f"Inhibitor agent error: {e}",
-            "inhibitor_binding_site_overlap": 0.0,
-            "inhibitor_docking_box": {},
-            "inhibitor_snapshot_paths": [],
-            "stage_outputs": [],
-            "conversation_history": [],
-        }
+        return _empty_inhibitor_update(
+            analysis=f"Inhibitor agent error: {e}",
+            summary=f"Inhibitor agent error: {e}",
+            enabled=True,
+        )

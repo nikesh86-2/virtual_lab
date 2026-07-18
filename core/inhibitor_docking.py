@@ -44,6 +44,7 @@ log = logging.getLogger("virtual_lab.inhibitor_docking")
 
 VINA_TIMEOUT = int(os.getenv("VINA_TIMEOUT", "600"))
 VINA_EXHAUSTIVENESS = int(os.getenv("VLAB_VINA_EXHAUSTIVENESS", "8"))
+VINA_SEED = int(os.getenv("VLAB_VINA_SEED", "1"))
 HDOCK_TIMEOUT = int(os.getenv("HDOCK_TIMEOUT", "1200"))
 HDOCK_N_MODELS = int(os.getenv("HDOCK_N_MODELS", "10"))
 REQUIRE_VINA = os.getenv("VLAB_REQUIRE_VINA", "0").lower() in {"1", "true", "yes"}
@@ -73,6 +74,8 @@ def dock_small_molecules(
     exhaustiveness: int = VINA_EXHAUSTIVENESS,
     vina_path: Optional[str] = None,
     max_ligands: int | None = None,
+    seed: int = VINA_SEED,
+    force_redock: bool | None = None,
 ) -> list:
     """
     Dock prepared small-molecule PDBQT files in ligands_dir against receptor.
@@ -135,9 +138,12 @@ def dock_small_molecules(
         ligand_files = ligand_files[:max_ligands]
 
     log.info(
-        "[INHIBITOR DOCK] Docking %d small molecules with Vina (exhaustiveness=%d)",
+        "[INHIBITOR DOCK] Docking %d small molecules with Vina "
+        "(exhaustiveness=%d seed=%d cache_enabled=%s)",
         len(ligand_files),
         exhaustiveness,
+        seed,
+        os.getenv("VLAB_VINA_CACHE_ENABLED", "1"),
     )
 
     for ligand_path in ligand_files:
@@ -149,6 +155,8 @@ def dock_small_molecules(
             center=center,
             size=size,
             exhaustiveness=exhaustiveness,
+            seed=seed,
+            force_redock=force_redock,
         )
 
         method = result.get("method", "vina")
@@ -173,12 +181,23 @@ def dock_small_molecules(
             "output_file": result.get("output_file"),
             "docked_pdbqt": result.get("output_file"),
             "error": result.get("error"),
+            "vina_seed": result.get("seed", seed),
+            "vina_exhaustiveness": result.get("exhaustiveness", exhaustiveness),
+            "vina_cache_hit": bool(result.get("cache_hit", False)),
+            "vina_cache_key": result.get("cache_key"),
+            "vina_cache_version": result.get("cache_version"),
         }
 
         results.append(row)
 
         if result.get("valid") and binding_energy is not None:
-            log.info("  → %s: %.3f kcal/mol", ligand_path.stem, binding_energy)
+            log.info(
+                "  → %s: %.3f kcal/mol seed=%s cache_hit=%s",
+                ligand_path.stem,
+                binding_energy,
+                row.get("vina_seed"),
+                row.get("vina_cache_hit"),
+            )
         else:
             log.warning("  → %s: FAILED (%s)", ligand_path.stem, result.get("error"))
 
@@ -1093,6 +1112,8 @@ def run_inhibitor_screen(
     small_molecule_results: Optional[list] = None,
     peptide_results: Optional[list] = None,
     max_small_molecules: int | None = None,
+    vina_seed: int = VINA_SEED,
+    force_vina_redock: bool | None = None,
 ) -> dict:
     """
     Run complete inhibitor screen.
@@ -1119,6 +1140,8 @@ def run_inhibitor_screen(
             center=center,
             size=size,
             max_ligands=max_small_molecules,
+            seed=vina_seed,
+            force_redock=force_vina_redock,
         )
 
     else:
@@ -1246,6 +1269,23 @@ def run_inhibitor_screen(
                 f"RNA overlap score: {comparison['overlap_score']:.2f} "
                 f"(legacy RMSD proxy: {comparison.get('min_rmsd', 0.0):.1f} Å)"
             )
+
+    vina_cache_hits = sum(
+        1 for row in sm_ranked
+        if isinstance(row, dict) and row.get("vina_cache_hit") is True
+    )
+    vina_cache_misses = sum(
+        1 for row in sm_ranked
+        if isinstance(row, dict)
+        and row.get("valid")
+        and row.get("vina_cache_hit") is not True
+    )
+
+    if sm_ranked:
+        summary_parts.append(
+            f"Vina cache: {vina_cache_hits} hit(s), {vina_cache_misses} miss(es), "
+            f"seed={vina_seed}"
+        )
 
     summary = "; ".join(summary_parts) if summary_parts else "No valid inhibitor results"
 

@@ -67,4 +67,4 @@ peft_model = get_peft_model(model, config)
 For detailed LoRA fine-tuning instructions, see [`docs/lora_finetuning.md`](lora_finetuning.md).
 
 ---
-*Last updated: 2026-07-01*
+*Last updated: 2026-07-15*

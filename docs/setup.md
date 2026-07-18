@@ -40,4 +40,4 @@ Ensure the following are available:
 See the main [README.md](../README.md) for full environment variable configuration options.
 
 ---
-*Last updated: 2026-07-01*
+*Last updated: 2026-07-15*

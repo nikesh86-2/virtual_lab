@@ -539,9 +539,22 @@ def _build_pi_operational_summary(
     This remains the backwards-compatible `pi_summary`, but it is not the
     preferred supervised-training target. Use `pi_action_summary` for that.
     """
+    effective_target = (
+        _target_id_from_state(state, target_pdb)
+        or target_pdb
+        or "None"
+    )
+    target_display = str(effective_target)
+
+    if (
+        state.get("target_status") == "partial_success_target"
+        and target_display != "None"
+    ):
+        target_display = f"{target_display} (partial success)"
+
     return (
         f"NSGA-II optimisation complete.\n"
-        f"Target PDB: {target_pdb}\n"
+        f"Target PDB: {target_display}\n"
         f"Target status: {state.get('target_status') or 'unknown'}\n"
         f"Target status reason: {state.get('target_status_reason') or 'unknown'}\n"
         f"Selected {len(top_sequences)} sequences.\n"
@@ -648,7 +661,6 @@ def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
       VLAB_TARGET_RESET_MIN_VALID_N=3
     """
     target_pdb = state.get("target_pdb")
-    critique = state.get("critique", "") or ""
 
     if not target_pdb:
         return target_pdb
@@ -656,9 +668,57 @@ def _maybe_reset_target_on_high_spread(state: LabState) -> str | None:
     if os.getenv("VLAB_TARGET_RESET_ON_HIGH_SPREAD", "1").strip() != "1":
         return target_pdb
 
-    score_spread = _parse_score_spread_from_critique(critique)
-    best_score = _parse_best_binding_score_from_critique(critique)
-    n_valid = _parse_n_valid_from_critique(critique)
+    # Compute score spread and best score from CURRENT measured rows (binding_results)
+    # instead of using proxy/aggregated scores from the critique.
+    binding_results = state.get("binding_results", []) or []
+    dock_scores = []
+    n_valid = 0
+
+    for r in binding_results:
+        if not isinstance(r, dict):
+            continue
+
+        if not (r.get("dock_valid") or r.get("vina_valid")):
+            continue
+
+        n_valid += 1
+
+        if r.get("binding_mode") == "rejected_docking":
+            continue
+
+        raw_hdock = r.get("dock_score", r.get("hdock_score"))
+
+        if raw_hdock is not None:
+            try:
+                raw_hdock = float(raw_hdock)
+            except Exception:
+                raw_hdock = None
+
+        min_valid_hdock_score = getenv_float("VLAB_MIN_VALID_HDOCK_SCORE", -30.0)
+
+        if raw_hdock is not None and raw_hdock > min_valid_hdock_score:
+            continue
+
+        value = r.get("binding_rank_score", r.get("dg"))
+
+        if value is None:
+            continue
+
+        try:
+            dock_scores.append(float(value))
+        except Exception:
+            pass
+
+    if not dock_scores:
+        # No valid measured rows - fall back to critique parsing for backward compatibility
+        critique = state.get("critique", "") or ""
+        score_spread = _parse_score_spread_from_critique(critique)
+        best_score = _parse_best_binding_score_from_critique(critique)
+    else:
+        # Use current measured rows
+        score_spread = max(dock_scores) - min(dock_scores)
+        best_score = min(dock_scores)
+        n_valid = len(dock_scores)
 
     max_accept_spread = getenv_float("VLAB_MAX_ACCEPT_SCORE_SPREAD", 10.0)
     accept_binding_score = getenv_float("VLAB_ACCEPT_BINDING_SCORE", -50.0)
@@ -1052,6 +1112,17 @@ def _build_combined_objectives(
     clean_interface_count = int(joint_feedback.get("clean_interface_count", 0) or 0)
     interface_clash_count = int(joint_feedback.get("interface_clash_count", 0) or 0)
 
+    combined_objectives.setdefault("interface", 0.0)
+
+    if clean_interface_count > 0:
+        combined_objectives["interface"] += 0.8
+
+    if interface_clash_count > 0:
+        combined_objectives["interface"] += 1.0
+
+    if state.get("target_status") == "partial_success_target":
+        combined_objectives["interface"] += 0.6
+
     if clean_interface_count > 0:
         combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.3
         combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.3
@@ -1090,16 +1161,28 @@ def _build_combined_objectives(
             combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + v
 
         elif k == "interface_pressure":
-            combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.5 * v
-            combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.5 * v
+            combined_objectives["interface"] = (
+                combined_objectives.get("interface", 0.0) + float(v)
+            )
+            combined_objectives["structure"] = (
+                combined_objectives.get("structure", 0.0) + 0.2 * float(v)
+            )
 
         elif k == "clash_avoidance_pressure":
-            combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.7 * v
-            combined_objectives["diversity"] = combined_objectives.get("diversity", 0.0) + 0.3 * v
+            combined_objectives["interface"] = (
+                combined_objectives.get("interface", 0.0) + float(v)
+            )
+            combined_objectives["structure"] = (
+                combined_objectives.get("structure", 0.0) + 0.3 * float(v)
+            )
 
         elif k == "target_specific_exploitation":
-            combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.2
-            combined_objectives["structure"] = combined_objectives.get("structure", 0.0) + 0.2
+            combined_objectives["interface"] = (
+                combined_objectives.get("interface", 0.0) + 0.5 * float(v)
+            )
+            combined_objectives["binding"] = (
+                combined_objectives.get("binding", 0.0) + 0.2 * float(v)
+            )
 
         elif k == "target_reuse_pressure":
             combined_objectives["binding"] = combined_objectives.get("binding", 0.0) + 0.15
@@ -1212,7 +1295,14 @@ def _cleanup_mutation_bias(state: LabState) -> dict:
         new_bias["thermo"] *= 0.9
 
     if new_bias:
-        required = ["thermo", "binding", "conservation", "structure", "diversity"]
+        required = [
+            "thermo",
+            "binding",
+            "conservation",
+            "structure",
+            "diversity",
+            "interface",
+        ]
 
         for k in required:
             new_bias[k] = new_bias.get(k, 0.0)
@@ -1236,6 +1326,149 @@ def _cleanup_mutation_bias(state: LabState) -> dict:
             new_bias = {k: v / total for k, v in new_bias.items()}
 
     return new_bias
+
+def _filter_known_interface_clashes(
+    state: LabState,
+    selected_sequences: list[str],
+    fallback_sequences: list[str] | None = None,
+    max_count: int | None = None,
+) -> list:
+    """
+    Exclude sequences with explicit measured or inherited steric-clash evidence.
+
+    Unknown interface evidence is retained because it represents exploration.
+    Clean-interface sequences are retained and keep their existing order.
+
+    If filtering removes selected candidates, refill from fallback_sequences
+    using only non-clashing candidates.
+    """
+    sequence_scores = (
+        state.get("_run_system_sequence_scores", {})
+        or {}
+    )
+
+    binding_rows = {
+        clean_rna(row.get("sequence", "")): row
+        for row in state.get("binding_results", []) or []
+        if isinstance(row, dict)
+        and clean_rna(row.get("sequence", ""))
+    }
+
+    def _is_known_clash(seq: str) -> bool:
+        seq = clean_rna(seq)
+
+        if not seq:
+            return False
+
+        score_data = sequence_scores.get(seq, {}) or {}
+        evidence = score_data.get("interface_evidence") or {}
+
+        score_map_clash = (
+            score_data.get("interface_evidence_known") is True
+            and (
+                evidence.get("steric_clash") is True
+                or evidence.get("interface_steric_clash") is True
+            )
+        )
+
+        binding_row = binding_rows.get(seq, {}) or {}
+
+        measured_clash = (
+            binding_row.get("dock_valid") is True
+            and binding_row.get("interface_steric_clash") is True
+        )
+
+        return score_map_clash or measured_clash
+
+    safe_sequences: list[str] = []
+    seen: set[str] = set()
+
+    for raw_seq in selected_sequences or []:
+        seq = clean_rna(raw_seq)
+
+        if not seq or seq in seen:
+            continue
+
+        if _is_known_clash(seq):
+            score_data = sequence_scores.get(seq, {}) or {}
+            evidence = score_data.get("interface_evidence") or {}
+
+            log.info(
+                "[PI FILTER] excluding known interface clash: "
+                "seq=%s source=%s interface=%s",
+                seq,
+                evidence.get("source"),
+                score_data.get("interface"),
+            )
+            continue
+
+        seen.add(seq)
+        safe_sequences.append(seq)
+
+    # Refill any slots removed by clash filtering.
+    for raw_seq in fallback_sequences or []:
+        if max_count is not None and len(safe_sequences) >= max_count:
+            break
+
+        seq = clean_rna(raw_seq)
+
+        if not seq or seq in seen:
+            continue
+
+        if _is_known_clash(seq):
+            continue
+
+        seen.add(seq)
+        safe_sequences.append(seq)
+
+    if max_count is not None:
+        safe_sequences = safe_sequences[:max_count]
+
+    return safe_sequences
+
+def _promote_interface_sequence(
+    state: LabState,
+    selected_sequences: list[str],
+    max_count: int,
+) -> list[str]:
+    """Reserve one PI selection slot for the best positive-interface candidate."""
+    selected = dedupe_rna_sequences(selected_sequences)
+    best_interface = clean_rna(
+        state.get("_run_system_best_interface_sequence")
+        or state.get("best_interface_clean_sequence")
+        or ""
+    )
+
+    if best_interface:
+        selected = [
+            best_interface,
+            *[seq for seq in selected if seq != best_interface],
+        ]
+
+    return selected[:max(1, int(max_count))]
+
+
+def _log_selected_interface_scores(
+    state: LabState,
+    selected_sequences: list[str],
+) -> None:
+    sequence_scores = state.get("_run_system_sequence_scores", {}) or {}
+
+    for seq in selected_sequences:
+        score_data = sequence_scores.get(seq, {}) or {}
+        evidence = score_data.get("interface_evidence") or {}
+        log.info(
+            "[PI SELECTED INTERFACE] seq=%s interface=%.4f raw=%.4f "
+            "known=%s source=%s similarity=%s clean=%s clash=%s",
+            seq,
+            float(score_data.get("interface", 0.0)),
+            float(score_data.get("interface_raw", 0.0)),
+            score_data.get("interface_evidence_known"),
+            evidence.get("source"),
+            evidence.get("best_similarity"),
+            evidence.get("clean"),
+            evidence.get("steric_clash"),
+        )
 
 
 def _capture_optimisation_step_if_available(
@@ -1552,7 +1785,13 @@ def pi_agent(state: LabState) -> dict:
         from VLAB2.optimisation.final_rna_design_system import decode_sequence as _decode
 
         analysis = analyse_pareto(population, _decode)
-        top_sequences = _select_top_sequences_from_population(population, analysis)
+
+        pareto_sequences = _select_top_sequences_from_population(
+            population,
+            analysis,
+        )
+
+        top_sequences = list(pareto_sequences)
 
         if not top_sequences:
             return _fallback_result(
@@ -1564,14 +1803,71 @@ def pi_agent(state: LabState) -> dict:
             )
 
         if conservation_fitness > 0.7:
-            top_sequences = top_sequences[:3]
+            selection_limit = 3
+
         elif conservation_fitness < 0.2:
-            log.warning("Low conservation — forcing exploitation phase")
-            top_sequences = top_sequences[:2]
+            log.warning(
+                "Low conservation: retaining interface exploitation "
+                "while limiting the selected population."
+            )
+            selection_limit = 2
+
+        else:
+            selection_limit = 6
+
+        # First reserve the leading position for the best positive-interface
+        # candidate identified by NSGA or previous measured evidence.
+        top_sequences = _promote_interface_sequence(
+            state=state,
+            selected_sequences=top_sequences,
+            max_count=selection_limit,
+        )
+
+        # Then remove any candidate subsequently identified as a known clash.
+        # Refill removed slots from the remaining Pareto candidates where possible.
+        top_sequences = _filter_known_interface_clashes(
+            state=state,
+            selected_sequences=top_sequences,
+            fallback_sequences=pareto_sequences,
+            max_count=selection_limit,
+        )
 
         top_sequences = dedupe_rna_sequences(top_sequences)
 
-        log.info("Top sequences selected by PI: %s", top_sequences)
+        if not top_sequences:
+            log.warning(
+                "All PI-selected sequences had known interface clashes; "
+                "falling back to the best safe previously designed sequence."
+            )
+
+            top_sequences = _filter_known_interface_clashes(
+                state=state,
+                selected_sequences=sequences,
+                fallback_sequences=[],
+                max_count=selection_limit,
+            )
+
+        if not top_sequences:
+            return _fallback_result(
+                state=state,
+                topic=topic,
+                sequences=sequences,
+                status="all_selected_sequences_known_clashes",
+                summary=(
+                    "All selected candidates had known steric-clash evidence; "
+                    "no sequence was promoted for downstream docking."
+                ),
+            )
+
+        _log_selected_interface_scores(
+            state,
+            top_sequences,
+        )
+
+        log.info(
+            "Top non-clashing sequences selected by PI: %s",
+            top_sequences,
+        )
 
         new_bias = _cleanup_mutation_bias(state)
         selected_motifs = state.get("_run_system_selected_motifs", [])
@@ -1627,10 +1923,11 @@ def pi_agent(state: LabState) -> dict:
             training_action_summary=training_action_summary,
         )
 
-        target_sequence = state.get("target_sequence")
-
-        if not target_sequence and top_sequences:
-            target_sequence = top_sequences[0]
+        target_sequence = (
+            top_sequences[0]
+            if top_sequences
+            else state.get("target_sequence")
+        )
 
         return {
             "pi_summary": operational_summary,
@@ -1655,6 +1952,12 @@ def pi_agent(state: LabState) -> dict:
             "iterations": state.get("iterations", 0) + 1,
             "_run_system_selected_motifs": selected_motifs,
             "_run_system_min_fold_thresholds": min_fold_thresholds,
+            "_run_system_sequence_scores": state.get(
+                "_run_system_sequence_scores", {}
+            ),
+            "_run_system_best_interface_sequence": state.get(
+                "_run_system_best_interface_sequence"
+            ),
             "joint_physics_feedback": joint_feedback,
             "literature_motif_hints": literature_motif_hints,
             "literature_target_hints": literature_target_hints,

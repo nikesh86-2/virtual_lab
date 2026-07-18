@@ -34,4 +34,4 @@ The peptide production pipeline generates peptide inhibitors for RNA‑binding v
 - `run_virtual_lab_conda.sh` – Exports the environment variables above.
 
 ---
-*Last updated: 2026‑07‑01*
+*Last updated: 2026-07-15*

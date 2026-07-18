@@ -68,8 +68,6 @@ module load miniforge
 # GROMACS is not required and can introduce incompatible shared libraries.
 # module load gromacs/2024.4/gcc-13.2.0_cuda-12.6.2
 
-eval "$(conda shell.bash hook)"
-
 set +u
 conda activate "${SRC_ENV}"
 set -u
@@ -230,12 +228,10 @@ mkdir -p \
 
 # Docking convergence / debug controls.
 # These override .env if it has older values.
-export VLAB_AGENT_EVAL_TOP_N=2
-export VLAB_MAX_DOCKINGS_PER_TARGET=2
+
 export VLAB_ABORT_TARGET_ON_FIRST_TIMEOUT=1
 
 export VLAB_MIN_VALID_HDOCK_SCORE=-30
-export VLAB_MIN_VALID_DOCKINGS_PER_TARGET=2
 export VLAB_MIN_VALID_DOCKINGS_FOR_CONVERGENCE=2
 
 export VLAB_REJECT_TARGET_ON_SCORE_SPREAD=1
@@ -297,6 +293,17 @@ export VLAB_REQUIRE_CONSERVATION_FOR_CONVERGENCE="${VLAB_REQUIRE_CONSERVATION_FO
 export VLAB_MIN_CONSERVATION_FOR_ACCEPT="${VLAB_MIN_CONSERVATION_FOR_ACCEPT:-0.2}"
 
 export VLAB_STREAM_WARMUP_SECONDS="${VLAB_STREAM_WARMUP_SECONDS:-6}"
+
+export VLAB_VINA_CACHE_ENABLED=1
+export VLAB_VINA_RESULT_CACHE_DIR=/scratch/fbsnpat/bot/VLAB2/output_data/vina_result_cache
+export VLAB_VINA_CACHE_VERSION=vina-cache-v1
+export VLAB_VINA_SEED=1
+export VLAB_VINA_FORCE_REDOCK=0
+export VLAB_VINA_EXHAUSTIVENESS=8
+
+export VLAB_AGENT_EVAL_TOP_N=3
+export VLAB_MAX_DOCKINGS_PER_TARGET=3
+export VLAB_MIN_VALID_DOCKINGS_PER_TARGET=2
 
 echo "===== DOCKING ENV ====="
 echo "VLAB_DOCKING_BACKEND=${VLAB_DOCKING_BACKEND}"

@@ -13,7 +13,11 @@ from VLAB2.orchestration.agents.protein_agent import protein_agent
 from VLAB2.orchestration.agents.inhibitor_agent import inhibitor_agent
 from VLAB2.orchestration.agents.skeptic_agent import skeptic_agent
 
-from VLAB2.orchestration.routing import should_continue, _inhibitor_should_run
+from VLAB2.orchestration.routing import (
+    after_structural,
+    should_continue,
+    _inhibitor_should_run,
+)
 
 
 def build_virtual_lab():
@@ -36,7 +40,17 @@ def build_virtual_lab():
     workflow.add_edge("pi", "researcher")
     workflow.add_edge("researcher", "bioinfo")
     workflow.add_edge("bioinfo", "structural")
-    workflow.add_edge("structural", "md")
+
+    # Conditional edge: skip MD/protein if structural design or folding failed
+    workflow.add_conditional_edges(
+        "structural",
+        after_structural,
+        {
+            "md": "md",
+            "pi": "pi",
+        },
+    )
+
     workflow.add_edge("md", "protein")
 
     # Conditional edge: run inhibitor screening if enabled, else skip to skeptic

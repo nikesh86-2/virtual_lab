@@ -14,13 +14,34 @@ def build_initial_state(
 ) -> LabState:
     """
     Build initial LabState for a Virtual Lab run.
+
+    Keep this aligned with VLAB2.orchestration.state_schema.LabState.
     """
+    topic_name = topic.get("topic_name") or topic.get("name") or ""
+    research_topic = topic.get("research_topic") or topic_name
+    topic_description = topic.get("description") or topic.get("topic_description") or ""
+
+    virus_name = topic.get("virus_name", "")
+    virus_family = topic.get("virus_family", "")
+    virus_genus = topic.get("virus_genus", "")
+
     state: LabState = {
-        "research_topic": topic["name"],
-        "topic_description": topic["description"],
+        # ------------------------------------------------------------------
+        # Topic / setup
+        # ------------------------------------------------------------------
+        "topic_name": topic_name,
+        "research_topic": research_topic,
+        "topic_description": topic_description,
         "seed_questions": topic.get("seed_questions", []),
         "failure_memory": [],
 
+        "virus_name": virus_name,
+        "virus_family": virus_family,
+        "virus_genus": virus_genus,
+
+        # ------------------------------------------------------------------
+        # Runtime wrappers / PI setup
+        # ------------------------------------------------------------------
         "wrappers": wrappers,
         "mutation_bias": {},
 
@@ -28,7 +49,7 @@ def build_initial_state(
         "iterations": 0,
         "max_iterations": max_iterations,
 
-        "hypothesis": topic.get("description") or topic.get("name") or "",
+        "hypothesis": topic_description or research_topic or "",
         "pi_summary": "",
         "optimisation_status": "",
         "pi_action_summary": "",
@@ -36,15 +57,49 @@ def build_initial_state(
         "pi_training_metadata": {},
         "best_interface_clean_sequence": None,
 
+        # ------------------------------------------------------------------
+        # Literature / researcher state
+        # ------------------------------------------------------------------
         "evidence": [],
+        "research_query": None,
+        "literature_query_bundle": [],
+        "literature_topic_profile": {},
+        "streamed_queries": [],
+        "streaming_started": False,
 
+        "literature_motif_hints": [],
+        "literature_target_hints": [],
+        "literature_policy_text": "",
+
+        # ------------------------------------------------------------------
+        # Agent analysis text
+        # ------------------------------------------------------------------
         "structural_analysis": "",
+        "structural_status": "",
+        "structural_error": None,
         "md_analysis": "",
         "protein_analysis": "",
         "bioinfo_analysis": "",
         "msa_data": "",
         "critique": "",
+        "skeptic_interface_metrics": {},
+        "skeptic_bioinfo_metrics": {},
+        "skeptic_error": None,
 
+        # ------------------------------------------------------------------
+        # Conservation
+        # ------------------------------------------------------------------
+        "conservation_signal": {},
+        "conserved_regions": [],
+        "conservation_fitness": 0.0,
+        "bioinfo_num_sequences": 0,
+        "bioinfo_alignment_length": 0,
+        "bioinfo_quality_passed": False,
+        "bioinfo_quality_reasons": [],
+
+        # ------------------------------------------------------------------
+        # Design / docking state
+        # ------------------------------------------------------------------
         "binding_units": "hdock_relative_score",
 
         "designed_sequences": [],
@@ -53,19 +108,14 @@ def build_initial_state(
         "md_results": [],
         "interface_contacts": None,
         "interface_contact_files": [],
+        "seq_len": 0,
 
+        # ------------------------------------------------------------------
+        # Target protein state
+        # ------------------------------------------------------------------
+        "target_pdb": None,
         "target_pdb_id": None,
         "target_pdb_path": None,
-        "inhibitor_enabled": False,
-        "inhibitor_small_molecules": [],
-        "inhibitor_peptides": [],
-        "inhibitor_binding_site_overlap": 0.0,
-        "inhibitor_docking_box": {},
-        "inhibitor_analysis": "",
-        "inhibitor_summary": "",
-        "inhibitor_snapshot_paths": [],
-
-        "target_pdb": None,
         "target_pdb_candidates": [],
         "failed_target_pdbs": [],
         "partial_success_targets": [],
@@ -84,26 +134,73 @@ def build_initial_state(
         ),
         "target_sequence": None,
 
-        "virus_name": topic.get("virus_name", ""),
-        "virus_family": topic.get("virus_family", ""),
-        "virus_genus": topic.get("virus_genus", ""),
+        # ------------------------------------------------------------------
+        # Inhibitor screening
+        # ------------------------------------------------------------------
+        "inhibitor_enabled": False,
+        "inhibitor_small_molecules": [],
+        "inhibitor_peptides": [],
+        "inhibitor_best_small_molecule": None,
+        "inhibitor_best_peptide": None,
 
+        # Legacy-compatible percent field.
+        "inhibitor_binding_site_overlap": 0.0,
+
+        # New structured overlap fields.
+        "inhibitor_binding_site_overlap_score": 0.0,
+        "inhibitor_pose_comparison": {},
+        "inhibitor_small_molecule_comparison": None,
+        "inhibitor_peptide_comparison": None,
+
+        "inhibitor_docking_box": {},
+        "inhibitor_analysis": "",
+        "inhibitor_summary": "",
+        "inhibitor_snapshot_paths": [],
+        # Vina reproducibility and persistent result-cache metadata.
+        "inhibitor_vina_seed": None,
+        "inhibitor_vina_cache_hits": 0,
+        "inhibitor_vina_cache_misses": 0,
+        "inhibitor_vina_cache_enabled": False,
+
+        # ------------------------------------------------------------------
+        # Docking exports
+        # ------------------------------------------------------------------
         "docking_summary_json": "",
         "docking_summary_csv": "",
         "docking_summary_md": "",
 
+        # ------------------------------------------------------------------
+        # Logs / conversation
+        # ------------------------------------------------------------------
         "results_log": [],
         "stage_outputs": [],
         "conversation_history": [],
 
-        "literature_motif_hints": [],
-        "literature_target_hints": [],
-        "literature_policy_text": "",
-
+        # ------------------------------------------------------------------
+        # Report / memory
+        # ------------------------------------------------------------------
+        "final_report": "",
         "previous_hypotheses": [],
 
+        # ------------------------------------------------------------------
+        # Runtime caches
+        # ------------------------------------------------------------------
         "_md_cache": {},
+        "_dock_cache": {},
         "joint_physics_feedback": {},
+
+        "_run_system_selected_motifs": [],
+        "_run_system_min_fold_thresholds": {},
+        "_run_system_final_weights": {},
+        "_run_system_interface_objective_enabled": False,
+        "_run_system_interface_lookup_count": 0,
+        "_run_system_interface_failure_weights": {},
+        "_run_system_seq_len": 0,
+        "_run_system_conservation_valid": False,
+        "_run_system_sequence_scores": {},
+        "_run_system_best_interface_sequence": None,
+        "_pi_excluded_interface_clashes": [],
+        "streamed_query_keys": [],
     }
 
     if data_collector is not None:
