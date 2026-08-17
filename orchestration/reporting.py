@@ -22,8 +22,46 @@ def generate_final_report(state: LabState) -> str:
         f"{truncate_str(state.get('pi_summary', ''), 800)}\n\n"
     )
 
+    # Phase 4.1: Add NSGA health reporting
+    report += "## NSGA-II Health\n"
+    report += f"- Status: {state.get('optimisation_status', 'unknown')}\n"
+    report += f"- Valid candidates: {state.get('nsga_valid_candidate_count', 0)}\n"
+    report += f"- Invalid candidates: {state.get('nsga_invalid_candidate_count', 0)}\n"
+    report += f"- Penalty-only candidates: {state.get('nsga_penalty_only_count', 0)}\n"
+    report += f"- Fallback population used: {'yes' if state.get('nsga_used_fallback_population', False) else 'no'}\n"
+    if state.get('nsga_best_sequence'):
+        report += f"- Best sequence: {state.get('nsga_best_sequence')}\n"
+    if state.get('nsga_failure_reason_counts'):
+        report += f"- Failure reasons: {state.get('nsga_failure_reason_counts')}\n"
+    report += "\n"
+
     report += f"## Target Protein\n{state.get('target_pdb', 'Not selected')}\n\n"
     report += f"## Binding Units\n{state.get('binding_units', 'hdock_relative_score')}\n\n"
+
+    # Phase 3.4: Report latest-batch status separately from best-validated status
+    latest_status = state.get("current_target_status")
+    best_status = state.get("best_validated_target_status")
+    latest_interface_count = state.get("clean_interface_count", 0)
+    best_interface_count = state.get("best_validated_clean_interface_count", 0)
+
+    report += "## Target Protein Status\n"
+    report += f"Latest docking batch status: {latest_status or 'unknown'}\n"
+    report += f"Best validated target status: {best_status or 'unknown'}\n"
+    report += f"Latest clean interface count: {latest_interface_count}\n"
+    report += f"Best validated clean interface count: {best_interface_count}\n\n"
+
+    # Phase 4.2: Add method-specific cache performance reporting
+    report += "## Cache Performance\n"
+    report += f"- RNA HDOCK: {state.get('rna_hdock_cache_hits', 0)} hit(s), {state.get('rna_hdock_cache_misses', 0)} miss(es)\n"
+    report += f"- Peptide HDOCK: {state.get('peptide_hdock_cache_hits', 0)} hit(s), {state.get('peptide_hdock_cache_misses', 0)} miss(es)\n"
+    report += f"- Vina: {state.get('inhibitor_vina_cache_hits', 0)} hit(s), {state.get('inhibitor_vina_cache_misses', 0)} miss(es)\n"
+    report += f"- Ligand metadata: {state.get('pubchem_manifest_hits', 0)} manifest, {state.get('pubchem_cache_hits', 0)} cache, {state.get('pubchem_live_requests', 0)} live\n\n"
+
+    # Phase 4.2: Add method-specific score units
+    report += "## Score Units\n"
+    report += "- RNA HDOCK scores: relative scores, more negative ranked better within this method\n"
+    report += "- Peptide HDOCK scores: relative scores, more negative ranked better within this method\n"
+    report += "- Vina scores: kcal/mol\n\n"
 
     if state.get("docking_summary_csv") or state.get("docking_summary_json"):
         report += "## Docking Output Files\n"

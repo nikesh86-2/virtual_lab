@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -27,6 +28,39 @@ from VLAB2.research.research_agent_adaptive import (
 )
 
 log = logging.getLogger("virtual_lab")
+
+
+# Priority 7 fix: Circuit breaker for Semantic Scholar
+@dataclass
+class ProviderCircuitBreaker:
+    consecutive_failures: int = 0
+    opened: bool = False
+    opened_at: float | None = None
+    failure_threshold: int = 3
+    recovery_timeout_seconds: float = 300.0
+
+    def record_success(self):
+        self.consecutive_failures = 0
+        self.opened = False
+        self.opened_at = None
+
+    def record_failure(self):
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.failure_threshold:
+            self.opened = True
+            self.opened_at = time.monotonic()
+
+    def should_allow_request(self) -> bool:
+        if not self.opened:
+            return True
+        if self.opened_at is None:
+            return True
+        if time.monotonic() - self.opened_at > self.recovery_timeout_seconds:
+            self.opened = False
+            self.consecutive_failures = 0
+            self.opened_at = None
+            return True
+        return False
 
 __all__ = ["researcher_agent"]
 
@@ -547,13 +581,35 @@ def researcher_agent(state: LabState) -> dict:
         else:
             log.info("Nothing found in local DB. Falling back to Semantic Scholar...")
 
+            # Priority 7 fix: Circuit breaker and time budget for Semantic Scholar
+            breaker = ProviderCircuitBreaker()
+            time_budget_seconds = float(os.getenv("VLAB_SEMANTIC_SCHOLAR_TIME_BUDGET", "60"))
+            started = time.monotonic()
+
             ss_results_all = []
 
             for q in query_bundle:
+                # Check circuit breaker
+                if not breaker.should_allow_request():
+                    log.warning(
+                        "Semantic Scholar circuit breaker is open; skipping remaining queries."
+                    )
+                    break
+
+                # Check time budget
+                if time.monotonic() - started > time_budget_seconds:
+                    log.warning(
+                        "Semantic Scholar time budget exhausted (%.1fs); skipping remaining queries.",
+                        time_budget_seconds,
+                    )
+                    break
+
                 try:
                     ss_results = search_semantic_scholar(q, limit=10)
+                    breaker.record_success()
                 except Exception as e:
                     log.warning("Semantic Scholar fallback failed for query '%s': %s", q, e)
+                    breaker.record_failure()
                     ss_results = []
 
                 for paper in ss_results:

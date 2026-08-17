@@ -361,7 +361,7 @@ def design_inhibitor_peptides(
     pocket_residues: list,
     llm,
     max_peptides: int = MAX_PEPTIDES,
-) -> list:
+) -> dict:
     """
     Use an LLM to design peptide sequences that target the RNA-binding pocket.
 
@@ -373,11 +373,16 @@ def design_inhibitor_peptides(
         max_peptides: Maximum number of peptide sequences to generate.
 
     Returns:
-        List of dicts, each with keys: sequence, rationale, source ("llm_generated").
+        Dict with keys:
+        - peptides: List of dicts, each with keys: sequence, rationale, source ("llm_generated" or "default")
+        - generation_method: "llm" or "conservative_defaults"
     """
     if llm is None:
         log.warning("No LLM provided for peptide design, using conservative defaults")
-        return _default_inhibitor_peptides()
+        return {
+            "peptides": _default_inhibitor_peptides(),
+            "generation_method": "conservative_defaults",
+        }
 
     # Build context for the LLM prompt
     pocket_str = ", ".join(
@@ -433,11 +438,17 @@ Do not include any text outside the JSON array. Generate exactly {max_peptides} 
                 log.warning("Skipping invalid peptide sequence: %s", p.get("sequence"))
 
         log.info("LLM generated %d peptide sequences", len(results))
-        return results[:max_peptides]
+        return {
+            "peptides": results[:max_peptides],
+            "generation_method": "llm",
+        }
 
     except Exception as e:
         log.error("LLM peptide design failed: %s", e)
-        return _default_inhibitor_peptides()
+        return {
+            "peptides": _default_inhibitor_peptides(),
+            "generation_method": "conservative_defaults",
+        }
 
 
 def _default_inhibitor_peptides() -> list:

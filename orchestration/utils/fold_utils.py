@@ -122,30 +122,52 @@ def extract_fold_quality_from_outputs(
 def motif_summary_from_state(state: dict) -> str:
     """
     Build a short motif summary from conservation and optimiser state.
+    Handles both the new coordinate schema and legacy start/end fields.
     """
     motifs = []
+
+    def _format_motif(item: dict) -> str | None:
+        """Format a motif dict into a human-readable location string."""
+        if not isinstance(item, dict):
+            return None
+
+        name = str(item.get("motif") or item.get("selected_motif") or "unknown")
+        mapping_status = item.get("mapping_status")
+        coordinate_system = item.get("coordinate_system")
+
+        # Try new coordinate schema first
+        if mapping_status == "mapped" and coordinate_system == "sequence_zero_based_half_open":
+            start = item.get("sequence_start")
+            end = item.get("sequence_end")
+            if start is not None and end is not None:
+                return f"{name}@sequence[{start},{end})"
+
+        msa_start = item.get("msa_start")
+        msa_end = item.get("msa_end")
+        if msa_start is not None and msa_end is not None:
+            return f"{name}@alignment[{msa_start},{msa_end})"
+
+        # Fall back to legacy fields
+        start = item.get("start") or item.get("selected_motif_start")
+        end = item.get("end") or item.get("selected_motif_end")
+        if start is not None and end is not None:
+            return f"{name}@{start}-{end}"
+
+        return f"{name}@unmapped"
 
     conservation_signal = state.get("conservation_signal", {}) or {}
 
     for item in conservation_signal.get("selected_motifs", []) or []:
-        if isinstance(item, dict) and item.get("motif"):
-            motifs.append(
-                f"{item.get('motif')}@{item.get('start')}-{item.get('end')}"
-            )
+        formatted = _format_motif(item)
+        if formatted:
+            motifs.append(formatted)
         elif isinstance(item, str):
             motifs.append(item)
 
     for item in state.get("_run_system_selected_motifs", []) or []:
-        if isinstance(item, dict) and item.get("selected_motif"):
-            motifs.append(
-                f"{item.get('selected_motif')}@"
-                f"{item.get('selected_motif_start')}-"
-                f"{item.get('selected_motif_end')}"
-            )
-        elif isinstance(item, dict) and item.get("motif"):
-            motifs.append(
-                f"{item.get('motif')}@{item.get('start')}-{item.get('end')}"
-            )
+        formatted = _format_motif(item)
+        if formatted:
+            motifs.append(formatted)
         elif isinstance(item, str):
             motifs.append(item)
 

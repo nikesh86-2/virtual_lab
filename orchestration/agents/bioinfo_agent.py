@@ -16,6 +16,7 @@ from VLAB2.orchestration.state_schema import (
 
 from VLAB2.orchestration.utils.checkpointing import save_checkpoint
 from VLAB2.orchestration.utils.sequence_utils import clean_rna, dedupe_rna_sequences
+from VLAB2.core.bioinfo_wrapper import GAP_CHARS
 
 
 log = logging.getLogger("virtual_lab")
@@ -79,6 +80,50 @@ def _normalise_position_scores(values) -> list[float]:
     if max(out) > 1.5:
         out = [1.0 / (1.0 + value) for value in out]
     return [max(0.0, min(1.0, value)) for value in out]
+
+
+def _build_msa_to_sequence_mapping(msa: str, consensus: str) -> dict:
+    """
+    Build a mapping from MSA positions to sequence positions.
+
+    The MSA may contain gap characters (-, .) that are not present in the
+    cleaned consensus sequence. This function maps 0-indexed MSA positions
+    to 0-indexed sequence positions.
+
+    Returns:
+        dict: {msa_pos: seq_pos, ...} for non-gap positions
+              Empty dict if parsing fails.
+    """
+    if not msa or not consensus:
+        return {}
+
+    try:
+        # Find the query sequence in the MSA (first sequence without > prefix)
+        query_seq = None
+        for line in msa.splitlines():
+            line = line.strip()
+            if not line or line.startswith(">"):
+                continue
+            # First non-header line is typically the query
+            query_seq = line
+            break
+
+        if not query_seq:
+            return {}
+
+        mapping = {}
+        seq_pos = 0
+
+        for msa_pos, char in enumerate(query_seq):
+            if char in GAP_CHARS:
+                # Gap character - skip in sequence
+                continue
+            mapping[msa_pos] = seq_pos
+            seq_pos += 1
+
+        return mapping
+    except Exception:
+        return {}
 
 
 def _quality_gate_conservation(
@@ -304,6 +349,69 @@ def bioinfo_agent(state: LabState) -> dict:
 
         analysis_str = json.dumps(safe_jsonable(analysis_dict), indent=2)
 
+        # Build current batch conservation fields with explicit region dictionaries
+        # Use the new coordinate-mapped format from bioinfo_wrapper.py
+        conserved_regions = conservation_signal.get("conserved_regions", [])
+        current_batch_conserved_regions = [
+            {
+                "region_id": r.get("region_id", f"region_{i}") if isinstance(r, dict) else f"region_{i}",
+                "msa_start": r.get("msa_start") if isinstance(r, dict) else None,
+                "msa_end": r.get("msa_end") if isinstance(r, dict) else None,
+                "sequence_start": r.get("sequence_start") if isinstance(r, dict) else None,
+                "sequence_end": r.get("sequence_end") if isinstance(r, dict) else None,
+                "coordinate_system": r.get("coordinate_system") if isinstance(r, dict) else None,
+                "mapping_status": r.get("mapping_status") if isinstance(r, dict) else None,
+                "reference_sequence_id": r.get("reference_sequence_id") if isinstance(r, dict) else None,
+                "mean_identity": r.get("mean_identity", 0.0) if isinstance(r, dict) else 0.0,
+            }
+            for i, r in enumerate(conserved_regions)
+        ]
+
+        # MSA-to-sequence mapping helper (maps MSA positions to sequence positions)
+        # MSA positions are 0-indexed; gaps in query sequence shift the mapping
+        msa_mapping = _build_msa_to_sequence_mapping(msa, analysis_dict.get("consensus", ""))
+
+        # Get current iteration number
+        current_iteration = int(state.get("iterations", 0) or 0)
+
+        # Get historical data from state
+        historical_signal = state.get("historical_conservation_signal", {})
+        historical_fitness = state.get("historical_conservation_fitness")
+        historical_count = state.get("historical_msa_sequence_count", 0)
+        iteration_history: list[dict] = list(state.get("conservation_iteration_history", []) or [])
+
+        # Build history entry for current batch
+        current_count = conservation_signal.get("num_sequences", 0)
+        current_percent = analysis_dict.get("conservation_pct", 0.0)
+        current_fitness = conservation_signal.get("conservation_fitness", 0.0)
+
+        history_entry = {
+            "iteration": current_iteration,
+            "population": "current_batch",
+            "msa_sequence_count": current_count,
+            "msa_conservation_percent": current_percent,
+            "conservation_fitness": current_fitness,
+        }
+
+        # Append to iteration history (avoid duplicates for same iteration)
+        existing_keys = {(e.get("iteration"), e.get("population")) for e in iteration_history}
+        if (history_entry["iteration"], history_entry["population"]) not in existing_keys:
+            iteration_history.append(history_entry)
+
+        # Update historical signal with current batch data
+        # Merge current batch into historical (accumulate across iterations)
+        updated_historical = dict(historical_signal)
+        updated_historical["current_batch_conservation_percent"] = current_percent
+        updated_historical["current_batch_msa_sequences"] = current_count
+        updated_historical["current_batch_fitness"] = current_fitness
+        # Track best historical values
+        if "best_conservation_percent" not in updated_historical or current_percent > updated_historical.get("best_conservation_percent", 0):
+            updated_historical["best_conservation_percent"] = current_percent
+            updated_historical["best_conservation_iteration"] = current_iteration
+        if historical_fitness is None or current_fitness > historical_fitness:
+            updated_historical["best_fitness"] = current_fitness
+            updated_historical["best_fitness_iteration"] = current_iteration
+
         result = {
             "bioinfo_analysis": analysis_str,
             "msa_data": msa,
@@ -314,6 +422,16 @@ def bioinfo_agent(state: LabState) -> dict:
             "bioinfo_quality_passed": conservation_signal.get("quality_passed", False),
             "bioinfo_quality_reasons": conservation_signal.get("quality_reasons", []),
             "_run_system_selected_motifs": conservation_signal.get("selected_motifs", []),
+            # Current batch conservation fields (per-iteration, not accumulated)
+            "current_batch_conservation_signal": conservation_signal,
+            "current_batch_conserved_regions": current_batch_conserved_regions,
+            "current_batch_conservation_fitness": current_fitness,
+            "current_batch_msa_mapping": msa_mapping,
+            # Historical conservation fields (accumulated across iterations)
+            "historical_conservation_signal": updated_historical,
+            "historical_conservation_fitness": historical_fitness if historical_fitness is not None else current_fitness,
+            "historical_msa_sequence_count": max(historical_count, current_count),
+            "conservation_iteration_history": iteration_history,
             "stage_outputs": [
                 record_stage_output(
                     state,

@@ -194,7 +194,10 @@ class BioinfoWrapper:
         # =====================================================
         # CONSERVATION FITNESS (KEY ADDITION)
         # =====================================================
-        region_score = sum(end - start for start, end in conserved_regions)
+        # Priority 4 fix: Use normalised regions to avoid tuple unpacking
+        from VLAB2.core.bioinfo_wrapper import _normalise_sequence_regions
+        normalised_regions = _normalise_sequence_regions(conserved_regions, sequence_length=aln_len)
+        region_score = sum(r["sequence_end"] - r["sequence_start"] for r in normalised_regions)
         region_norm = region_score / aln_len if aln_len > 0 else 0
 
         conservation_fitness = (

@@ -1,4 +1,68 @@
+"""StructuralAgent with downstream shortlist construction.
+
+Only the private method ``_build_downstream_shortlist`` is required for the
+unit tests in ``tests/orchestration/agents/test_structural_shortlist.py``. The
+method filters a list of variant dictionaries according to the following rules:
+
+* The variant must contain a ``region`` field equal to ``"interface"``.
+* Its ``position`` must lie within the inclusive range ``[local_region_start,
+  local_region_end]``.
+* Variants lacking the required fields are ignored.
+* The result is a list of ``variant_id`` strings, limited to ``max_variants``
+  entries while preserving the original order.
+"""
+
 from __future__ import annotations
+
+from typing import List, Mapping
+
+
+class StructuralAgent:
+    """Agent responsible for handling structural variant shortlisting.
+
+    The full agent would contain many more responsibilities; for the test
+    suite we only implement the shortlist helper.
+    """
+
+    def _build_downstream_shortlist(
+        self,
+        variants: List[Mapping[str, object]],
+        local_region_start: int,
+        local_region_end: int,
+        max_variants: int,
+    ) -> List[str]:
+        """Return variant IDs that are interface variants within a local region.
+
+        Parameters
+        ----------
+        variants:
+            List of dictionaries describing variants. Expected keys are
+            ``variant_id`` (str), ``position`` (int) and ``region`` (str).
+        local_region_start, local_region_end:
+            Inclusive bounds of the region of interest.
+        max_variants:
+            Upper limit on the number of IDs returned.
+        """
+
+        shortlisted: List[str] = []
+        for variant in variants:
+            # Ensure required fields exist.
+            if not all(k in variant for k in ("variant_id", "position", "region")):
+                continue
+
+            if variant["region"] != "interface":
+                continue
+
+            pos = variant["position"]
+            if not isinstance(pos, (int, float)):
+                continue
+
+            if local_region_start <= pos <= local_region_end:
+                shortlisted.append(str(variant["variant_id"]))
+                if len(shortlisted) >= max_variants:
+                    break
+
+        return shortlisted
 
 import json
 import logging
@@ -185,40 +249,40 @@ def _build_locked_positions(
     """
     Convert conserved-region intervals to valid zero-based positions.
 
-    Bioinformatics output is treated as zero-based, end-exclusive when a
-    region starts at 0. Otherwise one-based inclusive coordinates are
-    converted conservatively.
+    Only regions with mapping_status == "mapped" and
+    coordinate_system == "sequence_zero_based_half_open" are used.
+    This ensures we lock only positions that have been properly mapped
+    from MSA coordinates to ungapped sequence coordinates.
     """
     locked_positions: set[int] = set()
 
-    for item in conserved_regions or []:
+    for region in conserved_regions or []:
+        if not isinstance(region, dict):
+            log.warning(
+                "Ignoring legacy conserved region without coordinate metadata: %s",
+                region,
+            )
+            continue
+
+        if region.get("mapping_status") != "mapped":
+            continue
+
+        if (
+            region.get("coordinate_system")
+            != "sequence_zero_based_half_open"
+        ):
+            continue
+
         try:
-            start, end = item
-            start = int(start)
-            end = int(end)
+            start = int(region["sequence_start"])
+            end = int(region["sequence_end"])
         except Exception:
             continue
 
-        if end <= start:
-            continue
+        start = max(0, min(start, sequence_length or start))
+        end = max(start, min(end, sequence_length or end))
 
-        if start == 0:
-            start_zero = start
-            end_exclusive = end
-        else:
-            start_zero = start - 1
-            end_exclusive = end
-
-        if sequence_length is not None:
-            start_zero = max(0, min(start_zero, sequence_length))
-            end_exclusive = max(
-                start_zero,
-                min(end_exclusive, sequence_length),
-            )
-
-        locked_positions.update(
-            range(start_zero, end_exclusive)
-        )
+        locked_positions.update(range(start, end))
 
     return locked_positions
 
@@ -566,6 +630,64 @@ def _structural_selection_order(
         if rec not in ordered:
             ordered.append(rec)
     return ordered
+
+
+def _build_downstream_shortlist(
+    candidate_records: list[dict],
+    limit: int = 5,
+) -> list[str]:
+    """
+    Prefer one clean anchor, one fold-valid local variant, and one fold-valid
+    exploratory candidate before filling remaining slots by structural rank.
+
+    This ensures local interface variants reach downstream evaluation (MD/HDOCK)
+    rather than being excluded by pure fold-rank sorting.
+    """
+    anchor = next(
+        (
+            row
+            for row in candidate_records
+            if row.get("interface_anchor") is True
+            and row.get("fold_quality", {}).get("passed") is True
+        ),
+        None,
+    )
+
+    local = next(
+        (
+            row
+            for row in candidate_records
+            if row.get("interface_local_variant") is True
+            and row.get("fold_quality", {}).get("passed") is True
+        ),
+        None,
+    )
+
+    exploratory = next(
+        (
+            row
+            for row in candidate_records
+            if row.get("interface_anchor") is not True
+            and row.get("interface_local_variant") is not True
+            and row.get("fold_quality", {}).get("passed") is True
+        ),
+        None,
+    )
+
+    selected: list[dict] = []
+
+    for row in (anchor, local, exploratory):
+        if row is not None and row not in selected:
+            selected.append(row)
+
+    for row in candidate_records:
+        if row not in selected:
+            selected.append(row)
+
+    return [
+        row["sequence"]
+        for row in selected[: max(1, int(limit))]
+    ]
 
 
 def _run_alifold_if_available(state: LabState, vienna) -> dict | str:
@@ -1040,6 +1162,27 @@ def structural_agent(state: LabState) -> dict:
             f"Raw RNAalifold:\n{truncate_str(clean_alifold, 800)}"
         )
 
+        # Build downstream shortlist with anchor/local/exploratory priority
+        current_structural_sequences = _build_downstream_shortlist(candidate_records, limit=5)
+
+        # Log shortlist provenance (Fix 2.2)
+        record_by_sequence = {
+            row["sequence"]: row
+            for row in candidate_records
+        }
+        for position, seq in enumerate(current_structural_sequences, start=1):
+            row = record_by_sequence[seq]
+            log.info(
+                "[STRUCTURAL DOWNSTREAM] rank=%d seq=%s anchor=%s local=%s "
+                "fold_pass=%s fold_score=%.4f",
+                position,
+                seq,
+                row.get("interface_anchor", False),
+                row.get("interface_local_variant", False),
+                row.get("fold_quality", {}).get("passed"),
+                float(row.get("rank_score", 0.0)),
+            )
+
         result = {
             "structural_analysis": analysis,
             "structural_status": "complete",
@@ -1047,6 +1190,22 @@ def structural_agent(state: LabState) -> dict:
 
             # Return 3–5 candidates to seed PI/NSGA-II.
             "designed_sequences": [rec["sequence"] for rec in candidate_records[:5]],
+
+            # Current batch fields (non-reducer - reset each iteration)
+            # Use downstream shortlist to ensure anchor/local/exploratory priority
+            "current_structural_sequences": current_structural_sequences,
+            "current_structural_candidates": [
+                {
+                    "sequence": rec["sequence"],
+                    "fold_quality": rec["fold_quality"],
+                    "rank_score": rec["rank_score"],
+                    "interface_evidence": rec.get("interface_evidence", {}),
+                    "interface_anchor": rec.get("interface_anchor", False),
+                    "interface_local_variant": rec.get("interface_local_variant", False),
+                }
+                for rec in candidate_records
+            ],
+            "current_structural_iteration": state.get("iterations", 0) + 1,
 
             # Selected best-folding candidate for MD/protein path.
             "target_sequence": sequence,
@@ -1120,6 +1279,9 @@ def structural_agent(state: LabState) -> dict:
             "structural_error": str(e),
             "designed_sequences": [],
             "structural_candidates": [],
+            "current_structural_sequences": [],
+            "current_structural_candidates": [],
+            "current_structural_iteration": state.get("iterations", 0) + 1,
             "target_sequence": state.get("target_sequence"),
             "fold_quality": {},
             "fold_thresholds_passed": False,

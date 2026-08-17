@@ -97,10 +97,16 @@ def _conservation_score(seq: str, conservation_signal: Dict) -> float:
     if not conserved:
         return conservation_signal.get("conservation_fitness", 0.0)
 
+    # Priority 4 fix: Use normalised regions to avoid tuple unpacking
+    from VLAB2.core.bioinfo_wrapper import _normalise_sequence_regions
+    normalised_regions = _normalise_sequence_regions(conserved, sequence_length=len(seq))
+
     score = 0
     length = len(seq)
 
-    for start, end in conserved:
+    for region in normalised_regions:
+        start = region["sequence_start"]
+        end = region["sequence_end"]
         span = max(0, min(end, length) - start)
         score += span
 

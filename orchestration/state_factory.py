@@ -56,6 +56,13 @@ def build_initial_state(
         "pi_operational_summary": "",
         "pi_training_metadata": {},
         "best_interface_clean_sequence": None,
+        # Phase 4.1: NSGA health reporting defaults
+        "nsga_valid_candidate_count": 0,
+        "nsga_invalid_candidate_count": 0,
+        "nsga_penalty_only_count": 0,
+        "nsga_failure_reason_counts": {},
+        "nsga_best_sequence": None,
+        "nsga_used_fallback_population": False,
 
         # ------------------------------------------------------------------
         # Literature / researcher state
@@ -96,6 +103,16 @@ def build_initial_state(
         "bioinfo_alignment_length": 0,
         "bioinfo_quality_passed": False,
         "bioinfo_quality_reasons": [],
+        # Current batch conservation (reset each iteration)
+        "current_batch_conservation_signal": {},
+        "current_batch_conserved_regions": [],
+        "current_batch_conservation_fitness": 0.0,
+        "current_batch_msa_mapping": None,
+        # Historical conservation (accumulated across iterations)
+        "historical_conservation_signal": {},
+        "historical_conservation_fitness": None,
+        "historical_msa_sequence_count": 0,
+        "conservation_iteration_history": [],
 
         # ------------------------------------------------------------------
         # Design / docking state
@@ -109,6 +126,11 @@ def build_initial_state(
         "interface_contacts": None,
         "interface_contact_files": [],
         "seq_len": 0,
+
+        # Current structural batch (non-reducer - reset each iteration)
+        "current_structural_sequences": [],
+        "current_structural_candidates": [],
+        "current_structural_iteration": 0,
 
         # ------------------------------------------------------------------
         # Target protein state
@@ -133,6 +155,11 @@ def build_initial_state(
             "llm_fallback",
         ),
         "target_sequence": None,
+        # Priority 6 fix: Best validated target preservation defaults
+        "best_validated_target_status": None,
+        "best_validated_target_status_reason": None,
+        "best_validated_binding_results": [],
+        "best_validated_clean_interface_count": 0,
 
         # ------------------------------------------------------------------
         # Inhibitor screening
@@ -161,6 +188,21 @@ def build_initial_state(
         "inhibitor_vina_cache_hits": 0,
         "inhibitor_vina_cache_misses": 0,
         "inhibitor_vina_cache_enabled": False,
+        # Inhibitor screening signature for skip logic
+        "inhibitor_screen_signature": None,
+        "inhibitor_screen_last_signature": None,
+        "inhibitor_screen_skipped_count": 0,
+        # Phase 2.4: PubChem provider-source metrics
+        "pubchem_live_requests": 0,
+        "pubchem_cache_hits": 0,
+        "pubchem_manifest_hits": 0,
+        "pubchem_failures": 0,
+        "pubchem_circuit_opened": False,
+        # Phase 4.2: Method-specific cache metrics
+        "rna_hdock_cache_hits": 0,
+        "rna_hdock_cache_misses": 0,
+        "peptide_hdock_cache_hits": 0,
+        "peptide_hdock_cache_misses": 0,
 
         # ------------------------------------------------------------------
         # Docking exports

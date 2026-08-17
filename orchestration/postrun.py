@@ -36,6 +36,42 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _format_motif_location(motif: dict) -> str:
+    """
+    Format a motif dict into a human-readable location string.
+
+    Handles the new coordinate schema with mapping_status and coordinate_system,
+    falling back to legacy start/end fields.
+    """
+    name = str(motif.get("motif") or "unknown")
+    mapping_status = motif.get("mapping_status")
+    coordinate_system = motif.get("coordinate_system")
+
+    if (
+        mapping_status == "mapped"
+        and coordinate_system == "sequence_zero_based_half_open"
+    ):
+        start = motif.get("sequence_start")
+        end = motif.get("sequence_end")
+
+        if start is not None and end is not None:
+            return f"{name}@sequence[{start},{end})"
+
+    msa_start = motif.get("msa_start")
+    msa_end = motif.get("msa_end")
+
+    if msa_start is not None and msa_end is not None:
+        return f"{name}@alignment[{msa_start},{msa_end})"
+
+    legacy_start = motif.get("start")
+    legacy_end = motif.get("end")
+
+    if legacy_start is not None and legacy_end is not None:
+        return f"{name}@legacy[{legacy_start},{legacy_end})"
+
+    return f"{name}@unmapped"
+
+
 def _topic_name(topic: dict | None, state: dict | None = None) -> str | None:
     state = state or {}
     topic = topic or {}
@@ -1328,12 +1364,17 @@ def _extract_stage_examples(state: dict) -> list[dict]:
 
         if output is None:
             if agent == "bioinfo" and isinstance(metadata, dict):
+                selected_motifs = metadata.get("selected_motifs", []) or []
+                motifs_text = ", ".join(_format_motif_location(m) for m in selected_motifs)
                 output = (
                     "BIOINFO SUMMARY\n"
                     f"Conservation valid: {metadata.get('conservation_valid')}\n"
                     f"MSA size: {metadata.get('msa_size')}\n"
                     f"Conservation fitness: {metadata.get('conservation_fitness')}\n"
-                    f"Selected motifs: {metadata.get('selected_motifs', [])}"
+                    f"Selected motifs: {motifs_text}\n"
+                    f"MSA sequences: {metadata.get('num_sequences', '?')}\n"
+                    f"Alignment length: {metadata.get('alignment_length', '?')}\n"
+                    f"Quality passed: {metadata.get('quality_passed', False)}"
                 )
             else:
                 continue
@@ -2962,6 +3003,13 @@ def run_postrun_pipeline(topic: dict, final_state: dict | None = None) -> None:
             "conservation_fitness": (
                 ((state or {}).get("conservation_signal") or {}).get("conservation_fitness")
             ),
+            # Current batch conservation (per-iteration)
+            "current_batch_conservation_fitness": (state or {}).get("current_batch_conservation_fitness"),
+            "current_batch_msa_sequence_count": (state or {}).get("current_batch_msa_sequence_count", 0),
+            # Historical conservation (accumulated across iterations)
+            "historical_conservation_fitness": (state or {}).get("historical_conservation_fitness"),
+            "historical_msa_sequence_count": (state or {}).get("historical_msa_sequence_count", 0),
+            "conservation_iteration_history": (state or {}).get("conservation_iteration_history", []),
             "designed_sequence_count": len((state or {}).get("designed_sequences", []) or []),
             "binding_result_count": len((state or {}).get("binding_results", []) or []),
             "iteration_count": (state or {}).get("iterations"),

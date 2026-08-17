@@ -448,6 +448,14 @@ class LabState(TypedDict, total=False):
     mutation_bias: dict
     joint_physics_feedback: dict
 
+    # Phase 4.1: NSGA health reporting
+    nsga_valid_candidate_count: int
+    nsga_invalid_candidate_count: int
+    nsga_penalty_only_count: int
+    nsga_failure_reason_counts: dict[str, int]
+    nsga_best_sequence: str | None
+    nsga_used_fallback_population: bool
+
     # ----------------------------------------------------------------
     # Agent outputs
     # ----------------------------------------------------------------
@@ -473,6 +481,17 @@ class LabState(TypedDict, total=False):
     bioinfo_alignment_length: int
     bioinfo_quality_passed: bool
     bioinfo_quality_reasons: List[str]
+    # Current batch conservation (populated each iteration by bioinfo_agent)
+    current_batch_conservation_signal: dict
+    current_batch_conserved_regions: List[dict]  # [{region_id, msa_start, msa_end, sequence_start, sequence_end, coordinate_system, mapping_status, reference_sequence_id, mean_identity}, ...]
+    current_batch_conservation_fitness: float
+    # MSA-to-sequence coordinate mapping for this batch
+    current_batch_msa_mapping: dict | None  # {msa_pos: seq_pos, ...}
+    # Historical conservation (accumulated across iterations)
+    historical_conservation_signal: dict
+    historical_conservation_fitness: float | None
+    historical_msa_sequence_count: int
+    conservation_iteration_history: List[dict]  # [{iteration, population, msa_sequence_count, msa_conservation_percent, conservation_fitness}, ...]
 
     # ----------------------------------------------------------------
     # Designed candidates / structured outputs
@@ -483,6 +502,14 @@ class LabState(TypedDict, total=False):
     md_results: Annotated[List[dict], dedupe_md_results_reducer]
     structural_status: str
     structural_error: str | None
+
+    # ----------------------------------------------------------------
+    # Current structural batch (non-reducer - not accumulated)
+    # Populated by structural agent each iteration for downstream use
+    # ----------------------------------------------------------------
+    current_structural_sequences: List[str]
+    current_structural_candidates: List[dict]
+    current_structural_iteration: int
 
     # ----------------------------------------------------------------
     # Target protein selection
@@ -505,6 +532,11 @@ class LabState(TypedDict, total=False):
     resolved_partial_success_targets: Annotated[List[str], dedupe_string_list_reducer]
     docking_preferences: Annotated[List[dict], append_unique_dicts_reducer]
     seq_len: int
+    # Priority 6 fix: Best validated target preservation
+    best_validated_target_status: str | None
+    best_validated_target_status_reason: str | None
+    best_validated_binding_results: list[dict]
+    best_validated_clean_interface_count: int
 
     # ----------------------------------------------------------------
     # Literature learning / biological priors
@@ -559,6 +591,24 @@ class LabState(TypedDict, total=False):
     inhibitor_vina_cache_hits: int
     inhibitor_vina_cache_misses: int
     inhibitor_vina_cache_enabled: bool
+
+    # Inhibitor screening signature: skip re-docking when pocket + config unchanged.
+    inhibitor_screen_signature: str | None  # hash of (pocket_seq, box, exhaustiveness, seed)
+    inhibitor_screen_last_signature: str | None
+    inhibitor_screen_skipped_count: int
+
+    # Phase 2.4: PubChem provider-source metrics
+    pubchem_live_requests: int
+    pubchem_cache_hits: int
+    pubchem_manifest_hits: int
+    pubchem_failures: int
+    pubchem_circuit_opened: bool
+
+    # Phase 4.2: Method-specific cache metrics
+    rna_hdock_cache_hits: int
+    rna_hdock_cache_misses: int
+    peptide_hdock_cache_hits: int
+    peptide_hdock_cache_misses: int
 
     # ----------------------------------------------------------------
     # Logs / conversation

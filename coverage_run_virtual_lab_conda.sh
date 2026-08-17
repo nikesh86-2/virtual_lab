@@ -422,6 +422,37 @@ print("vLLM import OK")
 PY
 
 # ===========================================================================
+# 7b. TARGETED REGRESSION TESTS (before expensive vLLM startup)
+# ===========================================================================
+
+echo "===== TARGETED REGRESSION TESTS ====="
+
+# Run pytest under coverage to catch regressions before wasting GPU time on vLLM/HDOCK
+set +e
+"${PY}" -m coverage run \
+    --rcfile="${PROJECT_DIR}/.coveragerc" \
+    --parallel-mode \
+    -m pytest -q \
+    tests/optimisation/test_nsga_invalid_population.py \
+    tests/utils/test_pareto_analysis.py \
+    tests/orchestration/agents/test_pi_nsga_fallback.py \
+    tests/orchestration/agents/test_structural_shortlist.py \
+    tests/core/test_conservation_coordinate_mapping.py \
+    tests/core/test_hdock_cache.py \
+    tests/core/test_pubchem_cache.py \
+    tests/core/test_vina_box_constraints.py
+PYTEST_EXIT=$?
+set -e
+
+if [ "${PYTEST_EXIT}" -ne 0 ]; then
+    echo "ERROR: Regression tests failed (exit ${PYTEST_EXIT})"
+    echo "Fixes not validated - aborting before expensive vLLM startup"
+    exit 1
+fi
+
+echo "===== REGRESSION TESTS PASSED ====="
+
+# ===========================================================================
 # 8. vLLM CONFIGURATION AND CLEANUP
 # ===========================================================================
 

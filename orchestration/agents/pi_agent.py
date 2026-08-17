@@ -1764,6 +1764,16 @@ def pi_agent(state: LabState) -> dict:
             joint_feedback=joint_feedback,
         )
 
+        # Priority 3 fix: Initialize fallback-safe variables before optimisation
+        # to prevent UnboundLocalError in NSGA failure branches
+        new_bias = dict(
+            state.get("mutation_bias")
+            or {}
+        )
+        selected_sequences = list(dict.fromkeys(sequences))
+        optimisation_status = "not_run"
+        optimisation_failure_reason = None
+
         population = run_system(
             topic=topic,
             target_pdb=target_pdb,
@@ -1782,9 +1792,151 @@ def pi_agent(state: LabState) -> dict:
                 summary="No viable NSGA-II population produced; using fallback sequence.",
             )
 
+        # Issue 3 fix: check NSGA status from the optimiser
+        nsga_status = state.get("_run_system_nsga_status", "unknown")
+
+        if nsga_status == "invalid_all_penalty":
+            log.warning(
+                "NSGA-II produced an all-penalty population (valid=0); "
+                "retaining previous valid structural sequences."
+            )
+
+            selection_limit = max(
+                1,
+                int(os.getenv("VLAB_PI_SELECTION_LIMIT", "5")),
+            )
+
+            retained_sequences = list(
+                state.get("current_structural_sequences")
+                or state.get("designed_sequences")
+                or []
+            )
+            retained_sequences = list(dict.fromkeys(retained_sequences))
+            selected_sequences = retained_sequences[:selection_limit]
+
+            failure_reason = state.get("_run_system_failure_reason", "all_penalty")
+
+            pi_summary = (
+                "NSGA-II failed to produce a valid objective population "
+                f"({failure_reason}). Previous valid structural candidates "
+                "were retained."
+            )
+
+            return {
+                "pi_summary": pi_summary,
+                "pi_action_summary": pi_summary,
+                "pi_operational_summary": pi_summary,
+                "pi_training_metadata": _build_pi_training_metadata(
+                    state=state,
+                    target_pdb=target_pdb,
+                    joint_feedback=joint_feedback,
+                ),
+                "optimisation_status": "nsga_failed",
+                "nsga_status": nsga_status,
+                "nsga_failure_reason": failure_reason,
+                "nsga_valid_candidate_count": 0,
+                "nsga_invalid_candidate_count": len(population) if population else 0,
+                "designed_sequences": selected_sequences,
+                "target_sequence": selected_sequences[0] if selected_sequences else None,
+                "best_interface_clean_sequence": _select_best_interface_clean_sequence(state),
+                "structural_candidates": state.get("structural_candidates", []),
+                "target_pdb": target_pdb,
+                "target_pdb_id": state.get("target_pdb_id") or _target_id_from_state(state, target_pdb),
+                "target_pdb_path": state.get("target_pdb_path"),
+                "target_status": state.get("target_status"),
+                "target_status_reason": state.get("target_status_reason"),
+                "partial_success_targets": state.get("partial_success_targets", []),
+                "resolved_partial_success_targets": state.get("resolved_partial_success_targets", []),
+                "failed_target_pdbs": state.get("failed_target_pdbs", []),
+                "mutation_bias": new_bias,
+                "hypothesis": topic,
+                "iterations": state.get("iterations", 0) + 1,
+                "_run_system_selected_motifs": state.get("_run_system_selected_motifs", []),
+                "_run_system_min_fold_thresholds": state.get("_run_system_min_fold_thresholds", {}),
+                "_run_system_sequence_scores": state.get("_run_system_sequence_scores", {}),
+                "_run_system_best_interface_sequence": state.get("_run_system_best_interface_sequence"),
+                "joint_physics_feedback": joint_feedback,
+                "literature_motif_hints": literature_motif_hints,
+                "literature_target_hints": literature_target_hints,
+                "literature_policy_text": literature_policy_text,
+            }
+
         from VLAB2.optimisation.final_rna_design_system import decode_sequence as _decode
 
-        analysis = analyse_pareto(population, _decode)
+        # Issue 2 fix: validate population before Pareto analysis
+        # Extract fitness matrix from population (pymoo stores fitness in .F attribute)
+        from VLAB2.utils.pareto_analysis import _valid_nsga_rows
+
+        fitness_matrix = [ind.F for ind in population]
+        _, _, valid_indices = _valid_nsga_rows(fitness_matrix)
+
+        if len(valid_indices) == 0:
+            log.error(
+                "All NSGA-II candidates received penalty-only objective vectors; "
+                "skipping Pareto analysis."
+            )
+
+            selection_limit = max(
+                1,
+                int(os.getenv("VLAB_PI_SELECTION_LIMIT", "5")),
+            )
+
+            retained_sequences = list(
+                state.get("current_structural_sequences")
+                or state.get("designed_sequences")
+                or []
+            )
+            retained_sequences = list(dict.fromkeys(retained_sequences))
+            selected_sequences = retained_sequences[:selection_limit]
+
+            pi_summary = (
+                "NSGA-II produced no valid candidates after objective evaluation. "
+                "Previous valid structural candidates were retained."
+            )
+
+            return {
+                "pi_summary": pi_summary,
+                "pi_action_summary": pi_summary,
+                "pi_operational_summary": pi_summary,
+                "pi_training_metadata": _build_pi_training_metadata(
+                    state=state,
+                    target_pdb=target_pdb,
+                    joint_feedback=joint_feedback,
+                ),
+                "optimisation_status": "no_valid_candidates",
+                "nsga_status": nsga_status,
+                "nsga_failure_reason": "all_penalty",
+                "nsga_valid_candidate_count": 0,
+                "nsga_invalid_candidate_count": len(population),
+                "designed_sequences": selected_sequences,
+                "target_sequence": selected_sequences[0] if selected_sequences else None,
+                "best_interface_clean_sequence": _select_best_interface_clean_sequence(state),
+                "structural_candidates": state.get("structural_candidates", []),
+                "target_pdb": target_pdb,
+                "target_pdb_id": state.get("target_pdb_id") or _target_id_from_state(state, target_pdb),
+                "target_pdb_path": state.get("target_pdb_path"),
+                "target_status": state.get("target_status"),
+                "target_status_reason": state.get("target_status_reason"),
+                "partial_success_targets": state.get("partial_success_targets", []),
+                "resolved_partial_success_targets": state.get("resolved_partial_success_targets", []),
+                "failed_target_pdbs": state.get("failed_target_pdbs", []),
+                "mutation_bias": new_bias,
+                "hypothesis": topic,
+                "iterations": state.get("iterations", 0) + 1,
+                "_run_system_selected_motifs": state.get("_run_system_selected_motifs", []),
+                "_run_system_min_fold_thresholds": state.get("_run_system_min_fold_thresholds", {}),
+                "_run_system_sequence_scores": state.get("_run_system_sequence_scores", {}),
+                "_run_system_best_interface_sequence": state.get("_run_system_best_interface_sequence"),
+                "joint_physics_feedback": joint_feedback,
+                "literature_motif_hints": literature_motif_hints,
+                "literature_target_hints": literature_target_hints,
+                "literature_policy_text": literature_policy_text,
+            }
+
+        # Filter to valid candidates only for Pareto analysis
+        valid_population = [population[i] for i in valid_indices]
+
+        analysis = analyse_pareto(valid_population, _decode)
 
         pareto_sequences = _select_top_sequences_from_population(
             population,

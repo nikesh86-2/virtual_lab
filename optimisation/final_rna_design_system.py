@@ -99,6 +99,10 @@ MIN_ACCEPT_MFE_PER_NT = float(os.getenv("VLAB_RNA_MIN_ACCEPT_MFE_PER_NT", "-0.08
 ENFORCE_MIN_FOLD = os.getenv("VLAB_RNA_ENFORCE_MIN_FOLD", "1").strip() == "1"
 FOLD_THRESHOLD_PENALTY = float(os.getenv("VLAB_RNA_FOLD_THRESHOLD_PENALTY", "2.5"))
 
+# NSGA-II validation constants for detecting all-penalty populations.
+NSGA_INVALID_PENALTY = float(os.getenv("VLAB_NSGA_INVALID_PENALTY", "-1000.0"))
+NSGA_PENALTY_TOLERANCE = float(os.getenv("VLAB_NSGA_PENALTY_TOLERANCE", "1.0"))
+
 # Deduplication controls.
 NEAR_DUP_MAX_HAMMING = int(os.getenv("VLAB_RNA_NEAR_DUP_MAX_HAMMING", "2"))
 DEDUP_NEAR_DUPLICATES = os.getenv("VLAB_RNA_DEDUP_NEAR_DUPLICATES", "1").strip() == "1"
@@ -401,6 +405,44 @@ def _normalise_conservation_signal(raw: Any) -> dict:
     return out
 
 
+def _normalise_sequence_mapped_regions(
+    region,
+) -> tuple[int, int] | None:
+    """
+    Extract a (start, end) half-open interval from a conserved region.
+
+    Accepts:
+      - dict with mapping_status=="mapped" and
+        coordinate_system=="sequence_zero_based_half_open"
+        → returns (sequence_start, sequence_end)
+      - dict with msa_start/msa_end but no mapped coordinates → None
+      - legacy (start, end) tuple → returns (start, end)
+
+    Returns None for unmapped dict regions so callers can skip them.
+    """
+    if isinstance(region, dict):
+        mapping_status = region.get("mapping_status")
+        coordinate_system = region.get("coordinate_system")
+
+        if (
+            mapping_status == "mapped"
+            and coordinate_system == "sequence_zero_based_half_open"
+        ):
+            try:
+                return int(region["sequence_start"]), int(region["sequence_end"])
+            except Exception:
+                return None
+
+        # Dict but not mapped — skip silently
+        return None
+
+    # Legacy tuple/list: (start, end)
+    try:
+        return int(region[0]), int(region[1])
+    except Exception:
+        return None
+
+
 def conservation_fitness(seq: str, conservation_signal: dict) -> float:
     seq = _clean_rna(seq)
     sig = _normalise_conservation_signal(conservation_signal)
@@ -436,10 +478,11 @@ def conservation_fitness(seq: str, conservation_signal: dict) -> float:
 
     region_bonus = 0.0
     for region in sig.get("conserved_regions", []) or []:
-        try:
-            start, end = int(region[0]), int(region[1])
-        except Exception:
+        interval = _normalise_sequence_mapped_regions(region)
+        if interval is None:
             continue
+
+        start, end = interval
 
         region_seq = seq[start:min(end, len(seq))]
         region_cons = consensus[start:min(end, len(seq))] if consensus else ""
@@ -1174,6 +1217,64 @@ def sequence_composition_entropy(seq: str) -> float:
     return entropy / math.log2(4)  # Normalize to [0, 1]
 
 
+def _validate_nsga_population(
+    population: list,
+    problem: "RNAProblem",
+) -> dict:
+    """
+    Validate NSGA-II population for all-penalty detection.
+    
+    Returns a dict with:
+        - is_valid: bool - True if population has non-penalty individuals
+        - valid_count: int - count of individuals with valid scores
+        - invalid_count: int - count of individuals with penalty scores
+        - failure_reasons: dict - counts of different failure types
+        - objective_failures: dict - per-objective failure counts
+    """
+    if not population:
+        return {
+            "is_valid": False,
+            "valid_count": 0,
+            "invalid_count": 0,
+            "failure_reasons": {"empty_population": 1},
+            "objective_failures": {},
+        }
+    
+    valid_count = 0
+    invalid_count = 0
+    failure_reasons: dict = {}
+    objective_failures: dict = {obj: 0 for obj in OBJECTIVES}
+    
+    for ind in population:
+        seq = decode_sequence(ind.X)
+        score = problem.last_scores.get(seq, {})
+        
+        # Check if this individual has penalty values
+        is_invalid = False
+        for obj in OBJECTIVES:
+            obj_val = score.get(obj, NSGA_INVALID_PENALTY)
+            if obj_val <= NSGA_INVALID_PENALTY + NSGA_PENALTY_TOLERANCE:
+                objective_failures[obj] += 1
+                is_invalid = True
+        
+        if is_invalid:
+            invalid_count += 1
+            reason = score.get("invalid_reason", "unknown_penalty")
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+        else:
+            valid_count += 1
+    
+    is_valid = valid_count > 0
+    
+    return {
+        "is_valid": is_valid,
+        "valid_count": valid_count,
+        "invalid_count": invalid_count,
+        "failure_reasons": failure_reasons,
+        "objective_failures": objective_failures,
+    }
+
+
 def run_system(
     topic: str,
     target_pdb: Optional[str] = None,
@@ -1702,6 +1803,28 @@ def run_system(
 
     population = list(res.pop) if hasattr(res, "pop") else []
 
+    # Validate population for all-penalty detection (Fix 1.1).
+    validation = _validate_nsga_population(population, problem)
+    
+    nsga_status = "valid" if validation["is_valid"] else "invalid_all_penalty"
+    nsga_failure_reason = None
+    
+    if not validation["is_valid"]:
+        nsga_failure_reason = str(validation["failure_reasons"])
+        log.warning(
+            "[NSGA] Invalid population detected: valid=%d invalid=%d reasons=%s",
+            validation["valid_count"],
+            validation["invalid_count"],
+            nsga_failure_reason,
+        )
+    
+    # Store NSGA diagnostics in state (Fix 1.3).
+    state["_run_system_nsga_status"] = nsga_status
+    state["_run_system_nsga_failure_reason"] = nsga_failure_reason
+    state["_run_system_nsga_valid_candidate_count"] = validation["valid_count"]
+    state["_run_system_nsga_invalid_candidate_count"] = validation["invalid_count"]
+    state["_run_system_nsga_objective_failures"] = validation["objective_failures"]
+
     # Final exact/near deduplication while preserving first encountered Pareto individuals.
     final_population = []
     final_seen = []
@@ -1799,6 +1922,13 @@ def run_system(
         "min_accept_mfe_per_nt": MIN_ACCEPT_MFE_PER_NT,
         "enforce_min_fold": ENFORCE_MIN_FOLD,
     }
+    
+    # NSGA validation status (Fix 1.3 - ensure fields are set at end).
+    state.setdefault("_run_system_nsga_status", nsga_status)
+    state.setdefault("_run_system_nsga_failure_reason", nsga_failure_reason)
+    state.setdefault("_run_system_nsga_valid_candidate_count", validation["valid_count"])
+    state.setdefault("_run_system_nsga_invalid_candidate_count", validation["invalid_count"])
+    state.setdefault("_run_system_nsga_objective_failures", validation["objective_failures"])
 
     return final_population
 

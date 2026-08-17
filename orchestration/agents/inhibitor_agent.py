@@ -56,6 +56,8 @@ from VLAB2.core.rna_binding_pocket import define_docking_box
 from VLAB2.core.small_molecule_prep import (
     fetch_and_prepare_compounds,
     fetch_known_rna_binding_inhibitors,
+    get_pubchem_circuit_state,
+    normalize_compound_name,
     prepare_receptor_pdbqt,
 )
 from VLAB2.orchestration.utils.checkpointing import save_checkpoint
@@ -777,25 +779,57 @@ def inhibitor_agent(state: dict) -> dict:
             len(known_sm or []),
         )
 
+        # Phase 2.4: Track PubChem provider-source metrics
+        pubchem_live_requests = 0
+        pubchem_cache_hits = 0
+        pubchem_manifest_hits = len(known_sm or [])
+
+        # Phase 2.2: Remove duplicate case-variant queries
+        # Build set of normalized names from known panel to avoid re-querying
+        resolved_names = {
+            normalize_compound_name(item.get("name", ""))
+            for item in (known_sm or [])
+        }
+
         pubchem_queries = os.getenv("VLAB_PUBCHEM_QUERIES", "").strip()
         pubchem_compounds = []
 
         if pubchem_queries:
-            try:
-                pubchem_compounds = fetch_and_prepare_compounds(
-                    pubchem_queries.split("|"),
-                    max_per_query=max_small_mols,
-                    output_dir=str(run_ligand_dir),
-                    target_tag=target_tag,
-                )
+            # Filter out queries that match known panel (case-insensitive)
+            additional_queries = [
+                query
+                for query in pubchem_queries.split("|")
+                if normalize_compound_name(query) not in resolved_names
+            ]
 
-                log.info(
-                    "inhibitor_agent: fetched %d PubChem compounds",
-                    len(pubchem_compounds or []),
-                )
+            if additional_queries:
+                try:
+                    pubchem_compounds = fetch_and_prepare_compounds(
+                        additional_queries,
+                        max_per_query=max_small_mols,
+                        output_dir=str(run_ligand_dir),
+                        target_tag=target_tag,
+                    )
 
-            except Exception as e:
-                log.warning("inhibitor_agent: PubChem fetch failed: %s", e)
+                    # Phase 2.4: Track PubChem source metrics
+                    pubchem_live_requests += len(additional_queries)
+                    for comp in (pubchem_compounds or []):
+                        source = comp.get("metadata_source", "unknown")
+                        if source == "pubchem_cache":
+                            pubchem_cache_hits += 1
+                        elif source == "pubchem_live":
+                            pubchem_live_requests += 1
+
+                    log.info(
+                        "inhibitor_agent: fetched %d PubChem compounds from %d additional queries",
+                        len(pubchem_compounds or []),
+                        len(additional_queries),
+                    )
+
+                except Exception as e:
+                    log.warning("inhibitor_agent: PubChem fetch failed: %s", e)
+            else:
+                log.info("inhibitor_agent: all PubChem queries already resolved from known panel")
 
         small_mol_list = _dedupe_compounds(
             (known_sm or []) + (pubchem_compounds or []),
@@ -838,17 +872,32 @@ def inhibitor_agent(state: dict) -> dict:
         try:
             llm = state.get("llm") or state.get("language_model")
 
-            llm_designed_peptides = design_inhibitor_peptides(
+            peptide_result = design_inhibitor_peptides(
                 target_pdb=target_pdb,
                 pocket_residues=docking_box.get("pocket_residues", []),
                 llm=llm,
                 max_peptides=min(max_peptides, 3),
             )
 
-            log.info(
-                "inhibitor_agent: LLM designed %d peptide candidates",
-                len(llm_designed_peptides or []),
-            )
+            llm_designed_peptides = peptide_result.get("peptides", [])
+            generation_method = peptide_result.get("generation_method", "unknown")
+
+            if generation_method == "llm":
+                log.info(
+                    "LLM designed %d peptide candidates",
+                    len(llm_designed_peptides or []),
+                )
+            elif generation_method == "conservative_defaults":
+                log.info(
+                    "Generated %d peptide candidates using conservative defaults",
+                    len(llm_designed_peptides or []),
+                )
+            else:
+                log.info(
+                    "Generated %d peptide candidates using method=%s",
+                    len(llm_designed_peptides or []),
+                    generation_method,
+                )
 
         except Exception as e:
             log.warning("inhibitor_agent: peptide design failed: %s", e)
@@ -924,6 +973,18 @@ def inhibitor_agent(state: dict) -> dict:
                 "inhibitor_agent: receptor PDBQT unavailable; small-molecule Vina docking will be skipped"
             )
 
+        # Phase 1.4: Build ligand metadata dict for cache key structure awareness
+        ligand_metadata = {}
+        for sm in (selected_small_mols or []):
+            if sm.get("pdbqt_path"):
+                ligand_path = Path(sm["pdbqt_path"])
+                ligand_metadata[ligand_path.stem] = {
+                    "input_smiles_sha256": sm.get("input_smiles_sha256"),
+                    "pdbqt_sha256": sm.get("pdbqt_sha256"),
+                    "manifest_version": sm.get("manifest_version"),
+                    "record_version": sm.get("record_version"),
+                }
+
         screen_result = run_inhibitor_screen(
             receptor_pdbqt=receptor_pdbqt,
             receptor_pdb=target_pdb,
@@ -934,6 +995,7 @@ def inhibitor_agent(state: dict) -> dict:
             max_small_molecules=max_small_mols,
             vina_seed=_env_int("VLAB_VINA_SEED", 1),
             force_vina_redock=_env_bool("VLAB_VINA_FORCE_REDOCK", False),
+            ligand_metadata=ligand_metadata,
         )
 
         small_mol_results = screen_result.get("small_molecules", []) or []
@@ -1025,6 +1087,21 @@ def inhibitor_agent(state: dict) -> dict:
                 f"{screen_result.get('vina_cache_misses', 0)} miss(es), "
                 f"seed={screen_result.get('vina_seed')}."
             )
+
+        # Phase 2.4: Update state with PubChem provider-source metrics
+        circuit_state = get_pubchem_circuit_state()
+        result["pubchem_live_requests"] = pubchem_live_requests
+        result["pubchem_cache_hits"] = pubchem_cache_hits
+        result["pubchem_manifest_hits"] = pubchem_manifest_hits
+        result["pubchem_failures"] = circuit_state.get("consecutive_failures", 0)
+        result["pubchem_circuit_opened"] = circuit_state.get("opened", False)
+
+        # Phase 2.4: Add PubChem provider-source metrics to summary
+        summary_parts.append(
+            f"PubChem sources: {pubchem_manifest_hits} manifest, "
+            f"{pubchem_cache_hits} cache, {pubchem_live_requests} live requests. "
+            f"Circuit open: {circuit_state['opened']}."
+        )
 
         inhibitor_summary = " ".join(summary_parts)
         result["inhibitor_summary"] = inhibitor_summary

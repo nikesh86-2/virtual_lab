@@ -18,6 +18,8 @@ Design decisions:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -63,6 +65,61 @@ def _env_int(key: str, default: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# INHIBITOR SCREEN SIGNATURE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sha256_file(path: str) -> str:
+    """Return SHA256 hexdigest of a file, or empty string if unreadable."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+def inhibitor_screen_signature(
+    target_pdb: str,
+    interface_residues: list,
+    pocket_center: tuple[float, float, float],
+    pocket_size: tuple[float, float, float],
+    ligand_files: list[str],
+    peptide_files: list[str],
+) -> str:
+    """
+    Build a deterministic signature for the inhibitor screen configuration.
+
+    When the signature matches a previous run, the screen can be skipped
+    because target, pocket, ligands, peptides, and docking parameters
+    are unchanged.
+    """
+    payload = {
+        "target_sha256": _sha256_file(target_pdb),
+        "interface_residues": sorted(str(item) for item in interface_residues),
+        "pocket_center": [round(float(x), 4) for x in pocket_center],
+        "pocket_size": [round(float(x), 4) for x in pocket_size],
+        "ligands": {
+            Path(path).name: _sha256_file(path)
+            for path in sorted(ligand_files)
+        },
+        "peptides": {
+            Path(path).name: _sha256_file(path)
+            for path in sorted(peptide_files)
+        },
+        "vina_seed": os.getenv("VLAB_VINA_SEED", "1"),
+        "vina_exhaustiveness": os.getenv("VLAB_VINA_EXHAUSTIVENESS", "8"),
+        "vina_cache_version": os.getenv("VLAB_VINA_CACHE_VERSION", "vina-cache-v1"),
+        "hdock_cache_version": os.getenv("VLAB_HDOCK_CACHE_VERSION", "hdock-cache-v1"),
+    }
+
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return hashlib.sha256(encoded).hexdigest()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SMALL MOLECULE DOCKING
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -76,6 +133,7 @@ def dock_small_molecules(
     max_ligands: int | None = None,
     seed: int = VINA_SEED,
     force_redock: bool | None = None,
+    ligand_metadata: dict | None = None,
 ) -> list:
     """
     Dock prepared small-molecule PDBQT files in ligands_dir against receptor.
@@ -149,6 +207,13 @@ def dock_small_molecules(
     for ligand_path in ligand_files:
         log.info("[VINA LIGAND] %s", ligand_path.name)
 
+        # Phase 1.4: Extract ligand hash information from metadata
+        ligand_info = ligand_metadata.get(ligand_path.stem, {}) if ligand_metadata else {}
+        ligand_smiles_sha256 = ligand_info.get("input_smiles_sha256")
+        ligand_pdbqt_sha256 = ligand_info.get("pdbqt_sha256")
+        manifest_version = ligand_info.get("manifest_version")
+        record_version = ligand_info.get("record_version")
+
         result = vina.dock(
             receptor_pdbqt=receptor_pdbqt,
             ligand_pdbqt=str(ligand_path),
@@ -157,6 +222,10 @@ def dock_small_molecules(
             exhaustiveness=exhaustiveness,
             seed=seed,
             force_redock=force_redock,
+            ligand_smiles_sha256=ligand_smiles_sha256,
+            ligand_pdbqt_sha256=ligand_pdbqt_sha256,
+            manifest_version=manifest_version,
+            record_version=record_version,
         )
 
         method = result.get("method", "vina")
@@ -164,7 +233,14 @@ def dock_small_molecules(
 
         row = {
             "name": ligand_path.stem,
-            "ligand_name": ligand_path.stem,
+            "ligand_name": ligand_info.get("name") or ligand_path.stem,
+            "ligand_cid": ligand_info.get("cid"),
+            "ligand_metadata_source": ligand_info.get("metadata_source"),
+            "ligand_metadata_sha256": ligand_info.get("metadata_sha256"),
+            "ligand_smiles_sha256": ligand_smiles_sha256,
+            "ligand_pdbqt_sha256": ligand_pdbqt_sha256,
+            "ligand_compound_form": ligand_info.get("compound_form"),
+            "manifest_version": manifest_version,
             "_inhibitor_name": ligand_path.stem,
             "ligand_type": "small_molecule",
             "ligand_path": str(ligand_path),
@@ -1114,15 +1190,64 @@ def run_inhibitor_screen(
     max_small_molecules: int | None = None,
     vina_seed: int = VINA_SEED,
     force_vina_redock: bool | None = None,
+    last_signature: str | None = None,
+    existing_results: dict | None = None,
+    ligand_metadata: dict | None = None,
 ) -> dict:
     """
     Run complete inhibitor screen.
 
     Returns ranked small molecules/peptides plus true inhibitor-vs-RNA overlap
     comparisons where possible.
+
+    If last_signature and existing_results are provided and the computed
+    signature matches last_signature, the screen is skipped and the existing
+    results are returned.
     """
     center = docking_box.get("center") or (0.0, 0.0, 0.0)
     size = docking_box.get("size") or (20.0, 20.0, 20.0)
+
+    # ── Collect files for signature ───────────────────────────────────────────
+    ligand_files = []
+    if os.path.isdir(small_molecule_dir):
+        ligand_files = [
+            str(p) for p in Path(small_molecule_dir).iterdir()
+            if p.is_file() and p.suffix.lower() in {".pdbqt", ".pdb"}
+        ]
+
+    peptide_files = []
+    if os.path.isdir(peptide_pdb_dir):
+        peptide_files = [
+            str(p) for p in Path(peptide_pdb_dir).iterdir()
+            if p.is_file() and p.suffix.lower() == ".pdb"
+        ]
+
+    # ── Compute screen signature ─────────────────────────────────────────────
+    interface_residues = docking_box.get("interface_residues", [])
+    signature = inhibitor_screen_signature(
+        target_pdb=receptor_pdb,
+        interface_residues=interface_residues,
+        pocket_center=tuple(center),
+        pocket_size=tuple(size),
+        ligand_files=ligand_files,
+        peptide_files=peptide_files,
+    )
+
+    # ── Skip logic: reuse existing results if signature unchanged ─────────────
+    if (
+        signature
+        and signature == last_signature
+        and existing_results
+    ):
+        log.info(
+            "Skipping unchanged inhibitor screen: signature=%.16s",
+            signature,
+        )
+        return {
+            **existing_results,
+            "inhibitor_screen_signature": signature,
+            "inhibitor_screen_reused": True,
+        }
 
     # ── Small molecules ──────────────────────────────────────────────────────
 
@@ -1142,6 +1267,7 @@ def run_inhibitor_screen(
             max_ligands=max_small_molecules,
             seed=vina_seed,
             force_redock=force_vina_redock,
+            ligand_metadata=ligand_metadata,
         )
 
     else:
@@ -1304,4 +1430,8 @@ def run_inhibitor_screen(
         "n_peptides": len(pep_ranked),
         "n_valid_small_molecules": n_valid_sm,
         "n_valid_peptides": n_valid_pep,
+
+        # Screen signature for reuse detection.
+        "inhibitor_screen_signature": signature,
+        "inhibitor_screen_reused": False,
     }

@@ -47,6 +47,10 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
             os.unlink(tmp_name)
 
 
+# Phase 1.4: Vina cache schema version
+VINA_CACHE_SCHEMA_VERSION = "vina-cache-v3"
+
+
 class VinaDocking:
     """AutoDock Vina wrapper with deterministic seeds and persistent result caching."""
 
@@ -75,7 +79,7 @@ class VinaDocking:
             or os.getenv("VLAB_VINA_RESULT_CACHE_DIR")
             or DEFAULT_VINA_CACHE_DIR
         )
-        self.cache_version = os.getenv("VLAB_VINA_CACHE_VERSION", "vina-cache-v1")
+        self.cache_version = os.getenv("VLAB_VINA_CACHE_VERSION", VINA_CACHE_SCHEMA_VERSION)
 
         if self.cache_enabled:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +100,10 @@ class VinaDocking:
         exhaustiveness: int = 8,
         seed: int | None = None,
         force_redock: bool | None = None,
+        ligand_smiles_sha256: str | None = None,
+        ligand_pdbqt_sha256: str | None = None,
+        manifest_version: str | None = None,
+        record_version: int | None = None,
     ) -> dict:
         receptor_pdbqt = str(receptor_pdbqt)
         ligand_pdbqt = str(ligand_pdbqt)
@@ -134,6 +142,10 @@ class VinaDocking:
             size=size,
             exhaustiveness=exhaustiveness,
             seed=seed,
+            ligand_smiles_sha256=ligand_smiles_sha256,
+            ligand_pdbqt_sha256=ligand_pdbqt_sha256,
+            manifest_version=manifest_version,
+            record_version=record_version,
         )
 
         if self.cache_enabled and not force_redock:
@@ -279,17 +291,38 @@ class VinaDocking:
         size: tuple,
         exhaustiveness: int,
         seed: int,
+        ligand_smiles_sha256: str | None = None,
+        ligand_pdbqt_sha256: str | None = None,
+        manifest_version: str | None = None,
+        record_version: int | None = None,
     ) -> tuple[str, dict]:
+        """
+        Phase 1.4: Build structure-aware cache key including ligand identity hashes.
+
+        The cache key now includes:
+        - receptor PDBQT SHA-256
+        - ligand PDBQT SHA-256
+        - ligand SMILES SHA-256 (if available)
+        - manifest version and record version (if available)
+        This ensures that changing a ligand structure or manifest version
+        produces a different cache key, preventing stale cache reuse.
+        """
         payload = {
+            "cache_schema": VINA_CACHE_SCHEMA_VERSION,
             "cache_version": self.cache_version,
             "vina_binary": str(Path(self.vina_path).resolve()),
             "vina_binary_fingerprint": self._file_fingerprint(self.vina_path),
             "receptor_fingerprint": self._file_fingerprint(receptor_pdbqt),
             "ligand_fingerprint": self._file_fingerprint(ligand_pdbqt),
+            "ligand_pdbqt_sha256": ligand_pdbqt_sha256,
+            "ligand_smiles_sha256": ligand_smiles_sha256,
+            "manifest_version": manifest_version,
+            "record_version": record_version,
             "center": [round(float(value), 6) for value in center],
             "size": [round(float(value), 6) for value in size],
             "exhaustiveness": int(exhaustiveness),
             "seed": int(seed),
+            "scoring_function": "vina",
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest(), payload

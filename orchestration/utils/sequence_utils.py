@@ -22,6 +22,25 @@ def clean_rna(seq: str) -> str:
     )
 
 
+def valid_sequence_interval(
+    start: int,
+    end: int,
+    sequence_length: int,
+) -> bool:
+    """
+    Validate that a sequence interval is well-formed: 0 <= start < end <= sequence_length.
+    """
+    try:
+        start = int(start)
+        end = int(end)
+        sequence_length = int(sequence_length)
+    except (TypeError, ValueError):
+        return False
+
+    return 0 <= start < end <= sequence_length
+
+
+
 def hamming_distance(a: str, b: str) -> int:
     """
     Hamming distance with length mismatch treated as max length.

@@ -24,20 +24,16 @@ def get_llm(temperature: float = 0.7) -> ChatOpenAI:
 
         for attempt in range(3):
             try:
-                model_kwargs = {
-                    "frequency_penalty": float(os.getenv("VLLM_FREQ_PENALTY", "0.3")),
-                    "presence_penalty": float(os.getenv("VLLM_PRES_PENALTY", "0.1")),
-                    "top_p": float(os.getenv("VLLM_TOP_P", "0.9")),
-                    "max_tokens": int(os.getenv("VLLM_MAX_NEW_TOKENS", "512")),
-                }
-
                 _llm_instances[temperature] = ChatOpenAI(
                     base_url=vllm_url,
                     api_key=os.getenv("VLLM_API_KEY", "empty"),
                     model=model_name,
                     temperature=temperature,
                     request_timeout=600,
-                    model_kwargs=model_kwargs,
+                    frequency_penalty=float(os.getenv("VLLM_FREQ_PENALTY", "0.3")),
+                    presence_penalty=float(os.getenv("VLLM_PRES_PENALTY", "0.1")),
+                    top_p=float(os.getenv("VLLM_TOP_P", "0.9")),
+                    max_tokens=int(os.getenv("VLLM_MAX_NEW_TOKENS", "512")),
                 )
 
                 log.info(

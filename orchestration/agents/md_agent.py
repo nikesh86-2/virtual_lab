@@ -76,20 +76,45 @@ def md_agent(state: LabState) -> dict:
         eval_top_n = getenv_int("VLAB_AGENT_EVAL_TOP_N", 3, min_value=1)
 
         # ------------------------------------------------------------
-        # Sequence selection
+        # Sequence selection (priority: current batch > historical)
         # ------------------------------------------------------------
         sequences = []
 
+        # 1. Current structural batch (most recent - highest priority)
+        current_batch = state.get("current_structural_sequences", []) or []
+        if current_batch:
+            sequences.extend(current_batch)
+            log.info("MD using current_structural_sequences: %d candidates", len(current_batch))
+
+        # 2. Current structural candidates (with fold quality)
+        for c in state.get("current_structural_candidates", []) or []:
+            if isinstance(c, dict) and c.get("sequence"):
+                seq = c["sequence"]
+                if seq not in sequences:
+                    sequences.append(seq)
+
+        # 3. Legacy fallback: target_sequence
         if state.get("target_sequence"):
-            sequences.append(state["target_sequence"])
+            if state["target_sequence"] not in sequences:
+                sequences.append(state["target_sequence"])
 
-        sequences.extend(state.get("designed_sequences", []) or [])
+        # 4. Legacy fallback: designed_sequences (historical)
+        legacy_seqs = state.get("designed_sequences", []) or []
+        for seq in legacy_seqs:
+            if seq not in sequences:
+                sequences.append(seq)
 
+        # 5. Legacy fallback: structural_candidates (historical)
         for c in state.get("structural_candidates", []) or []:
             if isinstance(c, dict) and c.get("sequence"):
-                sequences.append(c["sequence"])
+                seq = c["sequence"]
+                if seq not in sequences:
+                    sequences.append(seq)
 
-        sequences = dedupe_rna_sequences(sequences)[:eval_top_n]
+        # Fix 2.3: Use order-preserving exact deduplication to preserve
+        # anchor/local/exploratory priority from downstream shortlist
+        sequences = list(dict.fromkeys(sequences))
+        sequences = sequences[:eval_top_n]
 
         # ------------------------------------------------------------
         # Fold gate

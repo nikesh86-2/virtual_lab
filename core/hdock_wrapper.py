@@ -18,6 +18,7 @@ Adds:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -25,7 +26,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional
 
 
 try:
@@ -40,6 +41,33 @@ log = logging.getLogger("virtual_lab.hdock_wrapper")
 DEFAULT_HDOCK_BIN = os.getenv("HDOCK_BIN", "hdock")
 DEFAULT_CREATEPL_BIN = os.getenv("CREATEPL_BIN", "createpl")
 DEFAULT_HDOCK_DEBUG_DIR = "/mnt/scratch/fbsnpat/bot/VLAB2/output_data/debug_hdock"
+DEFAULT_HDOCK_CACHE_DIR = "/mnt/scratch/fbsnpat/bot/VLAB2/output_data/hdock_result_cache"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 ERROR_TOKENS = [
     "parameters input error",
@@ -57,6 +85,7 @@ class HDockDocking:
         self,
         hdock_path: Optional[str] = None,
         createpl_path: Optional[str] = None,
+        cache_dir: Optional[str] = None,
     ):
         self.device = set_gpu_for_agent(prefer=1)
 
@@ -86,10 +115,196 @@ class HDockDocking:
         }
         self.min_atoms = self._getenv_int("HDOCK_MIN_PDB_ATOMS", 3, min_value=1)
 
+        # Cache configuration
+        self.cache_enabled = _env_bool("VLAB_HDOCK_CACHE_ENABLED", True)
+        self.cache_dir = Path(
+            cache_dir
+            or os.getenv("VLAB_HDOCK_RESULT_CACHE_DIR")
+            or DEFAULT_HDOCK_CACHE_DIR
+        )
+        self.cache_version = os.getenv("VLAB_HDOCK_CACHE_VERSION", "hdock-cache-v1")
+        self.force_redock = _env_bool("VLAB_HDOCK_FORCE_REDOCK", False)
+
+        if self.cache_enabled:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
         log.info("HDockDocking initialised with hdock binary: %s", self.hdock_path)
         log.info("HDockDocking initialised with createpl binary: %s", self.createpl_path)
         log.info("HDockDocking configured HDOCK_TIMEOUT=%s", self.timeout)
         log.info("HDockDocking configured HDOCK_N_MODELS=%s", self.models)
+        log.info(
+            "HDockDocking cache: enabled=%s dir=%s version=%s",
+            self.cache_enabled,
+            self.cache_dir,
+            self.cache_version,
+        )
+
+    # ─── Cache methods ───────────────────────────────────────────────────────────
+
+    def _build_cache_key(
+        self,
+        receptor_pdb: str,
+        ligand_pdb: str,
+        n_models: int,
+        timeout: int,
+        createpl_timeout: int,
+    ) -> tuple[str, dict]:
+        """Build a deterministic cache key from docking inputs."""
+        payload = {
+            "cache_version": self.cache_version,
+            "hdock_binary": str(Path(self.hdock_path).resolve()),
+            "hdock_binary_fingerprint": self._file_fingerprint(self.hdock_path),
+            "createpl_binary": str(Path(self.createpl_path).resolve()),
+            "createpl_binary_fingerprint": self._file_fingerprint(self.createpl_path),
+            "receptor_fingerprint": self._file_fingerprint(receptor_pdb),
+            "ligand_fingerprint": self._file_fingerprint(ligand_pdb),
+            "n_models": int(n_models),
+            "timeout": int(timeout),
+            "createpl_timeout": int(createpl_timeout),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest(), payload
+
+    def _cache_paths(self, cache_key: str) -> tuple[Path, Path, Path]:
+        """Return paths for result.json, output.pdb, and complex.pdb."""
+        entry_dir = self.cache_dir / cache_key[:2] / cache_key
+        return (
+            entry_dir / "result.json",
+            entry_dir / "hdock_output.pdb",
+            entry_dir / "complex.pdb",
+        )
+
+    def _load_cached_result(
+        self,
+        cache_key: str,
+        output_out: str,
+        output_complex: str,
+    ) -> dict | None:
+        """Load cached docking result if available and valid."""
+        metadata_path, cached_output, cached_complex = self._cache_paths(cache_key)
+
+        # Fix 5.3: validate persistent files exist before considering cache valid
+        if not metadata_path.exists():
+            return None
+        if not cached_output.exists() or cached_output.stat().st_size == 0:
+            return None
+        if cached_complex.exists() and cached_complex.stat().st_size == 0:
+            return None
+
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            result = payload.get("result") or {}
+
+            if not result.get("valid"):
+                return None
+
+            # Copy cached files to requested locations
+            Path(output_out).parent.mkdir(parents=True, exist_ok=True)
+            if cached_output.exists():
+                shutil.copy2(cached_output, output_out)
+            if cached_complex.exists() and result.get("complex_file"):
+                Path(output_complex).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cached_complex, output_complex)
+
+            # Fix 5.2: canonicalise paths on restore
+            cached_result = dict(result)
+            cached_result["output_file"] = output_out
+            cached_result["dock_output_file"] = output_out
+            cached_result["complex_file"] = output_complex if cached_complex.exists() else None
+            cached_result["dock_complex_file"] = output_complex if cached_complex.exists() else None
+
+            # Canonicalise nested complex_status paths
+            complex_status = dict(result.get("complex_status") or {})
+            if cached_complex.exists():
+                complex_status["output_file"] = output_complex
+                complex_status["valid"] = True
+            else:
+                complex_status["valid"] = False
+            cached_result["complex_status"] = complex_status
+
+            cached_result["cache_hit"] = True
+            cached_result["cache_key"] = cache_key
+            cached_result["cache_metadata_file"] = str(metadata_path)
+            cached_result["cached_output_file"] = str(cached_output)
+            cached_result["cached_complex_file"] = str(cached_complex) if cached_complex.exists() else None
+            return cached_result
+        except Exception as exc:
+            log.warning("[HDOCK CACHE INVALID] key=%s error=%s", cache_key[:16], exc)
+            return None
+
+    def _save_cached_result(
+        self,
+        cache_key: str,
+        result: dict,
+        output_out: str,
+        output_complex: str | None,
+        cache_payload: dict,
+    ) -> None:
+        """Save docking result to cache."""
+        metadata_path, cached_output, cached_complex = self._cache_paths(cache_key)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Copy output files to cache
+            if Path(output_out).exists():
+                tmp_output = cached_output.with_suffix(".tmp")
+                shutil.copy2(output_out, tmp_output)
+                os.replace(tmp_output, cached_output)
+
+            if output_complex and Path(output_complex).exists():
+                tmp_complex = cached_complex.with_suffix(".tmp")
+                shutil.copy2(output_complex, tmp_complex)
+                os.replace(tmp_complex, cached_complex)
+
+            # Fix 5.1: canonicalise paths on cache save
+            # Build serialisable result with all paths pointing to cached files
+            serialisable_result = dict(result)
+            serialisable_result["output_file"] = str(cached_output)
+            serialisable_result["dock_output_file"] = str(cached_output)
+            serialisable_result["complex_file"] = str(cached_complex) if cached_complex.exists() else None
+            serialisable_result["dock_complex_file"] = str(cached_complex) if cached_complex.exists() else None
+
+            # Canonicalise nested complex_status paths
+            complex_status = dict(result.get("complex_status") or {})
+            if cached_complex.exists():
+                complex_status["output_file"] = str(cached_complex)
+                complex_status["valid"] = True
+            else:
+                complex_status["valid"] = False
+            serialisable_result["complex_status"] = complex_status
+
+            _atomic_write_json(
+                metadata_path,
+                {
+                    "cache_key": cache_key,
+                    "inputs": cache_payload,
+                    "result": serialisable_result,
+                },
+            )
+            log.info("[HDOCK CACHE SAVE] key=%s path=%s", cache_key[:16], metadata_path)
+        except Exception as exc:
+            log.warning("[HDOCK CACHE SAVE FAILED] key=%s error=%s", cache_key[:16], exc)
+
+    @staticmethod
+    def _file_fingerprint(path: str) -> dict[str, Any]:
+        """Compute SHA-256 fingerprint of a file."""
+        file_path = Path(path)
+        if not file_path.exists():
+            return {"path": str(file_path), "exists": False}
+
+        digest = hashlib.sha256()
+        with file_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+
+        stat = file_path.stat()
+        return {
+            "path": str(file_path),
+            "exists": True,
+            "sha256": digest.hexdigest(),
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+        }
 
     def dock(
         self,
@@ -160,6 +375,34 @@ class HDockDocking:
                         "ligand_pdb_input": ligand_pdb,
                         "n_models": n_models,
                     }
+
+        # ─── Cache check ─────────────────────────────────────────────────────────
+        cache_key, cache_payload = self._build_cache_key(
+            receptor_pdb=receptor_pdb,
+            ligand_pdb=ligand_pdb,
+            n_models=n_models,
+            timeout=timeout,
+            createpl_timeout=createpl_timeout,
+        )
+
+        if self.cache_enabled and not self.force_redock:
+            cached = self._load_cached_result(cache_key, output_out, output_complex)
+            if cached is not None:
+                log.info(
+                    "[HDOCK CACHE HIT] ligand=%s key=%s score=%s",
+                    Path(ligand_pdb).name,
+                    cache_key[:16],
+                    cached.get("dock_score"),
+                )
+                cached.update(failure_meta)
+                return cached
+
+        log.info(
+            "[HDOCK CACHE MISS] ligand=%s key=%s force_redock=%s",
+            Path(ligand_pdb).name,
+            cache_key[:16],
+            self.force_redock,
+        )
 
         log.info(
             "[HDOCK RUN] run_id=%s receptor=%s ligand=%s output=%s complex=%s",
@@ -263,7 +506,7 @@ class HDockDocking:
 
                 self._maybe_preserve_debug(work, run_id)
 
-                return {
+                result = {
                     "dock_score": score,
                     "hdock_score": score,
 
@@ -289,7 +532,22 @@ class HDockDocking:
                     "receptor_pdb_input": receptor_pdb,
                     "ligand_pdb_input": ligand_pdb,
                     "n_models": n_models,
+
+                    "cache_key": cache_key,
+                    "cache_hit": False,
                 }
+
+                # ─── Save to cache ─────────────────────────────────────────────────
+                if self.cache_enabled:
+                    self._save_cached_result(
+                        cache_key=cache_key,
+                        result=result,
+                        output_out=output_out,
+                        output_complex=final_complex,
+                        cache_payload=cache_payload,
+                    )
+
+                return result
 
         except subprocess.TimeoutExpired:
             return self._fallback(f"HDOCK timed out after {timeout}s")

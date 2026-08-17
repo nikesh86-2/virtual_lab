@@ -579,24 +579,37 @@ def _collect_sequences_for_protein(state: LabState, eval_top_n: int) -> list:
     Collect RNA sequences for protein/docking evaluation.
 
     Priority:
-      1. NSGA-promoted positive-interface sequence
-      2. best previously measured clean-interface sequence
-      3. current target_sequence
-      4. designed_sequences
-      5. structural_candidates
+      1. current_structural_sequences (most recent batch - highest priority)
+      2. NSGA-promoted positive-interface sequence
+      3. best previously measured clean-interface sequence
+      4. current target_sequence
+      5. designed_sequences
+      6. structural_candidates
     """
-    sequences = [
-        state.get("_run_system_best_interface_sequence"),
-        state.get("best_interface_clean_sequence"),
-        state.get("target_sequence"),
-    ]
-    sequences.extend(state.get("designed_sequences", []) or [])
+    sequences = []
 
+    # 1. Current structural batch (most recent - highest priority)
+    current_batch = state.get("current_structural_sequences", []) or []
+    if current_batch:
+        sequences.extend(current_batch)
+        log.debug("Protein using current_structural_sequences: %d candidates", len(current_batch))
+
+    # 2. NSGA-promoted positive-interface sequence
+    sequences.append(state.get("_run_system_best_interface_sequence"))
+    # 3. best previously measured clean-interface sequence
+    sequences.append(state.get("best_interface_clean_sequence"))
+    # 4. current target_sequence
+    sequences.append(state.get("target_sequence"))
+    # 5. designed_sequences
+    sequences.extend(state.get("designed_sequences", []) or [])
+    # 6. structural_candidates
     for candidate in state.get("structural_candidates", []) or []:
         if isinstance(candidate, dict) and candidate.get("sequence"):
             sequences.append(candidate["sequence"])
 
-    sequences = dedupe_rna_sequences([seq for seq in sequences if seq])
+    # Fix 2.3: Use order-preserving exact deduplication to preserve
+    # anchor/local/exploratory priority from downstream shortlist
+    sequences = list(dict.fromkeys([seq for seq in sequences if seq]))
     return sequences[:eval_top_n]
 
 def _fold_gate_blocks_protein(state: LabState) -> bool:
@@ -2079,6 +2092,11 @@ def protein_agent(state: LabState) -> dict:
             "target_status": "hdock_accepted_pending_interface",
             "target_status_reason": "hdock_filter_passed_interface_pending",
             "docking_preferences": list(state.get("docking_preferences", []) or []),
+            # Priority 6 fix: Preserve existing best validated target
+            "best_validated_target_status": state.get("best_validated_target_status"),
+            "best_validated_target_status_reason": state.get("best_validated_target_status_reason"),
+            "best_validated_binding_results": state.get("best_validated_binding_results", []),
+            "best_validated_clean_interface_count": state.get("best_validated_clean_interface_count", 0),
             "stage_outputs": [
                 record_stage_output(
                     state,
@@ -2483,6 +2501,14 @@ def protein_agent(state: LabState) -> dict:
                                 "binding_energy_is_physical": False,
                                 "interface_contacts": result.get("interface_contacts"),
                                 "best_interface_clean_sequence": best_interface_clean_sequence,
+                                # Priority 6 fix: Update best validated target if current batch is stronger
+                                "best_validated_target_status": ACCEPTED_TARGET_STATUS,
+                                "best_validated_target_status_reason": "interface_validated",
+                                "best_validated_binding_results": [
+                                    r for r in binding_results or []
+                                    if _has_clean_interface(r)
+                                ],
+                                "best_validated_clean_interface_count": len(interface_clean),
                                 "stage_outputs": [
                                     record_stage_output(
                                         state,
