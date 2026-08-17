@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -32,6 +33,13 @@ from VLAB2.orchestration.utils.docking_utils import (
 )
 from VLAB2.orchestration.utils.env_utils import getenv_int
 from VLAB2.orchestration.utils.sequence_utils import dedupe_rna_sequences
+from VLAB2.orchestration.utils.target_state_utils import (
+    calculate_target_quality_score,
+    make_batch_id,
+    make_binding_result_id,
+    should_promote_best_target,
+    is_validated_target_record,
+)
 from VLAB2.orchestration.literature_memory import LiteratureMemory
 
 try:
@@ -2602,6 +2610,136 @@ def protein_agent(state: LabState) -> dict:
 
         except Exception as e:
             log.warning("Failed to export docking summary files: %s", e)
+
+        # ============================================================
+        # Build TargetEvaluationRecord for state management
+        # ============================================================
+        try:
+            rows = [
+                r for r in result.get("binding_results", []) or []
+                if isinstance(r, dict)
+            ]
+
+            # Add binding_result_id to each result row
+            for row in rows:
+                row["binding_result_id"] = make_binding_result_id(row)
+
+            # Extract metrics for target evaluation record
+            dock_valid_count = sum(1 for r in rows if _is_dock_valid_row(r))
+            interface_clean = [r for r in rows if _has_clean_interface(r)]
+            steric_clash_count = sum(1 for r in rows if _has_steric_clash(r))
+            hdock_scores = [r.get("dock_score") for r in rows if r.get("dock_score") is not None]
+            
+            target_pdb = result.get("target_pdb")
+            target_status = result.get("target_status")
+            target_status_reason = result.get("target_status_reason")
+
+            # Only build record if we have a target (not all failures)
+            if target_pdb and target_status:
+                batch_identity = {
+                    "target_pdb": str(target_pdb).strip().upper(),
+                    "iteration": int(state.get("iterations", 0) or 0),
+                    "sequence_ids": sorted([r.get("sequence", "")[:10] for r in rows if r.get("sequence")]),
+                    "scores": sorted([float(s) for s in hdock_scores if s is not None]),
+                }
+
+                target_evaluation_record = {
+                    "target_pdb": str(target_pdb).strip().upper(),
+                    "status": target_status,
+                    "status_reason": target_status_reason or "unknown",
+                    "iteration": int(state.get("iterations", 0) or 0),
+                    "batch_id": make_batch_id(batch_identity),
+                    "evaluated_at": datetime.now(timezone.utc).isoformat(),
+                    
+                    # Metrics
+                    "docking_valid_count": dock_valid_count,
+                    "docking_required_count": min_valid_dockings_per_target,
+                    "clean_interface_count": len(interface_clean),
+                    "clean_interface_required_count": min_valid_dockings_per_target,
+                    "steric_clash_count": steric_clash_count,
+                    
+                    "best_hdock_relative_score": (
+                        min(hdock_scores) if hdock_scores else None
+                    ),
+                    "hdock_score_spread": (
+                        max(hdock_scores) - min(hdock_scores)
+                        if len(hdock_scores) > 1
+                        else 0.0
+                    ),
+                    "interface_quality_score": (
+                        sum(r.get("interface_quality_score") or 0 for r in interface_clean)
+                        / len(interface_clean)
+                        if interface_clean
+                        else 0.0
+                    ),
+                    "aggregate_quality_score": calculate_target_quality_score(
+                        len(interface_clean),
+                        steric_clash_count,
+                        dock_valid_count,
+                        hdock_scores,
+                    ),
+                    
+                    "accepted": target_status == ACCEPTED_TARGET_STATUS,
+                    "interface_validated": len(interface_clean) >= min_valid_dockings_per_target,
+                    "exploratory": False,
+                    
+                    "binding_result_ids": [r["binding_result_id"] for r in rows],
+                    "clean_sequence_ids": [
+                        r.get("sequence", "") for r in interface_clean if r.get("sequence")
+                    ],
+                    "clash_sequence_ids": [
+                        r.get("sequence", "") for r in rows
+                        if r.get("sequence") and _has_steric_clash(r)
+                    ],
+                    
+                    "docking_summary_json": result.get("docking_summary_json"),
+                    "docking_summary_csv": result.get("docking_summary_csv"),
+                    "docking_summary_md": result.get("docking_summary_md"),
+                    
+                    "metadata": {
+                        "binding_units": "hdock_relative_score",
+                        "backend": "hdock",
+                        "require_interface_for_target_acceptance": require_interface_for_target_acceptance,
+                        "allow_partial_interface_target": allow_partial_interface_target,
+                    },
+                }
+
+                # Update state atomically
+                history = list(state.get("target_evaluation_history") or [])
+                history.append(target_evaluation_record)
+
+                best = state.get("best_validated_target_evaluation")
+
+                state_update = {
+                    "latest_target_evaluation": target_evaluation_record,
+                    "target_evaluation_history": history,
+                    
+                    # Legacy aliases for backward compatibility
+                    "target_pdb": target_evaluation_record["target_pdb"],
+                    "target_status": target_evaluation_record["status"],
+                    "target_status_reason": target_evaluation_record["status_reason"],
+                }
+
+                # Determine if this record should promote best_validated
+                if should_promote_best_target(target_evaluation_record, best):
+                    state_update.update({
+                        "best_validated_target_evaluation": target_evaluation_record,
+                        "best_validated_target_pdb": target_evaluation_record["target_pdb"],
+                        "best_validated_target_status": target_evaluation_record["status"],
+                        "best_validated_target_status_reason": target_evaluation_record["status_reason"],
+                    })
+                    log.info(
+                        "Target evaluation record promoted to best_validated: "
+                        "%s status=%s quality=%.2f",
+                        target_evaluation_record["target_pdb"],
+                        target_evaluation_record["status"],
+                        target_evaluation_record["aggregate_quality_score"],
+                    )
+
+                state.update(state_update)
+
+        except Exception as e:
+            log.warning("Failed to build TargetEvaluationRecord: %s", e)
 
         _update_failure_memory_from_result({**state, **result})
         save_checkpoint({**state, **result})

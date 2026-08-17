@@ -155,9 +155,23 @@ def build_initial_state(
             "llm_fallback",
         ),
         "target_sequence": None,
-        # Priority 6 fix: Best validated target preservation defaults
+
+        # ================================================================
+        # Target evaluation: Separate latest batch from best validated state
+        # ================================================================
+        "latest_target_evaluation": None,
+        "best_validated_target_evaluation": None,
+        "target_evaluation_history": [],
+
+        # Compatibility aliases (derived from structured records)
+        "target_pdb": None,
+        "target_status": None,
+        "target_status_reason": None,
+        "best_validated_target_pdb": None,
         "best_validated_target_status": None,
         "best_validated_target_status_reason": None,
+
+        # Legacy preservation fields (kept for backward compatibility)
         "best_validated_binding_results": [],
         "best_validated_clean_interface_count": 0,
 

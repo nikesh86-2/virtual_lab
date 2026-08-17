@@ -6,6 +6,45 @@ from VLAB2.orchestration.state_schema import LabState
 from VLAB2.orchestration.utils.text_utils import truncate_str
 
 
+def format_motif_location(motif: dict) -> str:
+    """
+    Format a motif location string with correct coordinate system.
+    
+    Renders as:
+    - GAG@sequence[5,8) if mapped to sequence coordinates
+    - CUG@alignment[40,43) if unmapped (alignment coordinates)
+    - CUG@unmapped if invalid
+    
+    Args:
+        motif: A motif dict with keys like motif/matched, mapping_status, 
+               coordinate_system, sequence_start/end, msa_start/end
+    
+    Returns:
+        Formatted motif location string
+    """
+    name = str(motif.get("motif") or motif.get("matched") or "unknown")
+    status = motif.get("mapping_status")
+    coordinate_system = motif.get("coordinate_system")
+
+    if (
+        status == "mapped"
+        and coordinate_system == "sequence_zero_based_half_open"
+    ):
+        start = motif.get("sequence_start")
+        end = motif.get("sequence_end")
+
+        if start is not None and end is not None:
+            return f"{name}@sequence[{int(start)},{int(end)})"
+
+    msa_start = motif.get("msa_start")
+    msa_end = motif.get("msa_end")
+
+    if msa_start is not None and msa_end is not None:
+        return f"{name}@alignment[{int(msa_start)},{int(msa_end)})"
+
+    return f"{name}@unmapped"
+
+
 def generate_final_report(state: LabState) -> str:
     """
     Generate Markdown summary report for a completed Virtual Lab run.

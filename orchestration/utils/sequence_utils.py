@@ -40,6 +40,148 @@ def valid_sequence_interval(
     return 0 <= start < end <= sequence_length
 
 
+# ---------------------------------------------------------------------------
+# MSA-to-sequence coordinate mapping (Priority 2 fix)
+# ---------------------------------------------------------------------------
+
+def alignment_boundary_to_sequence_offset(
+    aligned_reference: str,
+    boundary: int,
+) -> int | None:
+    """
+    Convert an alignment column boundary to a sequence offset.
+
+    For half-open interval [msa_start, msa_end), counts non-gap residues
+    before each boundary position in the aligned reference.
+
+    Args:
+        aligned_reference: The aligned reference sequence (may contain gaps)
+        boundary: The alignment column position (0-based)
+
+    Returns:
+        The sequence offset (number of non-gap residues before boundary),
+        or None if boundary is out of range.
+    """
+    if boundary < 0 or boundary > len(aligned_reference):
+        return None
+
+    return sum(
+        1
+        for character in aligned_reference[:boundary]
+        if character not in {"-", "."}
+    )
+
+
+def map_alignment_interval_to_sequence(
+    aligned_reference: str,
+    msa_start: int,
+    msa_end: int,
+) -> tuple[int, int] | None:
+    """
+    Map a half-open alignment interval to a sequence interval.
+
+    Correctly handles gaps by using boundary-based counting, not
+    position mapping.
+
+    Args:
+        aligned_reference: Aligned reference sequence (may contain gaps)
+        msa_start: Alignment start column (0-based, inclusive)
+        msa_end: Alignment end column (0-based, exclusive)
+
+    Returns:
+        Tuple of (sequence_start, sequence_end) as half-open interval,
+        or None if interval is invalid.
+
+    Examples:
+        >>> map_alignment_interval_to_sequence("AACUGAGUCC", 4, 7)
+        (4, 7)  # No gaps, so alignment and sequence intervals match
+
+        >>> map_alignment_interval_to_sequence("AA-CUGA-GUCC", 3, 7)
+        (2, 6)  # Gap before boundary 3, so sequence start is lower
+
+    """
+    if not isinstance(msa_start, int) or not isinstance(msa_end, int):
+        return None
+
+    if not 0 <= msa_start < msa_end <= len(aligned_reference):
+        return None
+
+    sequence_start = alignment_boundary_to_sequence_offset(
+        aligned_reference,
+        msa_start,
+    )
+    sequence_end = alignment_boundary_to_sequence_offset(
+        aligned_reference,
+        msa_end,
+    )
+
+    if sequence_start is None or sequence_end is None:
+        return None
+
+    if sequence_start >= sequence_end:
+        return None
+
+    return sequence_start, sequence_end
+
+
+def validate_motif_mapping(
+    matched_motif: str,
+    sequence_start: int | None,
+    sequence_end: int | None,
+    reference_sequence: str,
+) -> tuple[bool, str | None]:
+    """
+    Validate that a mapped motif interval is correct.
+
+    Checks:
+    - Both boundaries are defined
+    - Interval is within reference bounds
+    - Mapped length matches motif length
+    - Mapped sequence equals matched sequence exactly
+
+    Args:
+        matched_motif: The concrete matched motif sequence (not a pattern)
+        sequence_start: Mapped sequence interval start (0-based)
+        sequence_end: Mapped sequence interval end (0-based, exclusive)
+        reference_sequence: The ungapped reference sequence
+
+    Returns:
+        Tuple of (is_valid, error_reason)
+        If is_valid, error_reason is None.
+
+    Examples:
+        >>> validate_motif_mapping("GAG", 5, 8, "AAAAAGAGCCCC")
+        (True, None)
+
+        >>> validate_motif_mapping("GAG", 5, 7, "AAAAAGAGCCCC")
+        (False, "mapped_length_mismatch:expected=3,observed=2")
+    """
+    if sequence_start is None or sequence_end is None:
+        return False, "missing_sequence_interval"
+
+    if not 0 <= sequence_start < sequence_end <= len(reference_sequence):
+        return False, "interval_out_of_bounds"
+
+    expected_length = len(matched_motif)
+    observed_length = sequence_end - sequence_start
+
+    if observed_length != expected_length:
+        return False, (
+            "mapped_length_mismatch:"
+            f"expected={expected_length},observed={observed_length}"
+        )
+
+    mapped_sequence = reference_sequence[sequence_start:sequence_end]
+
+    if mapped_sequence != matched_motif:
+        return False, (
+            "mapped_sequence_mismatch:"
+            f"expected={matched_motif},observed={mapped_sequence}"
+        )
+
+    return True, None
+
+
 
 def hamming_distance(a: str, b: str) -> int:
     """

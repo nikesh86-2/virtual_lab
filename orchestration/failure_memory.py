@@ -863,12 +863,24 @@ class FailureMemory:
         Ingest final/intermediate run state with interface-aware labels.
 
         This is the main bridge from docking results to persistent memory.
+        Records latest target outcomes but only promotes best_validated targets.
         """
         if not isinstance(state, dict):
             return
 
         binding_results = state.get("binding_results", []) or []
-        accepted_target = state.get("target_pdb")
+        
+        # Use best validated target for success memory if available, else use latest
+        best_target = state.get("best_validated_target_evaluation")
+        latest_target = state.get("latest_target_evaluation")
+        target_record = best_target or latest_target
+        
+        if target_record and isinstance(target_record, dict):
+            accepted_target = target_record.get("target_pdb")
+        else:
+            # Fall back to legacy field
+            accepted_target = state.get("target_pdb")
+        
         accepted_target_norm = _pdb_id(accepted_target)
 
         clean_rows: list[dict] = []

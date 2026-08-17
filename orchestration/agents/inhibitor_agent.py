@@ -60,6 +60,7 @@ from VLAB2.core.small_molecule_prep import (
     normalize_compound_name,
     prepare_receptor_pdbqt,
 )
+from VLAB2.orchestration.config import get_peptide_mode
 from VLAB2.orchestration.utils.checkpointing import save_checkpoint
 from VLAB2.orchestration.utils.docking_visuals import (
     render_inhibitor_snapshots_for_results,
@@ -211,9 +212,35 @@ def _resolve_target_pdb_from_state(state: dict) -> tuple[str | None, str | None]
     """
     Resolve target PDB path and PDB ID from state.
 
+    Prioritizes best_validated_target_evaluation if available, then latest_target_evaluation,
+    then falls back to legacy target_pdb fields.
+
     Returns:
       (target_pdb_path, target_pdb_id)
     """
+    # Check best validated target first (most authoritative)
+    best_target = state.get("best_validated_target_evaluation")
+    latest_target = state.get("latest_target_evaluation")
+    target_record = best_target or latest_target
+    
+    if target_record and isinstance(target_record, dict):
+        target_pdb_id = target_record.get("target_pdb")
+        target_pdb_path = target_record.get("target_pdb_path")
+        
+        if target_pdb_id or target_pdb_path:
+            if _is_valid_pdb(target_pdb_path):
+                return str(target_pdb_path), str(target_pdb_id or "").strip().upper() or None
+            
+            if _looks_like_pdb_id(target_pdb_id):
+                try:
+                    log.info("inhibitor_agent: resolving PDB ID from target record: %s", target_pdb_id)
+                    pdb_path = ensure_protein_pdb(target_pdb_id)
+                    log.info("inhibitor_agent: resolved target_pdb=%s", pdb_path)
+                    return str(pdb_path), str(target_pdb_id).strip().upper()
+                except Exception as e:
+                    log.warning("inhibitor_agent: failed to resolve PDB ID %s: %s", target_pdb_id, e)
+
+    # Fall back to legacy fields
     raw_target = (
         state.get("target_pdb_path")
         or state.get("target_pdb_file")
@@ -868,9 +895,18 @@ def inhibitor_agent(state: dict) -> dict:
         )
 
         llm_designed_peptides = []
+        peptide_mode = get_peptide_mode()
 
         try:
-            llm = state.get("llm") or state.get("language_model")
+            # Only use LLM for peptide design if mode is "llm_design"
+            llm = None
+            if peptide_mode == "llm_design":
+                llm = state.get("llm") or state.get("language_model")
+                if not llm:
+                    log.warning(
+                        "peptide mode is llm_design but no LLM available in state; "
+                        "falling back to known_panel"
+                    )
 
             peptide_result = design_inhibitor_peptides(
                 target_pdb=target_pdb,

@@ -177,7 +177,13 @@ def _target_allows_convergence(state: LabState) -> bool:
         log.info("Not converging: no current target is available.")
         return False
 
-    status = state.get("target_status")
+    # Use best validated target for acceptance criteria, fall back to latest
+    best_target = state.get("best_validated_target_evaluation")
+    latest_target = state.get("latest_target_evaluation")
+    target_record = best_target or latest_target
+
+    status = target_record.get("status") if target_record else state.get("target_status")
+    status_reason = target_record.get("status_reason") if target_record else state.get("target_status_reason")
 
     if target_id and status == "accepted_target":
         return True
@@ -186,7 +192,7 @@ def _target_allows_convergence(state: LabState) -> bool:
         "Not converging: target=%s status=%s reason=%s; accepted_target is required.",
         target_id or None,
         status,
-        state.get("target_status_reason"),
+        status_reason,
     )
     return False
 
@@ -537,7 +543,12 @@ def _inhibitor_should_run(state: LabState) -> str:
         log.info("Inhibitor screening disabled (VLAB_INHIBITOR_ENABLED != 1)")
         return "skeptic"
 
-    target_status = state.get("target_status")
+    # Use best validated target for routing, fall back to latest
+    best_target = state.get("best_validated_target_evaluation")
+    latest_target = state.get("latest_target_evaluation")
+    target_record = best_target or latest_target
+    
+    target_status = target_record.get("status") if target_record else state.get("target_status")
     target_id = _normalise_target_id(
         state.get("target_pdb_id") or state.get("target_pdb")
     )

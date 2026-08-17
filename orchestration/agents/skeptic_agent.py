@@ -81,13 +81,27 @@ def _safe_numeric_score(row: dict) -> float | None:
 
 
 def _target_status_summary(state: LabState) -> str:
-    """Describe target status without treating partial success as acceptance."""
-    target_id = _normalise_target_id(
-        state.get("target_pdb_id")
-        or state.get("target_pdb")
-    )
-    status = state.get("target_status") or "unknown"
-    reason = state.get("target_status_reason") or "unknown"
+    """
+    Describe target status without treating partial success as acceptance.
+    Uses best_validated_target_evaluation if available.
+    """
+    # Prioritize best validated target for summary
+    best_target = state.get("best_validated_target_evaluation")
+    latest_target = state.get("latest_target_evaluation")
+    target_record = best_target or latest_target
+    
+    if target_record and isinstance(target_record, dict):
+        target_id = _normalise_target_id(target_record.get("target_pdb"))
+        status = target_record.get("status") or "unknown"
+        reason = target_record.get("status_reason") or "unknown"
+    else:
+        # Fall back to legacy fields
+        target_id = _normalise_target_id(
+            state.get("target_pdb_id")
+            or state.get("target_pdb")
+        )
+        status = state.get("target_status") or "unknown"
+        reason = state.get("target_status_reason") or "unknown"
 
     if status == "accepted_target":
         return (

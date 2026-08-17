@@ -407,6 +407,51 @@ def dedupe_inhibitor_peptides_reducer(
 
 
 # ---------------------------------------------------------------------------
+# Target evaluation record
+# ---------------------------------------------------------------------------
+
+class TargetEvaluationRecord(TypedDict, total=False):
+    """
+    Structured record of a target evaluation batch.
+
+    Captures all metrics and metadata for a single round of target-RNA docking
+    and interface analysis. This allows separation of latest batch from best
+    validated state.
+    """
+    target_pdb: str
+    status: str
+    status_reason: str
+    iteration: int
+    batch_id: str
+    evaluated_at: str
+
+    docking_valid_count: int
+    docking_required_count: int
+    clean_interface_count: int
+    clean_interface_required_count: int
+    steric_clash_count: int
+
+    best_hdock_relative_score: float | None
+    hdock_score_spread: float | None
+    interface_quality_score: float | None
+    aggregate_quality_score: float
+
+    accepted: bool
+    interface_validated: bool
+    exploratory: bool
+
+    binding_result_ids: list[str]
+    clean_sequence_ids: list[str]
+    clash_sequence_ids: list[str]
+
+    docking_summary_json: str | None
+    docking_summary_csv: str | None
+    docking_summary_md: str | None
+
+    metadata: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
 # Canonical LabState
 # ---------------------------------------------------------------------------
 
@@ -532,9 +577,23 @@ class LabState(TypedDict, total=False):
     resolved_partial_success_targets: Annotated[List[str], dedupe_string_list_reducer]
     docking_preferences: Annotated[List[dict], append_unique_dicts_reducer]
     seq_len: int
-    # Priority 6 fix: Best validated target preservation
+
+    # ----------------------------------------------------------------
+    # Target evaluation: Separate latest batch from best validated state
+    # ----------------------------------------------------------------
+    latest_target_evaluation: dict[str, Any] | None
+    best_validated_target_evaluation: dict[str, Any] | None
+    target_evaluation_history: List[dict[str, Any]]
+
+    # Compatibility aliases (derived, not independently mutated)
+    target_pdb: str | None  # Latest batch target
+    target_status: str | None  # Latest batch status
+    target_status_reason: str | None  # Latest batch reason
+    best_validated_target_pdb: str | None
     best_validated_target_status: str | None
     best_validated_target_status_reason: str | None
+
+    # Legacy preservation fields (kept for backward compatibility)
     best_validated_binding_results: list[dict]
     best_validated_clean_interface_count: int
 

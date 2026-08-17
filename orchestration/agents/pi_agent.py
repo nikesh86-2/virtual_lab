@@ -217,7 +217,17 @@ def _target_id_from_state(state: LabState, target_pdb: str | None = None) -> str
 def _target_status_is_final_accepted(state: LabState) -> bool:
     """
     True only for final accepted targets, not partial-success targets.
+    Uses best_validated_target_evaluation if available.
     """
+    # Prioritize best validated target
+    best_target = state.get("best_validated_target_evaluation")
+    latest_target = state.get("latest_target_evaluation")
+    target_record = best_target or latest_target
+    
+    if target_record and isinstance(target_record, dict):
+        return target_record.get("status") == "accepted_target"
+    
+    # Fall back to legacy fields
     return (
         state.get("target_pdb") is not None
         and state.get("target_status") == "accepted_target"
@@ -228,6 +238,16 @@ def _partial_success_target_present(state: LabState) -> bool:
     """
     True if current state represents or contains a partial-success target.
     """
+    # Check best validated target first
+    best_target = state.get("best_validated_target_evaluation")
+    latest_target = state.get("latest_target_evaluation")
+    target_record = best_target or latest_target
+    
+    if target_record and isinstance(target_record, dict):
+        if target_record.get("status") == "partial_success_target":
+            return True
+    
+    # Fall back to legacy fields
     return (
         state.get("target_status") == "partial_success_target"
         or bool(state.get("partial_success_targets"))

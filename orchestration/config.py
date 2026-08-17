@@ -53,3 +53,28 @@ def bootstrap_runtime(anchor_file: str | None = None) -> None:
     configure_paths(anchor_file)
     configure_environment()
     configure_logging()
+
+
+def get_peptide_mode() -> str:
+    """
+    Get peptide design mode from environment variable.
+    
+    Returns:
+        "known_panel" (default, deterministic)
+        "llm_design" (uses LLM for generation)
+    """
+    mode = os.getenv("VLAB_PEPTIDE_MODE", "known_panel").strip().lower()
+    
+    valid_modes = {"known_panel", "llm_design"}
+    if mode not in valid_modes:
+        import logging
+        log = logging.getLogger("virtual_lab")
+        log.warning(
+            "Unknown VLAB_PEPTIDE_MODE=%s; using 'known_panel'. "
+            "Valid modes: %s",
+            mode,
+            ", ".join(sorted(valid_modes)),
+        )
+        return "known_panel"
+    
+    return mode

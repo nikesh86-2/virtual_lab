@@ -15,6 +15,7 @@ from VLAB2.orchestration.utils.literature_utils import (
     keep_research_query,
     normalise_lit_query,
 )
+from VLAB2.orchestration.reporting import format_motif_location
 from VLAB2.research.research_agent_adaptive import expand_knowledge
 from VLAB2.orchestration.failure_memory import FailureMemory
 from VLAB2.orchestration.literature_memory import LiteratureMemory
@@ -34,42 +35,6 @@ def _env_int(key: str, default: int) -> int:
         return int(os.getenv(key, str(default)).strip())
     except Exception:
         return default
-
-
-def _format_motif_location(motif: dict) -> str:
-    """
-    Format a motif dict into a human-readable location string.
-
-    Handles the new coordinate schema with mapping_status and coordinate_system,
-    falling back to legacy start/end fields.
-    """
-    name = str(motif.get("motif") or "unknown")
-    mapping_status = motif.get("mapping_status")
-    coordinate_system = motif.get("coordinate_system")
-
-    if (
-        mapping_status == "mapped"
-        and coordinate_system == "sequence_zero_based_half_open"
-    ):
-        start = motif.get("sequence_start")
-        end = motif.get("sequence_end")
-
-        if start is not None and end is not None:
-            return f"{name}@sequence[{start},{end})"
-
-    msa_start = motif.get("msa_start")
-    msa_end = motif.get("msa_end")
-
-    if msa_start is not None and msa_end is not None:
-        return f"{name}@alignment[{msa_start},{msa_end})"
-
-    legacy_start = motif.get("start")
-    legacy_end = motif.get("end")
-
-    if legacy_start is not None and legacy_end is not None:
-        return f"{name}@legacy[{legacy_start},{legacy_end})"
-
-    return f"{name}@unmapped"
 
 
 def _topic_name(topic: dict | None, state: dict | None = None) -> str | None:
@@ -466,6 +431,8 @@ def _effective_resolved_partial_success_target_ids(state: dict) -> list:
         same target as resolved.
       - If final target_status is accepted_target, mark accepted target as
         resolved partial-success if it appeared in previous memory/state.
+    
+    Uses best_validated target evaluation if available.
     """
     if not isinstance(state, dict):
         return []
@@ -476,12 +443,22 @@ def _effective_resolved_partial_success_target_ids(state: dict) -> list:
         if x
     )
 
-    target_status = state.get("target_status")
-    accepted = str(
-        state.get("target_pdb")
-        or state.get("target_pdb_id")
-        or ""
-    ).strip().upper()
+    # Use best validated target for final determination
+    best_target = state.get("best_validated_target_evaluation")
+    latest_target = state.get("latest_target_evaluation")
+    target_record = best_target or latest_target
+    
+    if target_record and isinstance(target_record, dict):
+        target_status = target_record.get("status")
+        accepted = str(target_record.get("target_pdb") or "").strip().upper()
+    else:
+        # Fall back to legacy fields
+        target_status = state.get("target_status")
+        accepted = str(
+            state.get("target_pdb")
+            or state.get("target_pdb_id")
+            or ""
+        ).strip().upper()
 
     if target_status == "partial_success_target" and accepted:
         resolved.discard(accepted)
@@ -496,6 +473,8 @@ def _effective_failed_target_ids(state: dict) -> list[str]:
     """
     Hard failed targets excluding partial-success, resolved partial-success,
     and final accepted target.
+    
+    Uses best_validated target evaluation if available.
     """
     if not isinstance(state, dict):
         return []
@@ -504,13 +483,24 @@ def _effective_failed_target_ids(state: dict) -> list[str]:
     partial = set(_effective_partial_success_target_ids(state))
     resolved = set(_effective_resolved_partial_success_target_ids(state))
 
-    accepted = str(
-        state.get("target_pdb")
-        or state.get("target_pdb_id")
-        or ""
-    ).strip().upper()
+    # Use best validated target for final determination
+    best_target = state.get("best_validated_target_evaluation")
+    latest_target = state.get("latest_target_evaluation")
+    target_record = best_target or latest_target
+    
+    if target_record and isinstance(target_record, dict):
+        target_status = target_record.get("status")
+        accepted = str(target_record.get("target_pdb") or "").strip().upper()
+    else:
+        # Fall back to legacy fields
+        target_status = state.get("target_status")
+        accepted = str(
+            state.get("target_pdb")
+            or state.get("target_pdb_id")
+            or ""
+        ).strip().upper()
 
-    if accepted and state.get("target_status") == "accepted_target":
+    if accepted and target_status == "accepted_target":
         failed.discard(accepted)
 
     return sorted(failed - partial - resolved)
